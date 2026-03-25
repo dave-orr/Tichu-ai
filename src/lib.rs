@@ -3,3 +3,8 @@ pub mod deck;
 pub mod combinations;
 pub mod scoring;
 pub mod engine;
+pub mod player;
+pub mod runner;
+pub mod harness;
+pub mod bots;
+pub mod tournament;
