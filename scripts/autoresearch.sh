@@ -29,7 +29,7 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
     echo "========================================="
 
     # Ask Claude to make ONE improvement.
-    claude --print \
+    claude --print --dangerously-skip-permissions \
         "Read CLAUDE.md for full context. You are optimizing the Tichu ISMCTS bot.
 
 Make ONE specific, targeted improvement to the bot code in src/bots/heuristic/ or src/bots/ismcts/.
@@ -37,8 +37,7 @@ Make ONE specific, targeted improvement to the bot code in src/bots/heuristic/ o
 Look at the current code, identify the weakest area, and improve it.
 Do NOT modify files outside src/bots/.
 After making changes, run: cargo build --release
-If the build fails, fix it before finishing." \
-        --allowedTools Edit,Read,Bash,Glob,Grep
+If the build fails, fix it before finishing."
 
     # Check if it compiles.
     if ! cargo build --release 2>/dev/null; then
