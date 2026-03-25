@@ -1,6 +1,10 @@
+use std::path::Path;
+
 use clap::{Parser, Subcommand};
 
+use tichu_engine::bots::heuristic::constants::HeuristicWeights;
 use tichu_engine::bots::heuristic::HeuristicBot;
+use tichu_engine::bots::ismcts::config::ISMCTSConfig;
 use tichu_engine::bots::ismcts::ISMCTSBot;
 use tichu_engine::bots::random::RandomBot;
 use tichu_engine::engine::Action;
@@ -44,6 +48,15 @@ enum Commands {
         #[arg(long)]
         swap: bool,
     },
+    /// Run current ISMCTS bot vs baseline (for autoresearch).
+    /// Uses low iterations (50) for speed. Creates baseline files on first run.
+    Autoresearch {
+        #[arg(long, default_value_t = 100)]
+        games: usize,
+        /// MCTS iterations per decision (low for speed).
+        #[arg(long, default_value_t = 50)]
+        iterations: u32,
+    },
 }
 
 fn main() {
@@ -54,6 +67,7 @@ fn main() {
         Commands::Benchmark { games } => run_benchmark(games),
         Commands::Tournament { games, swap } => run_tournament_cmd(games, swap),
         Commands::Ismcts { games, iterations, swap } => run_ismcts_vs_heuristic(games, iterations, swap),
+        Commands::Autoresearch { games, iterations } => run_autoresearch(games, iterations),
     }
 }
 
@@ -195,5 +209,63 @@ fn run_ismcts_vs_heuristic(games: usize, iterations: u32, swap: bool) {
         &|| Box::new(HeuristicBot::new()) as Box<dyn Player>,
     );
 
+    println!("{}", result);
+}
+
+fn run_autoresearch(games: usize, eval_iterations: u32) {
+    let weights_path = Path::new("baseline_weights.json");
+    let config_path = Path::new("baseline_config.json");
+
+    // If baseline files don't exist, create them from current defaults and exit.
+    if !weights_path.exists() || !config_path.exists() {
+        let weights = HeuristicWeights::default();
+        let config = ISMCTSConfig::default();
+        weights.save(weights_path).expect("Failed to save baseline weights");
+        config.save(config_path).expect("Failed to save baseline config");
+        println!("Created baseline files from current defaults.");
+        println!("Run again after making changes to evaluate against this baseline.");
+        return;
+    }
+
+    // Load baseline.
+    let baseline_weights = HeuristicWeights::load(weights_path)
+        .expect("Failed to load baseline_weights.json");
+    let baseline_config = ISMCTSConfig::load(config_path)
+        .expect("Failed to load baseline_config.json");
+
+    // Override both to use eval_iterations for speed.
+    let mut challenger_config = ISMCTSConfig::default();
+    challenger_config.num_iterations = eval_iterations;
+
+    let mut baseline_eval_config = baseline_config.clone();
+    baseline_eval_config.num_iterations = eval_iterations;
+
+    let tournament_config = TournamentConfig {
+        num_games: games,
+        swap_seats: true,
+    };
+
+    eprintln!(
+        "=== Autoresearch: Current vs Baseline ({} iterations, {} games with swap) ===",
+        eval_iterations, games
+    );
+
+    let result = run_tournament(
+        &tournament_config,
+        &move || {
+            Box::new(ISMCTSBot::from_config(
+                challenger_config.clone(),
+                HeuristicWeights::default(),
+            )) as Box<dyn Player>
+        },
+        &move || {
+            Box::new(ISMCTSBot::from_config(
+                baseline_eval_config.clone(),
+                baseline_weights.clone(),
+            )) as Box<dyn Player>
+        },
+    );
+
+    // Print parseable output to stdout (eprintln for human-readable).
     println!("{}", result);
 }

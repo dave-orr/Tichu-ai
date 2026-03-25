@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
 /// Tunable weights and thresholds for the heuristic bot.
 /// This is the primary target for autoresearch optimization.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeuristicWeights {
     // --- Hand evaluation ---
     /// Bonus for holding a four-of-a-kind or straight-flush bomb.
@@ -45,5 +48,18 @@ impl Default for HeuristicWeights {
             grand_tichu_threshold: 18.0,
             small_tichu_tempo_threshold: 5.0,
         }
+    }
+}
+
+impl HeuristicWeights {
+    pub fn load(path: &Path) -> std::io::Result<Self> {
+        let data = std::fs::read_to_string(path)?;
+        serde_json::from_str(&data).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
+        let data = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, data)
     }
 }

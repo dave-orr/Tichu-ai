@@ -1,3 +1,4 @@
+pub mod config;
 pub mod determinize;
 pub mod rollout;
 pub mod tree;
@@ -11,6 +12,7 @@ use crate::engine::{Action, GameState};
 use crate::player::Player;
 use crate::types::*;
 
+use config::ISMCTSConfig;
 use determinize::determinize;
 use rollout::rollout;
 use tree::{actions_match, MctsTree};
@@ -21,10 +23,8 @@ use tree::{actions_match, MctsTree};
 /// consistent opponent hands). Falls back to heuristic logic for
 /// grand tichu, small tichu, and passing decisions.
 pub struct ISMCTSBot {
-    /// Total MCTS iterations to run per decision.
-    pub num_iterations: u32,
-    /// UCB1 exploration constant.
-    pub exploration: f64,
+    /// ISMCTS-specific parameters.
+    pub config: ISMCTSConfig,
     /// Heuristic weights used for rollout policy and non-play decisions.
     pub weights: HeuristicWeights,
 }
@@ -32,10 +32,16 @@ pub struct ISMCTSBot {
 impl ISMCTSBot {
     pub fn new(num_iterations: u32) -> Self {
         Self {
-            num_iterations,
-            exploration: 1.41, // sqrt(2), standard UCB1
+            config: ISMCTSConfig {
+                num_iterations,
+                ..ISMCTSConfig::default()
+            },
             weights: HeuristicWeights::default(),
         }
+    }
+
+    pub fn from_config(config: ISMCTSConfig, weights: HeuristicWeights) -> Self {
+        Self { config, weights }
     }
 
     /// Run ISMCTS and return the best action.
@@ -43,7 +49,7 @@ impl ISMCTSBot {
         let mut tree = MctsTree::new();
         let mut rng = SmallRng::from_entropy();
 
-        for _ in 0..self.num_iterations {
+        for _ in 0..self.config.num_iterations {
             // 1. Determinize: sample a consistent world.
             let det_state = determinize(state, seat, &mut rng);
 
@@ -99,7 +105,7 @@ impl ISMCTSBot {
             }
 
             // All actions tried — select best child.
-            if let Some(child_id) = tree.select_child(node_id, &legal, self.exploration) {
+            if let Some(child_id) = tree.select_child(node_id, &legal, self.config.exploration) {
                 let action = tree.nodes[child_id].action.clone().unwrap();
                 apply_action(&mut sim_state, &action);
                 node_id = child_id;

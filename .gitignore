@@ -1,1 +1,4 @@
 /target
+.DS_Store
+baseline_config.json
+baseline_weights.json
