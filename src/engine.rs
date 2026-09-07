@@ -3,6 +3,7 @@ use crate::deck::*;
 use crate::scoring::*;
 use crate::types::*;
 
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,7 @@ pub struct GameState {
     pub target_score: i32,
     pub direction: Direction,
     pub first_card_played: bool,         // has any card been played this round?
+    pub has_played_card: [bool; 4],      // has this seat played a card this round? (Small Tichu window)
     #[serde(skip)]
     _remaining_cards: Option<Vec<Card>>, // stashed between deal phases
 }
@@ -95,6 +97,7 @@ impl GameState {
             target_score: 1000,
             direction: Direction::Clockwise,
             first_card_played: false,
+            has_played_card: [false; 4],
             _remaining_cards: None,
         }
     }
@@ -105,8 +108,14 @@ impl GameState {
 
     /// Start a new round: shuffle deck, deal first 8 cards to each player.
     pub fn start_new_round(&mut self) {
+        self.start_new_round_with_rng(&mut thread_rng());
+    }
+
+    /// Start a new round using the supplied RNG for the shuffle, so deals can
+    /// be reproduced (see `deck::seeded_rng`).
+    pub fn start_new_round_with_rng<R: Rng + ?Sized>(&mut self, rng: &mut R) {
         let mut deck = create_deck();
-        shuffle(&mut deck);
+        shuffle_with(&mut deck, rng);
 
         self.hands = [vec![], vec![], vec![], vec![]];
         self.tricks_won = [vec![], vec![], vec![], vec![]];
@@ -123,6 +132,7 @@ impl GameState {
         self.dragon_giveaway = false;
         self.dragon_giveaway_seat = None;
         self.first_card_played = false;
+        self.has_played_card = [false; 4];
 
         // Deal first 8 cards.
         for seat in 0..4 {
@@ -189,11 +199,9 @@ impl GameState {
         if self.tichu_calls[seat].is_some() {
             return Err(GameError::AlreadyCalledTichu);
         }
-        // Small tichu: must be before the player has played any card.
-        // In the TS engine: allowed before firstCardPlayed for any player,
-        // but actually it's per-player. The TS checks !firstCardPlayed.
-        // We'll follow the same logic: allowed before any card is played this round.
-        if self.first_card_played {
+        // Small Tichu: allowed until this player has played their first card
+        // (other players having played already does not close the window).
+        if self.has_played_card[seat] {
             return Err(GameError::WrongPhase);
         }
         self.tichu_calls[seat] = Some(TichuCall::Small);
@@ -324,14 +332,13 @@ impl GameState {
             return self.play_dog(seat);
         }
 
-        // Identify the combination.
-        let mut combo = identify_combo(cards, phoenix_as).ok_or(GameError::InvalidCombo)?;
-
-        // If playing phoenix as single, adjust rank based on current trick.
-        if cards.len() == 1 && matches!(cards[0], Card::Special(SpecialKind::Phoenix)) {
-            let last_rank = self.current_trick.as_ref().map(|ct| ct.rank);
-            combo.rank = single_card_rank(&cards[0], last_rank);
-        }
+        // Identify the combination. A single's rank (notably the Phoenix's)
+        // depends on the current trick.
+        let combo = if cards.len() == 1 {
+            single_combo(cards[0], self.current_trick.as_ref())
+        } else {
+            identify_combo(cards, phoenix_as).ok_or(GameError::InvalidCombo)?
+        };
 
         // Must beat current trick (if any).
         if let Some(ref current) = self.current_trick {
@@ -343,11 +350,9 @@ impl GameState {
         // MahJong wish enforcement: if there's an active wish and you're not playing
         // a card of the wished rank, check if you COULD play a legal combo containing
         // the wished rank. If so, you MUST include it (or play a bomb).
+        let mut plays_wish = false;
         if let Some(wish_rank) = self.mah_jong_wish {
-            let plays_wish = cards.iter().any(|c| match c {
-                Card::Normal { rank, .. } => *rank == wish_rank,
-                _ => false,
-            });
+            plays_wish = combo_has_rank(&combo, wish_rank);
             if !plays_wish {
                 // Check if hand has a card of the wished rank and can form a legal combo.
                 let has_wished = self.hands[seat].iter().any(|c| match c {
@@ -370,6 +375,11 @@ impl GameState {
             }
         }
 
+        // Playing the wished rank fulfills (and clears) the wish.
+        if plays_wish {
+            self.mah_jong_wish = None;
+        }
+
         // Check if MahJong was played -> prompt for wish.
         let played_mahjong = cards
             .iter()
@@ -389,6 +399,7 @@ impl GameState {
         self.last_played_by = Some(seat);
         self.pass_count = 0;
         self.first_card_played = true;
+        self.has_played_card[seat] = true;
 
         // Check if player went out.
         if self.hands[seat].is_empty() {
@@ -406,13 +417,6 @@ impl GameState {
 
         // Advance to next player.
         self.current_player = self.get_next_active_seat(seat);
-
-        // If the new current player is the one who last played (everyone else passed or is out),
-        // award the trick.
-        if Some(self.current_player) == self.last_played_by {
-            self.award_trick();
-        }
-
         Ok(())
     }
 
@@ -422,13 +426,16 @@ impl GameState {
             return Err(GameError::DogMustBeLead);
         }
 
-        // Remove dog from hand.
+        // Remove dog from hand. The Dog is a one-card trick taken by whoever
+        // played it (it is worth nothing, but every card must be accounted for).
         let pos = self.hands[seat]
             .iter()
             .position(|c| matches!(c, Card::Special(SpecialKind::Dog)))
             .ok_or(GameError::CardNotInHand)?;
-        self.hands[seat].remove(pos);
+        let dog = self.hands[seat].remove(pos);
+        self.tricks_won[seat].push(vec![dog]);
         self.first_card_played = true;
+        self.has_played_card[seat] = true;
 
         // Check if player went out.
         if self.hands[seat].is_empty() {
@@ -476,11 +483,13 @@ impl GameState {
 
         self.pass_count += 1;
 
-        // Check if all active players (except trick winner) have passed.
+        // The trick is won once every active player other than the one who
+        // played last has passed. If that player has already gone out, every
+        // active player must pass.
         let active_count = (0..4).filter(|&s| !self.is_out(s)).count();
-        // Trick is won when pass_count == active_count - 1
-        // (everyone except the last player who played has passed).
-        if self.pass_count >= active_count - 1 {
+        let leader_active = self.last_played_by.is_some_and(|l| !self.is_out(l));
+        let passes_needed = if leader_active { active_count - 1 } else { active_count };
+        if self.pass_count >= passes_needed {
             self.award_trick();
             return Ok(());
         }
@@ -500,6 +509,9 @@ impl GameState {
         cards: &[Card],
     ) -> Result<(), GameError> {
         if self.phase != Phase::Playing {
+            return Err(GameError::WrongPhase);
+        }
+        if self.dragon_giveaway {
             return Err(GameError::WrongPhase);
         }
         if self.is_out(seat) {
@@ -535,11 +547,19 @@ impl GameState {
             }
         }
 
+        // A bomb containing the wished rank fulfills the wish.
+        if let Some(wish_rank) = self.mah_jong_wish {
+            if combo_has_rank(&combo, wish_rank) {
+                self.mah_jong_wish = None;
+            }
+        }
+
         self.current_trick_cards.extend_from_slice(cards);
         self.current_trick = Some(combo);
         self.last_played_by = Some(seat);
         self.pass_count = 0;
         self.first_card_played = true;
+        self.has_played_card[seat] = true;
 
         // Check if player went out.
         if self.hands[seat].is_empty() {
@@ -581,6 +601,7 @@ impl GameState {
         self.dragon_giveaway = false;
         self.dragon_giveaway_seat = None;
         self.current_trick = None;
+        self.pass_count = 0;
 
         // Next player leads.
         if self.is_out(seat) {
@@ -600,23 +621,19 @@ impl GameState {
     // Trick resolution
     // -----------------------------------------------------------------------
 
+    /// Was the trick won by the Dragon itself? (A Dragon beaten by a bomb is
+    /// simply captured by the bomber.)
+    fn trick_won_by_dragon(&self) -> bool {
+        self.current_trick
+            .as_ref()
+            .is_some_and(|ct| ct.cards == [Card::Special(SpecialKind::Dragon)])
+    }
+
     fn award_trick(&mut self) {
         let winner = self.last_played_by.unwrap();
 
-        // Check if dragon is in the trick.
-        let has_dragon = self
-            .current_trick_cards
-            .iter()
-            .any(|c| matches!(c, Card::Special(SpecialKind::Dragon)));
-
-        if has_dragon {
-            // Dragon winner must give trick to an opponent.
-            self.dragon_giveaway = true;
-            self.dragon_giveaway_seat = Some(winner);
-            // Don't clear trick yet - it will be given away.
-            // But clear the combo so no one needs to beat it.
-            self.current_trick = None;
-            self.pass_count = 0;
+        if self.trick_won_by_dragon() {
+            self.begin_dragon_giveaway(winner);
             return;
         }
 
@@ -650,10 +667,28 @@ impl GameState {
         false
     }
 
+    /// The winner of a trick containing the Dragon must give it to an opponent.
+    /// The turn goes to the winner so they can choose the recipient.
+    fn begin_dragon_giveaway(&mut self, winner: Seat) {
+        self.dragon_giveaway = true;
+        self.dragon_giveaway_seat = Some(winner);
+        self.current_player = winner;
+        // Don't clear the trick cards yet - they will be given away.
+        // But clear the combo so no one needs to beat it.
+        self.current_trick = None;
+        self.pass_count = 0;
+    }
+
     fn end_round(&mut self) {
         // If a trick is in progress (not dragon giveaway), award it.
         if !self.dragon_giveaway && self.last_played_by.is_some() && !self.current_trick_cards.is_empty() {
             let winner = self.last_played_by.unwrap();
+            if self.trick_won_by_dragon() {
+                // The round cannot be scored until the Dragon trick is given
+                // away; `give_dragon_trick` will call `end_round` again.
+                self.begin_dragon_giveaway(winner);
+                return;
+            }
             let trick_cards = std::mem::take(&mut self.current_trick_cards);
             self.tricks_won[winner].push(trick_cards);
         }
@@ -756,36 +791,23 @@ impl GameState {
         let hand = &self.hands[seat];
         let mut actions = Vec::new();
 
-        // Pass (if not leading).
-        if self.current_trick.is_some() {
-            // Can pass unless wish enforcement prevents it.
-            if let Some(wish_rank) = self.mah_jong_wish {
-                if !can_fulfill_wish(hand, wish_rank, self.current_trick.as_ref()) {
-                    actions.push(Action::Pass);
-                }
-            } else {
-                actions.push(Action::Pass);
-            }
+        // Enumerate playable combos once; the wish check is derived from them.
+        let combos = find_playable_combos(hand, self.current_trick.as_ref());
+        let must_fulfill_wish = self
+            .mah_jong_wish
+            .is_some_and(|wish_rank| combos_can_fulfill_wish(&combos, wish_rank));
+
+        // Pass (if not leading, and not forced to fulfill the wish).
+        if self.current_trick.is_some() && !must_fulfill_wish {
+            actions.push(Action::Pass);
         }
 
-        // Playable combos.
-        let combos = find_playable_combos(hand, self.current_trick.as_ref());
         for combo in combos {
-            // Filter by wish if active.
-            if let Some(wish_rank) = self.mah_jong_wish {
-                let has_wished = hand.iter().any(|c| match c {
-                    Card::Normal { rank, .. } => *rank == wish_rank,
-                    _ => false,
-                });
-                if has_wished && can_fulfill_wish(hand, wish_rank, self.current_trick.as_ref()) {
-                    // Must include wished rank (unless bomb).
-                    let plays_wish = combo.cards.iter().any(|c| match c {
-                        Card::Normal { rank, .. } => *rank == wish_rank,
-                        _ => false,
-                    });
-                    if !plays_wish && !is_bomb_combo(&combo) {
-                        continue;
-                    }
+            if must_fulfill_wish {
+                // Must include wished rank (unless bomb).
+                let wish_rank = self.mah_jong_wish.unwrap();
+                if !combo_has_rank(&combo, wish_rank) && !is_bomb_combo(&combo) {
+                    continue;
                 }
             }
             actions.push(Action::Play(combo));

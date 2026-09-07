@@ -1,5 +1,6 @@
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::{thread_rng, Rng, SeedableRng};
 
 use crate::types::*;
 
@@ -18,10 +19,20 @@ pub fn create_deck() -> Vec<Card> {
     deck
 }
 
-/// Fisher-Yates shuffle in place.
+/// Fisher-Yates shuffle in place using the thread-local RNG.
 pub fn shuffle(deck: &mut Vec<Card>) {
-    let mut rng = thread_rng();
-    deck.shuffle(&mut rng);
+    shuffle_with(deck, &mut thread_rng());
+}
+
+/// Fisher-Yates shuffle in place using the supplied RNG (seed it for
+/// reproducible deals).
+pub fn shuffle_with<R: Rng + ?Sized>(deck: &mut Vec<Card>, rng: &mut R) {
+    deck.shuffle(rng);
+}
+
+/// A deterministic RNG for reproducible games.
+pub fn seeded_rng(seed: u64) -> StdRng {
+    StdRng::seed_from_u64(seed)
 }
 
 /// Sort a hand by the canonical Tichu ordering.

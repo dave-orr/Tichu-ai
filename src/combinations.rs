@@ -6,19 +6,41 @@ use crate::types::*;
 // Single-card effective rank
 // ---------------------------------------------------------------------------
 
+/// Rank of the Dragon as a single.
+pub const DRAGON_RANK: f32 = 15.0;
+
 /// Effective rank of a single card.
 /// Phoenix = last_played_rank + 0.5  (or 1.5 when leading).
 /// MahJong = 1, Dragon = 15, Dog = -1.
+///
+/// The Phoenix can never beat the Dragon, so when the last played single is
+/// the Dragon the Phoenix is capped at the Dragon's rank (which does not beat it).
 pub fn single_card_rank(card: &Card, last_played_rank: Option<f32>) -> f32 {
     match card {
         Card::Normal { rank, .. } => *rank as f32,
         Card::Special(SpecialKind::MahJong) => 1.0,
-        Card::Special(SpecialKind::Dragon) => 15.0,
+        Card::Special(SpecialKind::Dragon) => DRAGON_RANK,
         Card::Special(SpecialKind::Dog) => -1.0,
         Card::Special(SpecialKind::Phoenix) => match last_played_rank {
+            Some(r) if r >= DRAGON_RANK => DRAGON_RANK,
             Some(r) => r + 0.5,
             None => 1.5,
         },
+    }
+}
+
+/// Build the single-card combo for `card` in the context of `current_trick`.
+/// This is the only correct way to rank the Phoenix as a single, since its
+/// rank depends on the single it is played on.
+pub fn single_combo(card: Card, current_trick: Option<&Combo>) -> Combo {
+    let last_rank = current_trick
+        .filter(|ct| ct.kind == ComboKind::Single)
+        .map(|ct| ct.rank);
+    Combo {
+        kind: ComboKind::Single,
+        cards: vec![card],
+        rank: single_card_rank(&card, last_rank),
+        length: 1,
     }
 }
 
@@ -603,22 +625,15 @@ fn compare_bombs(current: &Combo, play: &Combo) -> bool {
 /// Find all valid combinations from `hand` that can beat `current_trick`
 /// (or all leading combos if `current_trick` is `None`).
 pub fn find_playable_combos(hand: &[Card], current_trick: Option<&Combo>) -> Vec<Combo> {
-    let mut results = Vec::new();
+    let mut results: Vec<Combo> = Vec::new();
     let n = hand.len();
 
     // Generate all subsets up to size n (but practically we only need 1..=n).
     // For performance we enumerate by expected sizes.
-    // Singles
+    // Singles (the Phoenix's rank depends on the single it is played on).
     for i in 0..n {
-        if let Some(combo) = identify_combo(&[hand[i]], None) {
-            if let Some(ct) = current_trick {
-                if can_beat(ct, &combo) {
-                    results.push(combo);
-                }
-            } else {
-                results.push(combo);
-            }
-        }
+        let combo = single_combo(hand[i], current_trick);
+        check_and_push(combo, current_trick, &mut results);
     }
 
     // Pairs
@@ -988,14 +1003,21 @@ fn find_straight_combos(
     }
 }
 
+/// Does this combo contain a card of the wished rank?
+pub fn combo_has_rank(combo: &Combo, wish_rank: u8) -> bool {
+    combo.cards.iter().any(|c| match c {
+        Card::Normal { rank, .. } => *rank == wish_rank,
+        Card::Special(SpecialKind::MahJong) => wish_rank == 1,
+        _ => false,
+    })
+}
+
+/// Given the already-enumerated playable combos, can the wish be fulfilled?
+pub fn combos_can_fulfill_wish(combos: &[Combo], wish_rank: u8) -> bool {
+    combos.iter().any(|combo| combo_has_rank(combo, wish_rank))
+}
+
 /// Check if the hand contains any playable combo that includes a card of the wished rank.
 pub fn can_fulfill_wish(hand: &[Card], wish_rank: u8, current_trick: Option<&Combo>) -> bool {
-    let combos = find_playable_combos(hand, current_trick);
-    combos.iter().any(|combo| {
-        combo.cards.iter().any(|c| match c {
-            Card::Normal { rank, .. } => *rank == wish_rank,
-            Card::Special(SpecialKind::MahJong) => wish_rank == 1,
-            _ => false,
-        })
-    })
+    combos_can_fulfill_wish(&find_playable_combos(hand, current_trick), wish_rank)
 }

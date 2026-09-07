@@ -347,3 +347,216 @@ fn test_deck_points_sum_to_100() {
     let total: i32 = deck.iter().map(|c| card_points(c)).sum();
     assert_eq!(total, 100);
 }
+
+// ---------------------------------------------------------------------------
+// Engine rule regression tests
+// ---------------------------------------------------------------------------
+
+/// Build a game in the Playing phase with the given hands, seat 0 to lead.
+fn playing_game(hands: [Vec<Card>; 4]) -> GameState {
+    let mut g = GameState::new();
+    g.phase = Phase::Playing;
+    g.hands = hands;
+    g.current_player = 0;
+    g
+}
+
+#[test]
+fn test_phoenix_offered_as_single_response() {
+    let eight = identify_combo(&[jade(8)], None).unwrap();
+    let combos = find_playable_combos(&[phoenix(), star(3)], Some(&eight));
+    let ph = combos.iter().find(|c| c.cards == vec![phoenix()]).expect("phoenix should be playable on an 8");
+    assert_eq!(ph.kind, ComboKind::Single);
+    assert_eq!(ph.rank, 8.5);
+
+    // And it is offered through legal_actions.
+    let mut g = playing_game([vec![jade(8), jade(2)], vec![phoenix(), star(3)], vec![jade(4)], vec![jade(5)]]);
+    g.play_cards(0, &[jade(8)], None, None).unwrap();
+    let offered = g.legal_actions().iter().any(|a| matches!(a, Action::Play(c) if c.cards == vec![phoenix()]));
+    assert!(offered);
+    g.play_cards(1, &[phoenix()], None, None).unwrap();
+    assert_eq!(g.current_trick.as_ref().unwrap().rank, 8.5);
+}
+
+#[test]
+fn test_phoenix_cannot_beat_dragon() {
+    let mut g = playing_game([vec![dragon(), jade(2)], vec![phoenix(), star(3)], vec![jade(4)], vec![jade(5)]]);
+    g.play_cards(0, &[dragon()], None, None).unwrap();
+    assert_eq!(g.play_cards(1, &[phoenix()], None, None), Err(GameError::CannotBeatCurrentTrick));
+    let offered = g.legal_actions().iter().any(|a| matches!(a, Action::Play(c) if c.cards == vec![phoenix()]));
+    assert!(!offered);
+    // Ace-then-Phoenix still works.
+    let ace = identify_combo(&[jade(14)], None).unwrap();
+    assert!(find_playable_combos(&[phoenix()], Some(&ace)).len() == 1);
+}
+
+#[test]
+fn test_all_remaining_players_must_pass_when_leader_is_out() {
+    // Seat 0 goes out on its lead; seats 1, 2 and 3 all have to pass before the
+    // trick is awarded, so seat 3 still gets a chance to beat it.
+    let mut g = playing_game([vec![jade(8)], vec![star(3), star(4)], vec![jade(4), jade(5)], vec![jade(9), jade(2)]]);
+    g.play_cards(0, &[jade(8)], None, None).unwrap();
+    assert!(g.is_out(0));
+    g.pass_turn(1).unwrap();
+    g.pass_turn(2).unwrap();
+    assert!(g.current_trick.is_some(), "trick awarded before seat 3 could act");
+    assert_eq!(g.current_player, 3);
+    g.play_cards(3, &[jade(9)], None, None).unwrap();
+    assert_eq!(g.last_played_by, Some(3));
+    // Now seats 1 and 2 pass and seat 3 (still active) wins the trick.
+    g.pass_turn(1).unwrap();
+    g.pass_turn(2).unwrap();
+    assert!(g.current_trick.is_none());
+    assert_eq!(g.current_player, 3);
+    assert_eq!(g.tricks_won[3].len(), 1);
+}
+
+#[test]
+fn test_trick_awarded_to_out_leader_after_everyone_passes() {
+    let mut g = playing_game([vec![jade(8)], vec![star(3), star(4)], vec![jade(4), jade(5)], vec![jade(6), jade(2)]]);
+    g.play_cards(0, &[jade(8)], None, None).unwrap();
+    g.pass_turn(1).unwrap();
+    g.pass_turn(2).unwrap();
+    g.pass_turn(3).unwrap();
+    assert!(g.current_trick.is_none());
+    assert_eq!(g.tricks_won[0].len(), 1);
+    // Next active player after the (out) winner leads.
+    assert_eq!(g.current_player, 1);
+}
+
+#[test]
+fn test_wish_clears_once_fulfilled() {
+    let mut g = playing_game([
+        vec![mahjong(), jade(2)],
+        vec![star(7), star(3)],
+        vec![jade(7), jade(4)],
+        vec![jade(9), jade(5)],
+    ]);
+    g.play_cards(0, &[mahjong()], None, Some(7)).unwrap();
+    assert_eq!(g.mah_jong_wish, Some(7));
+    // Seat 1 holds a 7 and can play it, so it may not pass.
+    assert_eq!(g.pass_turn(1), Err(GameError::MustFulfillWish));
+    assert_eq!(g.play_cards(1, &[star(3)], None, None), Err(GameError::MustFulfillWish));
+    g.play_cards(1, &[star(7)], None, None).unwrap();
+    assert_eq!(g.mah_jong_wish, None, "wish must clear once the wished rank is played");
+    // Seat 2 also holds a 7 but is no longer forced to play it.
+    assert!(g.legal_actions().iter().any(|a| matches!(a, Action::Pass)));
+    g.pass_turn(2).unwrap();
+}
+
+#[test]
+fn test_bomb_containing_wished_rank_fulfills_wish() {
+    let mut g = playing_game([
+        vec![mahjong(), jade(2)],
+        vec![jade(7), sword(7), pagoda(7), star(7), star(3)],
+        vec![jade(4), jade(5)],
+        vec![jade(9), jade(6)],
+    ]);
+    g.play_cards(0, &[mahjong()], None, Some(7)).unwrap();
+    g.play_bomb(1, &[jade(7), sword(7), pagoda(7), star(7)]).unwrap();
+    assert_eq!(g.mah_jong_wish, None);
+}
+
+#[test]
+fn test_dragon_trick_hands_turn_to_winner_for_giveaway() {
+    let mut g = playing_game([vec![dragon(), jade(2)], vec![jade(3)], vec![jade(4)], vec![jade(5)]]);
+    g.play_cards(0, &[dragon()], None, None).unwrap();
+    for s in 1..4 {
+        g.pass_turn(s).unwrap();
+    }
+    assert!(g.dragon_giveaway);
+    assert_eq!(g.dragon_giveaway_seat, Some(0));
+    assert_eq!(g.current_player, 0);
+    let actions = g.legal_actions();
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().all(|a| matches!(a, Action::GiveDragonTrick(1) | Action::GiveDragonTrick(3))));
+    // Nobody may play (even a bomb) until the trick is given away.
+    assert_eq!(g.play_cards(0, &[jade(2)], None, None), Err(GameError::WrongPhase));
+    assert_eq!(g.give_dragon_trick(0, 2), Err(GameError::InvalidDragonTarget));
+    g.give_dragon_trick(0, 3).unwrap();
+    assert_eq!(g.tricks_won[3].len(), 1);
+    assert_eq!(g.current_player, 0);
+    assert!(g.legal_actions().iter().any(|a| matches!(a, Action::Play(_))));
+}
+
+#[test]
+fn test_dragon_in_final_trick_is_still_given_away() {
+    // Seats 1 and 2 are already out; seat 0 goes out with the Dragon, which ends
+    // the round. The Dragon trick still has to go to an opponent.
+    let mut g = playing_game([vec![dragon()], vec![], vec![], vec![jade(5), jade(10)]]);
+    g.out_order = vec![1, 2];
+    g.play_cards(0, &[dragon()], None, None).unwrap();
+    assert_eq!(g.phase, Phase::Playing);
+    assert!(g.dragon_giveaway);
+    let actions = g.legal_actions();
+    assert_eq!(actions.len(), 2);
+    assert!(actions.iter().all(|a| matches!(a, Action::GiveDragonTrick(1) | Action::GiveDragonTrick(3))));
+    g.give_dragon_trick(0, 3).unwrap();
+    assert_eq!(g.phase, Phase::RoundEnd);
+    assert!(g.tricks_won[3][0].contains(&dragon()));
+    assert!(g.tricks_won[0].is_empty());
+    // Seat 1 went out first (team 1) and seat 3 (team 1) was last. Seat 3's
+    // tricks (the Dragon, 25) go to the first-out team (team 1); its remaining
+    // hand (5 + 10) goes to the opposing team (team 0).
+    assert_eq!(g.round_history[0], (15, 25));
+}
+
+#[test]
+fn test_small_tichu_window_is_per_player() {
+    let mut g = playing_game([vec![jade(8), jade(2)], vec![star(3), star(4)], vec![jade(4), jade(5)], vec![jade(9), jade(6)]]);
+    g.play_cards(0, &[jade(8)], None, None).unwrap();
+    // Seat 0 has played, so it may no longer call.
+    assert_eq!(g.call_small_tichu(0), Err(GameError::WrongPhase));
+    // Seat 3 has not played a card yet, so it still may.
+    g.call_small_tichu(3).unwrap();
+    assert_eq!(g.tichu_calls[3], Some(TichuCall::Small));
+}
+
+#[test]
+fn test_seeded_deal_is_reproducible() {
+    let mut a = GameState::new();
+    a.start_new_round_with_rng(&mut tichu_engine::deck::seeded_rng(42));
+    let mut b = GameState::new();
+    b.start_new_round_with_rng(&mut tichu_engine::deck::seeded_rng(42));
+    let mut c = GameState::new();
+    c.start_new_round_with_rng(&mut tichu_engine::deck::seeded_rng(43));
+    assert_eq!(a.hands, b.hands);
+    assert_ne!(a.hands, c.hands);
+}
+
+#[test]
+fn test_dog_passes_lead_to_partner_and_is_captured() {
+    let mut g = playing_game([vec![dog(), jade(2)], vec![star(3)], vec![jade(4)], vec![jade(5)]]);
+    assert_eq!(g.play_cards(1, &[star(3)], None, None), Err(GameError::NotYourTurn));
+    g.play_cards(0, &[dog()], None, None).unwrap();
+    assert_eq!(g.current_player, 2);
+    assert!(g.current_trick.is_none());
+    assert_eq!(g.tricks_won[0], vec![vec![dog()]]);
+    // The Dog cannot be played onto a trick.
+    g.play_cards(2, &[jade(4)], None, None).unwrap();
+    let mut h = playing_game([vec![dog()], vec![], vec![], vec![]]);
+    h.current_trick = Some(identify_combo(&[jade(3)], None).unwrap());
+    assert_eq!(h.play_cards(0, &[dog()], None, None), Err(GameError::DogMustBeLead));
+}
+
+#[test]
+fn test_dragon_beaten_by_bomb_is_captured_by_bomber() {
+    // Seat 2 (the Dragon player's partner) bombs the Dragon; the trick, Dragon
+    // included, simply goes to seat 2. No giveaway.
+    let mut g = playing_game([
+        vec![dragon(), jade(2)],
+        vec![star(3), star(4)],
+        vec![jade(7), sword(7), pagoda(7), star(7), jade(9)],
+        vec![jade(5), jade(6)],
+    ]);
+    g.play_cards(0, &[dragon()], None, None).unwrap();
+    g.pass_turn(1).unwrap();
+    g.play_cards(2, &[jade(7), sword(7), pagoda(7), star(7)], None, None).unwrap();
+    g.pass_turn(3).unwrap();
+    g.pass_turn(0).unwrap();
+    g.pass_turn(1).unwrap();
+    assert!(!g.dragon_giveaway);
+    assert_eq!(g.tricks_won[2].len(), 1);
+    assert!(g.tricks_won[2][0].contains(&dragon()));
+    assert_eq!(g.current_player, 2);
+}
