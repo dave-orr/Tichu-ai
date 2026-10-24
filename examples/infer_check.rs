@@ -1,8 +1,10 @@
-//! Sanity check for `infer`: at sampled decision points in h2 self-play,
-//! compare the likelihood of the true hands with that of uniform guesses,
-//! and count guesses the replay rejects.
+//! How much does `infer` sharpen the guess at the hidden hands? At random
+//! turns of seat 0, compare the share of hidden cards that uniform guesses
+//! and inferred guesses put in the right hand.
 //!
-//!     cargo run --release --example infer_check
+//!     cargo run --release --example infer_check -- [OTHERS] [ROUNDS] [EPS]
+//!
+//! OTHERS (default h2) plays seats 1-3; seat 0 plays h2.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -11,19 +13,41 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use tichu_engine::bot::Bot;
-use tichu_engine::bots::H2Bot;
+use tichu_engine::bots::{by_name, H2Bot};
 use tichu_engine::deck::shuffled_deck;
-use tichu_engine::engine::{GameState, Pending};
-use tichu_engine::infer::{likelihood, InferConfig};
+use tichu_engine::engine::GameState;
+use tichu_engine::infer::{sample_hands_weighted, InferConfig};
 use tichu_engine::sim::play_dealt_round;
 use tichu_engine::types::*;
+use tichu_engine::view::PlayerView;
 
-/// Plays as h2, and at random turns records (likelihood of the truth, mean likelihood of guesses, zero guesses).
+#[derive(Default)]
+struct Tally {
+    points: usize,
+    uniform: f64,
+    inferred: f64,
+}
+
 struct Probe {
     inner: H2Bot,
     rng: StdRng,
+    cfg: InferConfig,
     truth: Option<[Vec<Card>; 4]>,
-    out: Rc<RefCell<Vec<(f64, f64, usize)>>>,
+    tally: Rc<RefCell<Tally>>,
+}
+
+/// Share of the hidden cards placed in the right seat, averaged over `guesses`.
+fn accuracy(view: &PlayerView, truth: &[Vec<Card>; 4], guesses: &[[Vec<Card>; 4]]) -> f64 {
+    let mut right = 0usize;
+    let mut total = 0usize;
+    for g in guesses {
+        for s in (0..4).filter(|&s| s != view.seat) {
+            let t = CardSet::from_cards(&truth[s]);
+            right += g[s].iter().filter(|c| t.contains(**c)).count();
+            total += g[s].len();
+        }
+    }
+    right as f64 / total.max(1) as f64
 }
 
 impl Bot for Probe {
@@ -36,61 +60,57 @@ impl Bot for Probe {
     fn peek(&mut self, state: &GameState) {
         self.truth = Some([0, 1, 2, 3].map(|s| state.players[s].hand.clone()));
     }
-    fn pass_cards(&mut self, view: &tichu_engine::view::PlayerView) -> PassInfo {
+    fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
         self.inner.pass_cards(view)
     }
-    fn play(&mut self, view: &tichu_engine::view::PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+    fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
         if view.played_cards.len() > 8 && self.rng.gen_bool(0.2) {
-            let cfg = InferConfig::default();
-            let t = likelihood(view, self.truth.as_ref().unwrap(), &cfg);
-            let mut sum = 0.0;
-            let mut zeros = 0;
-            for _ in 0..50 {
-                let h = view.sample_hands(&mut self.rng);
-                let l = likelihood(view, &h, &cfg);
-                sum += l;
-                zeros += (l == 0.0) as usize;
-            }
-            self.out.borrow_mut().push((t, sum / 50.0, zeros));
+            let truth = self.truth.clone().unwrap();
+            let uniform: Vec<_> = (0..20).map(|_| view.sample_hands(&mut self.rng)).collect();
+            let inferred = sample_hands_weighted(view, &mut self.rng, 20, &self.cfg);
+            let mut t = self.tally.borrow_mut();
+            t.points += 1;
+            t.uniform += accuracy(view, &truth, &uniform);
+            t.inferred += accuracy(view, &truth, &inferred);
         }
         self.inner.play(view, plays, can_pass)
     }
-    fn bomb(&mut self, view: &tichu_engine::view::PlayerView, bombs: &[Combo]) -> Option<usize> {
+    fn bomb(&mut self, view: &PlayerView, bombs: &[Combo]) -> Option<usize> {
         self.inner.bomb(view, bombs)
     }
-    fn wish(&mut self, view: &tichu_engine::view::PlayerView) -> Option<Rank> {
+    fn wish(&mut self, view: &PlayerView) -> Option<Rank> {
         self.inner.wish(view)
     }
-    fn dragon_recipient(&mut self, view: &tichu_engine::view::PlayerView) -> Seat {
+    fn dragon_recipient(&mut self, view: &PlayerView) -> Seat {
         self.inner.dragon_recipient(view)
     }
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let others = args.get(1).cloned().unwrap_or("h2".into());
+    let rounds: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(200);
+    let mut cfg = InferConfig::default();
+    if let Some(e) = args.get(3).and_then(|s| s.parse().ok()) {
+        cfg.eps_play = e;
+    }
     let mut rng = StdRng::seed_from_u64(7);
-    let (mut n, mut truth_ln, mut guess_ln, mut zeros, mut better) = (0usize, 0.0, 0.0, 0usize, 0usize);
-    for _ in 0..200 {
+    let tally = Rc::new(RefCell::new(Tally::default()));
+    for _ in 0..rounds {
         let mut g = GameState::new(Settings::default());
         g.start_round(shuffled_deck(&mut rng));
-        let out = Rc::new(RefCell::new(vec![]));
-        let probe = Probe { inner: H2Bot::new(), rng: StdRng::seed_from_u64(rng.gen()), truth: None, out: out.clone() };
-        let mut bots: [Box<dyn Bot>; 4] =
-            [Box::new(probe), Box::new(H2Bot::new()), Box::new(H2Bot::new()), Box::new(H2Bot::new())];
+        let probe = Probe { inner: H2Bot::new(), rng: StdRng::seed_from_u64(rng.gen()), cfg, truth: None, tally: tally.clone() };
+        let other = |seed: u64| by_name(&others, seed).expect("unknown bot");
+        let mut bots: [Box<dyn Bot>; 4] = [Box::new(probe), other(rng.gen()), other(rng.gen()), other(rng.gen())];
         play_dealt_round(&mut g, &mut bots, None).unwrap();
-        assert!(matches!(g.pending(), Pending::RoundOver | Pending::GameOver));
-        for &(t, m, z) in out.borrow().iter() {
-            n += 1;
-            truth_ln += t.max(1e-300).ln();
-            guess_ln += m.max(1e-300).ln();
-            zeros += z;
-            better += (t > m) as usize;
-        }
     }
+    let t = tally.borrow();
+    let n = t.points.max(1) as f64;
     println!(
-        "{n} decision points: truth beats the average guess {:.0}% of the time; mean ln L truth {:.2}, guesses {:.2}; rejected guesses {:.1}%",
-        100.0 * better as f64 / n as f64,
-        truth_ln / n as f64,
-        guess_ln / n as f64,
-        100.0 * zeros as f64 / (50 * n) as f64
+        "others = {others}, eps_play = {}: {} decision points; hidden cards placed right: uniform {:.1}%, inferred {:.1}%",
+        cfg.eps_play,
+        t.points,
+        100.0 * t.uniform / n,
+        100.0 * t.inferred / n
     );
 }

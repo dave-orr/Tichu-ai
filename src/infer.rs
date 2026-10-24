@@ -55,22 +55,15 @@ pub fn sample_hands_weighted<R: Rng + ?Sized>(
     if total <= 0.0 {
         return cands.into_iter().take(n).collect();
     }
-    // Systematic resampling.
-    let step = total / n as f64;
-    let mut u = rng.gen::<f64>() * step;
-    let mut out = Vec::with_capacity(n);
-    let mut acc = 0.0;
-    for (h, w) in cands.iter().zip(&weights) {
-        acc += w;
-        while u < acc && out.len() < n {
-            out.push(h.clone());
-            u += step;
-        }
-    }
-    while out.len() < n {
-        out.push(cands[0].clone());
-    }
-    out
+    // Draw n distinct guesses by weight (Efraimidis-Spirakis keys): no
+    // duplicates, so the search still sees n different deals.
+    let mut keyed: Vec<(f64, usize)> = weights
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| (if w > 0.0 { rng.gen::<f64>().ln() / w } else { f64::NEG_INFINITY }, i))
+        .collect();
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    keyed.into_iter().take(n).map(|(_, i)| cands[i].clone()).collect()
 }
 
 /// What a play looks like regardless of suits (bombs keep their suits out
