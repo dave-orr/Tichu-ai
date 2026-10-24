@@ -2,6 +2,7 @@
 //! there's something better than random to measure new bots against.
 
 use crate::bot::Bot;
+use crate::bots::calls;
 use crate::scoring::card_points;
 use crate::types::*;
 use crate::view::PlayerView;
@@ -41,6 +42,17 @@ fn breaks_bomb(hand_counts: &[usize; 15], combo: &Combo) -> bool {
     !combo.is_bomb() && combo.cards.iter().any(|c| c.rank().is_some_and(|r| hand_counts[r as usize] == 4))
 }
 
+/// The original (v1) call rules, kept for comparison (`calls:v1:BOT`).
+pub fn grand_tichu_v1(view: &PlayerView) -> bool {
+    controls(&view.hand) >= 4.5
+}
+
+pub fn small_tichu_v1(view: &PlayerView) -> bool {
+    view.players[view.partner()].tichu == TichuCall::None
+        && controls(&view.hand) >= 4.0
+        && low_singles(&view.hand) <= 2
+}
+
 /// Rough count of "control" cards: ones likely to win a trick.
 fn controls(hand: &[Card]) -> f32 {
     let counts = rank_counts(hand);
@@ -69,14 +81,11 @@ impl Bot for HeuristicBot {
     }
 
     fn grand_tichu(&mut self, view: &PlayerView) -> bool {
-        controls(&view.hand) >= 4.5
+        calls::grand_tichu_v2(view)
     }
 
     fn small_tichu(&mut self, view: &PlayerView) -> bool {
-        if view.players[view.partner()].tichu != TichuCall::None {
-            return false;
-        }
-        controls(&view.hand) >= 4.0 && low_singles(&view.hand) <= 2
+        calls::small_tichu_v2(view, calls::DEFAULT_TICHU_THRESHOLD).unwrap_or(false)
     }
 
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {

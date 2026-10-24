@@ -35,7 +35,7 @@
 //! when 300+ ahead, only the first and last rules apply.
 
 use crate::bot::Bot;
-use crate::bots::HeuristicBot;
+use crate::bots::heuristic::{grand_tichu_v1, small_tichu_v1};
 use crate::engine::GameState;
 use crate::hand::{decompose, Decomposition};
 use crate::scoring::RoundResult;
@@ -102,6 +102,10 @@ pub fn tichu_eval(view: &PlayerView) -> TichuEval {
     let losers = (d.combos.len() - winner_combos) as f32 - 1.0;
     TichuEval { winners, losers, decomposition: d }
 }
+
+/// The Tichu threshold the bundled bots use: roughly break-even with pimc
+/// play (called Tichus at 0 succeed ~67%).
+pub const DEFAULT_TICHU_THRESHOLD: f32 = 0.0;
 
 /// Score-situation adjustment to a call threshold (positive = stricter).
 fn score_adjustment(view: &PlayerView) -> f32 {
@@ -214,12 +218,11 @@ impl CallPolicy {
 pub struct CallsBot {
     pub policy: CallPolicy,
     inner: Box<dyn Bot>,
-    v1: HeuristicBot,
 }
 
 impl CallsBot {
     pub fn new(policy: CallPolicy, inner: Box<dyn Bot>) -> Self {
-        CallsBot { policy, inner, v1: HeuristicBot::new() }
+        CallsBot { policy, inner }
     }
 }
 
@@ -237,7 +240,7 @@ impl Bot for CallsBot {
     fn grand_tichu(&mut self, view: &PlayerView) -> bool {
         match self.policy {
             CallPolicy::Never => false,
-            CallPolicy::V1 => self.v1.grand_tichu(view),
+            CallPolicy::V1 => grand_tichu_v1(view),
             CallPolicy::V2 { grand, .. } => grand && grand_tichu_v2(view),
             CallPolicy::GrandOnly => grand_tichu_v2(view),
         }
@@ -245,7 +248,7 @@ impl Bot for CallsBot {
     fn small_tichu(&mut self, view: &PlayerView) -> bool {
         match self.policy {
             CallPolicy::Never | CallPolicy::GrandOnly => false,
-            CallPolicy::V1 => self.v1.small_tichu(view),
+            CallPolicy::V1 => small_tichu_v1(view),
             CallPolicy::V2 { threshold, .. } => small_tichu_v2(view, threshold).unwrap_or(false),
         }
     }

@@ -44,8 +44,16 @@ Findings:
 - Knowing the hands is worth ~30/deal, so hand inference is the biggest
   lever found so far. The endgame solver helps a little; two-player endgames
   occur in ~65% of rounds and usually solve in under 1 ms.
-- Call rules (v2, `src/bots/calls.rs`): winners vs losers for Tichu,
-  threshold set to break-even; card-pattern Grand rules frozen.
+- Call rules (v2, `src/bots/calls.rs`, the default since Oct 2026): winners
+  vs losers for Tichu at threshold 0; card-pattern Grand rules frozen. With
+  pimc10 play, the v2 Tichu rule at 0 vs v1 is +4.8 ± 6.1 over 800 deals.
+- Real games (148 rounds, 29 games; `examples/human_calls.rs`): humans
+  finish 1-2 in 22% of rounds (bots 33%), call Tichu at 15% of seats
+  (made 63%) and Grand at 10.5% (made 56%), and bomb 0.30 times per round.
+  They call Tichu on the same hands the v2 margin rates highly (mostly
+  margin ≥ −1) and make 75–85% of those; pimc makes ~45% of the same
+  hands. Humans called Grand on all 7 hands that met the 3-tops rule (made
+  6), but bots make 50%. The gap is in play, not in hand evaluation.
 
 ## Next steps
 
