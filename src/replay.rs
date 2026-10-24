@@ -369,6 +369,27 @@ pub fn build(game: &Value, label: &str) -> Result<Value, String> {
 const VIEWER: &str = include_str!("../viewer/replay.html");
 const DATA_MARK: &str = "/*REPLAY_DATA*/[]";
 const ART_MARK: &str = "/*CARD_ART*/{}";
+const WASM_MARK: &str = "/*REPLAY_WASM*/";
+/// This module's `build_from_text`, compiled to WebAssembly so the page can
+/// open raw game logs. Rebuild it with `scripts/build-viewer-wasm.sh` after
+/// changing the replay builder or the rules.
+const WASM: &[u8] = include_bytes!("../viewer/replay.wasm");
+
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+    }
+    s
+}
 /// Card art from the production client (`client/public/cards/` in the tichu
 /// repo), embedded so the page is one self-contained file.
 const ART: [(&str, &str); 8] = [
@@ -395,6 +416,7 @@ pub fn html_body(replays: &[Value]) -> String {
     VIEWER
         .replacen(DATA_MARK, &script_json(&json!(replays)), 1)
         .replacen(ART_MARK, &script_json(&Value::Object(art)), 1)
+        .replacen(WASM_MARK, &base64(WASM), 1)
 }
 
 /// The viewer page with `replays` (from `build`) embedded: one
@@ -404,6 +426,26 @@ pub fn html(replays: &[Value]) -> String {
         "<!doctype html>\n<html lang=\"en\">\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">\n{}\n</html>\n",
         html_body(replays)
     )
+}
+
+/// Every replay in a log file's text: one JSON document, or JSONL with one
+/// per line. Ok(empty) if the file holds no game logs.
+pub fn build_from_text(text: &str) -> Result<Vec<Value>, String> {
+    let docs: Vec<Value> = match serde_json::from_str(text) {
+        Ok(v) => vec![v],
+        Err(e) => {
+            let docs: Vec<Value> = text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect();
+            if docs.is_empty() {
+                return Err(format!("not JSON: {e}"));
+            }
+            docs
+        }
+    };
+    let mut out = Vec::new();
+    for d in &docs {
+        out.extend(build_all(d)?);
+    }
+    Ok(out)
 }
 
 /// Every replay in a log file's JSON (one per game log found).

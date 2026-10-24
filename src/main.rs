@@ -136,19 +136,12 @@ fn main() {
                     eprintln!("{path}: {e}");
                     exit(1)
                 });
-                // A JSON document, or JSONL with one per line.
-                let docs: Vec<serde_json::Value> = match serde_json::from_str(&text) {
-                    Ok(v) => vec![v],
-                    Err(_) => text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect(),
-                };
                 let before = replays.len();
-                for doc in &docs {
-                    match tichu_engine::replay::build_all(doc) {
-                        Ok(r) => replays.extend(r),
-                        Err(e) => {
-                            eprintln!("{path}: {e}");
-                            exit(1);
-                        }
+                match tichu_engine::replay::build_from_text(&text) {
+                    Ok(r) => replays.extend(r),
+                    Err(e) => {
+                        eprintln!("{path}: {e}");
+                        exit(1);
                     }
                 }
                 if replays.len() == before {

@@ -211,6 +211,8 @@ details pre { white-space: pre-wrap; font-size: 0.78rem; color: var(--ink-soft);
 .log li .t { min-width: 0; overflow-wrap: anywhere; }
 .log li.thinks .t::after { content: " · reasoning"; color: var(--claude); font-size: 0.75rem; font-weight: 800; }
 .log li.trick { color: var(--ochre-soft); }
+.notice { flex-basis: 100%; font-size: 0.88rem; padding: 6px 10px; border-radius: 8px; background: rgba(232,170,56,0.14); color: var(--ochre-soft); }
+.notice.err { background: rgba(224,86,63,0.16); color: #F3A493; }
 .empty-state { padding: 40px 16px; text-align: center; color: var(--ink-soft); }
 @media (prefers-reduced-motion: reduce) { .card { transition: none; } }
 </style>
@@ -219,10 +221,12 @@ details pre { white-space: pre-wrap; font-size: 0.78rem; color: var(--ink-soft);
   <h1>Tichu Hand Replay</h1>
   <div class="game-pick">
     <select id="game" aria-label="Game"></select>
-    <label class="file-btn">Open replay JSON…<input id="file" type="file" accept=".json,application/json"></label>
+    <label class="file-btn">Open game logs…<input id="file" type="file" accept=".json,.jsonl,application/json" multiple></label>
   </div>
   <div class="result-line" id="resultLine"></div>
+  <div class="notice" id="notice" role="status" hidden></div>
 </header>
+<div class="empty-state" id="empty" hidden>No games loaded yet. Use <b>Open game logs…</b> above to pick one or more logs (<code>tichu arena --log</code> output or a match's <code>games/deal-NNNN.json</code>).</div>
 
 <div class="layout" id="app">
   <main>
@@ -256,6 +260,7 @@ details pre { white-space: pre-wrap; font-size: 0.78rem; color: var(--ink-soft);
 
 <script id="replay-data" type="application/json">/*REPLAY_DATA*/[]</script>
 <script id="card-art" type="application/json">/*CARD_ART*/{}</script>
+<script id="replay-wasm" type="text/plain">/*REPLAY_WASM*/</script>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
@@ -292,7 +297,7 @@ details pre { white-space: pre-wrap; font-size: 0.78rem; color: var(--ink-soft);
   function md(text) {
     const lines = esc(text).trim().split('\n');
     let html = '', inList = false, para = [];
-    const inline = s => s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+    const inline = s => s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\\([*_`])/g, '$1');
     const flush = () => { if (para.length) { html += `<p>${inline(para.join(' '))}</p>`; para = []; } };
     for (const raw of lines) {
       const l = raw.trim();
@@ -495,25 +500,66 @@ details pre { white-space: pre-wrap; font-size: 0.78rem; color: var(--ink-soft);
     else if (e.key === 'End') { stop(); go(game.steps.length - 1); }
     else if (e.key === ' ') { timer ? stop() : start(); e.preventDefault(); }
   });
-  $('file').onchange = async e => {
-    const f = e.target.files[0];
-    if (!f) return;
+  // Raw game logs go through the Rust replay builder, compiled to
+  // WebAssembly (viewer/wasm), the same code as `tichu replay`.
+  let wasm = null;
+  async function builder() {
+    if (wasm) return wasm;
+    const b64 = $('replay-wasm').textContent.trim();
+    if (!b64) throw new Error('this page was built without the log reader');
+    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+    wasm = (await WebAssembly.instantiate(bytes, {})).instance.exports;
+    return wasm;
+  }
+  async function readFile(f) {
+    const text = await f.text();
+    // Replay data (`tichu replay --json`) is already built.
     try {
-      const v = JSON.parse(await f.text());
+      const v = JSON.parse(text);
       const list = Array.isArray(v) ? v : [v];
-      if (!list.length || !list[0].steps) throw new Error('not replay data');
-      replays = list;
-      init();
-    } catch (err) {
-      $('narration').innerHTML = `<span class="k">Could not open ${esc(f.name)}</span>This viewer reads replay data. Make it from a game log with <code>tichu replay LOG.json --json &gt; replay.json</code>, or build the page directly with <code>tichu replay LOG.json --out replay.html</code>.`;
+      if (list.length && list.every(r => r && Array.isArray(r.steps))) return list;
+    } catch (_) { /* JSONL, or not JSON: the builder says which */ }
+    const x = await builder();
+    const input = new TextEncoder().encode(text);
+    const p = x.alloc(input.length);
+    new Uint8Array(x.memory.buffer, p, input.length).set(input);
+    x.build(p, input.length);
+    const out = JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, x.out_ptr(), x.out_len())));
+    if (out.error) throw new Error(out.error);
+    return out;
+  }
+  function notice(html, err) {
+    const n = $('notice');
+    n.innerHTML = html;
+    n.classList.toggle('err', !!err);
+    n.hidden = !html;
+  }
+  $('file').onchange = async e => {
+    const files = [...e.target.files];
+    e.target.value = '';
+    if (!files.length) return;
+    const loaded = [], failed = [];
+    for (const f of files) {
+      try {
+        const list = await readFile(f);
+        // Name the file in each title when several were opened.
+        list.forEach(r => loaded.push(files.length > 1 ? { ...r, title: `${f.name} · ${r.title}` } : r));
+      } catch (err) {
+        failed.push(`<b>${esc(f.name)}</b>: ${esc(err.message)}`);
+      }
     }
+    if (loaded.length) {
+      replays = loaded;
+      init();
+    }
+    const ok = loaded.length ? `Opened ${loaded.length} game${loaded.length === 1 ? '' : 's'} from ${files.length - failed.length} file${files.length - failed.length === 1 ? '' : 's'}.` : '';
+    notice([ok, ...failed.map(f => `Could not open ${f}`)].filter(Boolean).join('<br>'), failed.length > 0);
   };
 
   function init() {
-    if (!replays.length) {
-      $('app').innerHTML = `<div class="empty-state">No games in this page. Build one from a game log: <code>tichu replay games/deal-0000.json --out replay.html</code>, or open replay JSON above.</div>`;
-      return;
-    }
+    $('empty').hidden = replays.length > 0;
+    $('app').hidden = replays.length === 0;
+    if (!replays.length) return;
     $('game').innerHTML = replays.map((r, i) => `<option value="${i}">${esc(r.title)}</option>`).join('');
     // Start on the first game with model reasoning in it, if any.
     const first = Math.max(0, replays.findIndex(r => r.players.some(isLlm)));

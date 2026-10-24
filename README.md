@@ -141,8 +141,12 @@ settings, the result, and `events`: every action in order, with each LLM
 question and reply (`{"type": "llm", ...}`) just before the action it led
 to. `tichu replay` finds every game log inside a file, re-runs each through
 the engine and embeds per-step snapshots (hands, table, points, calls), so
-the page needs no game logic of its own. `--json` prints that replay data
-instead; the page can also open such a file. The card art is the production
+the page needs no game logic of its own. The page's **Open game logs…**
+button takes raw logs too (several at once, JSON or JSONL): it runs the same
+builder compiled to WebAssembly (`viewer/wasm`, embedded from
+`viewer/replay.wasm`; rebuild with `scripts/build-viewer-wasm.sh` after
+changing `src/replay.rs` or the rules). `--json` prints the replay data
+instead of the page. The card art is the production
 client's (`client/public/cards/` in the tichu repo), copied to
 `viewer/cards/`.
 
