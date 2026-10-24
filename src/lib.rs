@@ -16,6 +16,7 @@ pub mod deck;
 pub mod endgame;
 pub mod engine;
 pub mod hand;
+pub mod infer;
 pub mod scoring;
 pub mod sim;
 pub mod trace;
