@@ -8,14 +8,19 @@
 //! wishes, the Dragon) is delegated to the heuristic bot.
 //!
 //! `PimcBot::oracle()` is the cheating version: it is shown the real hands
-//! (`Bot::cheats`) and simulates from those instead of guesses. Its edge over
-//! `pimcN` bounds what better hand inference could buy this search.
+//! (`Bot::cheats`) and simulates from those instead of guesses.
+//!
+//! With `noise` > 0, each rollout player makes a uniformly random legal play
+//! instead of the heuristic one with that probability. That keeps the search
+//! from over-trusting a single deterministic opponent model. It also makes
+//! `oracleN@x` vs `pimcN@x` a clean measure of what knowing the hands is
+//! worth: same rollouts, same sample count, only the hands differ.
 //!
 //! It's slow and naive (uniform sampling, a weak rollout policy, no reuse
 //! between turns) — a starting point, not a strong player.
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 
 use crate::bot::Bot;
 use crate::bots::HeuristicBot;
@@ -26,6 +31,8 @@ use crate::view::PlayerView;
 
 pub struct PimcBot {
     pub samples: usize,
+    /// Chance that a rollout player plays a random legal move.
+    pub noise: f64,
     rng: StdRng,
     base: HeuristicBot,
     /// Some(true hands) for the oracle, refreshed before every decision.
@@ -34,17 +41,62 @@ pub struct PimcBot {
 
 impl PimcBot {
     pub fn new(samples: usize, seed: u64) -> Self {
-        PimcBot { samples, rng: StdRng::seed_from_u64(seed), base: HeuristicBot::new(), oracle: None }
+        PimcBot { samples, noise: 0.0, rng: StdRng::seed_from_u64(seed), base: HeuristicBot::new(), oracle: None }
     }
 
-    /// Searches the real deal. The rollouts are deterministic, so one
-    /// "sample" is exact.
-    pub fn oracle(seed: u64) -> Self {
-        PimcBot { oracle: Some(Default::default()), ..PimcBot::new(1, seed) }
+    /// Searches the real deal, `samples` rollouts per candidate (with
+    /// noise 0 the rollouts are deterministic, so 1 is exact).
+    pub fn oracle(samples: usize, seed: u64) -> Self {
+        PimcBot { oracle: Some(Default::default()), ..PimcBot::new(samples, seed) }
     }
 
-    fn rollout_bots() -> [Box<dyn Bot>; 4] {
-        [0, 1, 2, 3].map(|_| Box::new(HeuristicBot::new()) as Box<dyn Bot>)
+    pub fn with_noise(mut self, noise: f64) -> Self {
+        self.noise = noise;
+        self
+    }
+
+    fn rollout_bots(&mut self) -> [Box<dyn Bot>; 4] {
+        let noise = self.noise;
+        [0, 1, 2, 3].map(|_| -> Box<dyn Bot> {
+            if noise > 0.0 {
+                Box::new(NoisyHeuristic { noise, rng: StdRng::seed_from_u64(self.rng.gen()), base: HeuristicBot::new() })
+            } else {
+                Box::new(HeuristicBot::new())
+            }
+        })
+    }
+}
+
+/// Rollout policy: the heuristic, but a random legal play with probability `noise`.
+struct NoisyHeuristic {
+    noise: f64,
+    rng: StdRng,
+    base: HeuristicBot,
+}
+
+impl Bot for NoisyHeuristic {
+    fn name(&self) -> String {
+        "noisy-heuristic".into()
+    }
+    fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
+        self.base.pass_cards(view)
+    }
+    fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+        if self.rng.gen_bool(self.noise) {
+            let n = plays.len() + can_pass as usize;
+            let k = self.rng.gen_range(0..n);
+            return if k < plays.len() { Some(k) } else { None };
+        }
+        self.base.play(view, plays, can_pass)
+    }
+    fn bomb(&mut self, view: &PlayerView, bombs: &[Combo]) -> Option<usize> {
+        self.base.bomb(view, bombs)
+    }
+    fn wish(&mut self, view: &PlayerView) -> Option<Rank> {
+        self.base.wish(view)
+    }
+    fn dragon_recipient(&mut self, view: &PlayerView) -> Seat {
+        self.base.dragon_recipient(view)
     }
 }
 
@@ -65,7 +117,9 @@ fn distinct_candidates(plays: &[Combo]) -> Vec<usize> {
 
 impl Bot for PimcBot {
     fn name(&self) -> String {
-        if self.oracle.is_some() { "oracle".into() } else { format!("pimc{}", self.samples) }
+        let base = if self.oracle.is_some() { "oracle" } else { "pimc" };
+        let noise = if self.noise > 0.0 { format!("@{}", self.noise) } else { String::new() };
+        format!("{base}{}{noise}", self.samples)
     }
 
     fn cheats(&self) -> bool {
@@ -119,7 +173,7 @@ impl Bot for PimcBot {
                     None => Action::PassTurn { seat: view.seat },
                 };
                 g.apply(&action).expect("candidate rejected by engine");
-                let mut bots = Self::rollout_bots();
+                let mut bots = self.rollout_bots();
                 if let Ok(r) = play_from(&mut g, &mut bots, None, false) {
                     totals[k] += (r.total(team) - r.total(1 - team)) as f64;
                 }

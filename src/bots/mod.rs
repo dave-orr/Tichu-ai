@@ -15,8 +15,8 @@ pub use random::RandomBot;
 pub const NAMES: &[(&str, &str)] = &[
     ("random", "uniformly random legal moves (some Tichu calls and bombs, to exercise the rules)"),
     ("heuristic", "simple rule-based baseline: dump low combos, don't overtake partner, save the Dragon"),
-    ("pimcN", "example search bot: N sampled deals x heuristic rollouts per candidate play (e.g. pimc20)"),
-    ("oracle", "CHEATS (diagnostic): pimc that sees every hand; bounds the value of better hand inference"),
+    ("pimcN[@x]", "example search bot: N sampled deals x heuristic rollouts per candidate play; @x = rollout noise (pimc20, pimc20@0.1)"),
+    ("oracleN[@x]", "CHEATS (diagnostic): pimc that searches the real hands (oracle1, oracle20@0.1)"),
     ("nocalls:BOT", "BOT, but never calls Tichu or Grand Tichu (e.g. nocalls:pimc20)"),
 ];
 
@@ -25,11 +25,19 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
     match name {
         "random" => Some(Box::new(RandomBot::new(seed))),
         "heuristic" => Some(Box::new(HeuristicBot::new())),
-        "oracle" => Some(Box::new(PimcBot::oracle(seed))),
         _ if name.starts_with("nocalls:") => Some(Box::new(NoCalls(by_name(&name[8..], seed)?))),
         _ => {
-            let n: usize = name.strip_prefix("pimc")?.parse().ok()?;
-            Some(Box::new(PimcBot::new(n.max(1), seed)))
+            // pimcN / oracleN, optionally @noise.
+            let (head, noise) = match name.split_once('@') {
+                Some((h, x)) => (h, x.parse::<f64>().ok().filter(|x| (0.0..=1.0).contains(x))?),
+                None => (name, 0.0),
+            };
+            let bot = if let Some(n) = head.strip_prefix("oracle") {
+                PimcBot::oracle(if n.is_empty() { 1 } else { n.parse().ok()? }, seed)
+            } else {
+                PimcBot::new(head.strip_prefix("pimc")?.parse().ok()?, seed)
+            };
+            Some(Box::new(bot.with_noise(noise)))
         }
     }
 }
