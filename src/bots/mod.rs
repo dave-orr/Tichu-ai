@@ -28,7 +28,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("eg:BOT", "BOT, but two-player endgames are solved exactly (e.g. eg:heuristic, eg:pimc20)"),
     ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, g = v2 Grand only (calls:1:pimc20)"),
     ("nocalls:BOT", "same as calls:none:BOT"),
-    ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; heuristic for calls, passes, bombs out of turn"),
+    ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; h2 for calls, passes, bombs out of turn"),
     ("vpimcN:PATH", "pimcN whose rollouts stop at my next turn and are scored by the model's value head"),
 ];
 
