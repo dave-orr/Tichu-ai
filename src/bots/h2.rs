@@ -16,7 +16,7 @@
 //!   a 1-2; push for our own 1-2 when the partner went out first; feed a
 //!   partner who is nearly out.
 //! - **Dave's rules.** Lead the Mah Jong first; wish for an Ace when the next
-//!   player called, else for a card I passed an opponent; play over a
+//!   player called, else for the card I passed the next player; play over a
 //!   partner's low single or pair unless they called (as the caller, play
 //!   over them with any loser); give the Dragon to an opponent who didn't
 //!   call.
@@ -51,8 +51,8 @@ pub struct Params {
     pub shed: f32,
     /// Lead the Mah Jong (alone or in a run) as soon as I have the lead (0/1).
     pub mj_first: f32,
-    /// Wish: 1 = an Ace if the next player called, else a card I passed an
-    /// opponent; 0 = the heuristic's (the highest card I passed an opponent).
+    /// Wish: 1 = an Ace if the next player called, else the card I passed
+    /// the next player; 0 = the heuristic's (the highest card I passed an opponent).
     pub wish_mode: f32,
     /// Play over a partner's low single (below 10) or low pair (below 8s)
     /// unless they called; as the caller, play over them with any loser (0/1).
@@ -506,16 +506,14 @@ impl Bot for H2Bot {
         if view.players[next].tichu != TichuCall::None && !view.players[next].is_out() {
             return Some(14);
         }
-        // Otherwise a card I passed an opponent, the highest, and not a rank
-        // I'd be forced to play myself if I can help it.
-        let mine = Counts::of(view.hand.iter().copied());
-        let passed: Vec<Rank> = view
-            .known_holdings()
-            .iter()
-            .filter(|(_, s)| !view.is_teammate(*s))
-            .filter_map(|(c, _)| c.rank())
-            .collect();
-        passed.iter().copied().filter(|&r| mine.n[r as usize] == 0).max().or(passed.iter().copied().max())
+        // Otherwise the card I passed the next player: they must play it on
+        // the Mah Jong right away, so the wish never binds me. Failing that
+        // (they've played it already), the one I passed the other opponent.
+        let held = view.known_holdings();
+        let passed_to = |s: Seat| held.iter().find(|(_, t)| *t == s).and_then(|(c, _)| c.rank());
+        let [a, b] = view.opponents();
+        let other = if a == next { b } else { a };
+        passed_to(next).or(passed_to(other))
     }
 
     fn dragon_recipient(&mut self, view: &PlayerView) -> Seat {
