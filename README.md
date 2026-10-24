@@ -45,6 +45,7 @@ heuristic vs random  (2000 deals)
 | `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `pimcN` (an example search bot), and `eg:BOT` (any bot plus the exact endgame solver) |
 | `src/endgame.rs` | exact alpha-beta solver for two-player endgames (see below) |
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
+| `src/llm/`, `examples/llm_match.rs` | Claude as a player (via `claude -p` on a subscription) and a resumable Claude-vs-bot match; see [docs/LLM_MATCH.md](docs/LLM_MATCH.md) |
 
 ## Writing a bot
 
