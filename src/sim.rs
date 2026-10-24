@@ -55,6 +55,15 @@ fn apply(state: &mut GameState, action: Action, obs: &mut Option<Observer>) -> R
     state.apply(&action).map_err(|error| SimError::IllegalAction { seat, action, error })
 }
 
+/// The bot in `seat`, after showing it the full state if it's a diagnostic
+/// cheater (see `Bot::cheats`).
+fn ask<'a>(bots: &'a mut [Box<dyn Bot>; 4], seat: Seat, state: &GameState) -> &'a mut Box<dyn Bot> {
+    if bots[seat].cheats() {
+        bots[seat].peek(state);
+    }
+    &mut bots[seat]
+}
+
 /// Offer bombs to the active seats in play order starting at `from` (and
 /// ending with the seat before it). Returns true if someone bombed.
 fn offer_bombs(
@@ -67,7 +76,7 @@ fn offer_bombs(
     for _ in 0..4 {
         let bombs = state.legal_bombs(seat);
         if !bombs.is_empty() {
-            if let Some(i) = bots[seat].bomb(&state.view(seat), &bombs) {
+            if let Some(i) = ask(bots, seat, state).bomb(&state.view(seat), &bombs) {
                 let b = bombs.get(i).ok_or(SimError::BadChoice { seat, what: format!("bomb index {i}") })?;
                 apply(state, Action::Bomb { seat, cards: b.cards.clone() }, obs)?;
                 return Ok(true);
@@ -96,7 +105,7 @@ fn bomb_round(
         for _ in 0..3 {
             let bombs = state.legal_bombs(seat);
             if !bombs.is_empty() {
-                if let Some(i) = bots[seat].bomb(&state.view(seat), &bombs) {
+                if let Some(i) = ask(bots, seat, state).bomb(&state.view(seat), &bombs) {
                     let b = bombs.get(i).ok_or(SimError::BadChoice { seat, what: format!("bomb index {i}") })?;
                     apply(state, Action::Bomb { seat, cards: b.cards.clone() }, obs)?;
                     bombed = Some(seat);
@@ -135,14 +144,14 @@ pub fn play_from(
         match state.pending() {
             Pending::GrandTichu(seats) => {
                 let calls: Vec<(Seat, bool)> =
-                    seats.iter().map(|&s| (s, bots[s].grand_tichu(&state.view(s)))).collect();
+                    seats.iter().map(|&s| (s, ask(bots, s, state).grand_tichu(&state.view(s)))).collect();
                 for (seat, call) in calls {
                     apply(state, Action::GrandTichu { seat, call }, &mut obs)?;
                 }
             }
             Pending::Passing(seats) => {
                 let passes: Vec<(Seat, PassInfo)> =
-                    seats.iter().map(|&s| (s, bots[s].pass_cards(&state.view(s)))).collect();
+                    seats.iter().map(|&s| (s, ask(bots, s, state).pass_cards(&state.view(s)))).collect();
                 for (seat, pass) in passes {
                     apply(state, Action::PassCards { seat, pass }, &mut obs)?;
                 }
@@ -152,19 +161,19 @@ pub fn play_from(
                     asked_small = true;
                     for i in 0..4 {
                         let s = (seat + i) % 4;
-                        if state.can_call_small_tichu(s) && bots[s].small_tichu(&state.view(s)) {
+                        if state.can_call_small_tichu(s) && ask(bots, s, state).small_tichu(&state.view(s)) {
                             apply(state, Action::SmallTichu { seat: s }, &mut obs)?;
                         }
                     }
                 } else if ask_small_tichu
                     && state.can_call_small_tichu(seat)
-                    && bots[seat].small_tichu(&state.view(seat))
+                    && ask(bots, seat, state).small_tichu(&state.view(seat))
                 {
                     apply(state, Action::SmallTichu { seat }, &mut obs)?;
                 }
                 let plays = state.legal_plays(seat);
                 let can_pass = state.can_pass(seat);
-                match bots[seat].play(&state.view(seat), &plays, can_pass) {
+                match ask(bots, seat, state).play(&state.view(seat), &plays, can_pass) {
                     None if can_pass => apply(state, Action::PassTurn { seat }, &mut obs)?,
                     None => return Err(SimError::BadChoice { seat, what: "passed when it must play".into() }),
                     Some(i) => {
@@ -176,7 +185,7 @@ pub fn play_from(
                 }
             }
             Pending::Wish(seat) => {
-                let rank = bots[seat].wish(&state.view(seat));
+                let rank = ask(bots, seat, state).wish(&state.view(seat));
                 apply(state, Action::Wish { seat, rank }, &mut obs)?;
             }
             Pending::TrickCountdown(winner) => {
@@ -190,7 +199,7 @@ pub fn play_from(
                 }
             }
             Pending::DragonGiveaway(seat) => {
-                let to = bots[seat].dragon_recipient(&state.view(seat));
+                let to = ask(bots, seat, state).dragon_recipient(&state.view(seat));
                 apply(state, Action::GiveDragon { seat, to }, &mut obs)?;
             }
             Pending::RoundOver | Pending::GameOver => {

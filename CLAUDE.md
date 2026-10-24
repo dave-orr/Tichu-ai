@@ -11,6 +11,8 @@ Rust Tichu engine + bot harness. See README.md for layout and usage.
   `TICHU_REPO`). The diff must report "Rust and TS agree on everything".
 - Bots only ever see a `PlayerView`, never `GameState`. Keep it that way, so
   no bot can cheat by accident. `GameState::from_view` is for search bots
-  that rebuild a state from a guess at the hidden hands.
+  that rebuild a state from a guess at the hidden hands. The one exception
+  is the opt-in `Bot::cheats`/`peek` hook, for diagnostic oracles only
+  (`oracle`); never use it in a bot meant to play.
 - Evaluate with `tichu arena A B` (duplicate, round mode). Quote the ± and
   the number of deals with any result.

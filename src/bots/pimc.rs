@@ -7,6 +7,10 @@
 //! the best average team margin. Everything else (calls, passing, bombs,
 //! wishes, the Dragon) is delegated to the heuristic bot.
 //!
+//! `PimcBot::oracle()` is the cheating version: it is shown the real hands
+//! (`Bot::cheats`) and simulates from those instead of guesses. Its edge over
+//! `pimcN` bounds what better hand inference could buy this search.
+//!
 //! It's slow and naive (uniform sampling, a weak rollout policy, no reuse
 //! between turns) — a starting point, not a strong player.
 
@@ -24,11 +28,19 @@ pub struct PimcBot {
     pub samples: usize,
     rng: StdRng,
     base: HeuristicBot,
+    /// Some(true hands) for the oracle, refreshed before every decision.
+    oracle: Option<[Vec<Card>; 4]>,
 }
 
 impl PimcBot {
     pub fn new(samples: usize, seed: u64) -> Self {
-        PimcBot { samples, rng: StdRng::seed_from_u64(seed), base: HeuristicBot::new() }
+        PimcBot { samples, rng: StdRng::seed_from_u64(seed), base: HeuristicBot::new(), oracle: None }
+    }
+
+    /// Searches the real deal. The rollouts are deterministic, so one
+    /// "sample" is exact.
+    pub fn oracle(seed: u64) -> Self {
+        PimcBot { oracle: Some(Default::default()), ..PimcBot::new(1, seed) }
     }
 
     fn rollout_bots() -> [Box<dyn Bot>; 4] {
@@ -53,7 +65,15 @@ fn distinct_candidates(plays: &[Combo]) -> Vec<usize> {
 
 impl Bot for PimcBot {
     fn name(&self) -> String {
-        format!("pimc{}", self.samples)
+        if self.oracle.is_some() { "oracle".into() } else { format!("pimc{}", self.samples) }
+    }
+
+    fn cheats(&self) -> bool {
+        self.oracle.is_some()
+    }
+
+    fn peek(&mut self, state: &GameState) {
+        self.oracle = Some([0, 1, 2, 3].map(|s| state.players[s].hand.clone()));
     }
 
     fn grand_tichu(&mut self, view: &PlayerView) -> bool {
@@ -87,7 +107,10 @@ impl Bot for PimcBot {
         let team = view.my_team();
         let mut totals = vec![0.0f64; options.len()];
         for _ in 0..self.samples {
-            let hands = view.sample_hands(&mut self.rng);
+            let hands = match &self.oracle {
+                Some(h) => h.clone(),
+                None => view.sample_hands(&mut self.rng),
+            };
             let base = GameState::from_view(view, hands);
             for (k, opt) in options.iter().enumerate() {
                 let mut g = base.clone();

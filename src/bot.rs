@@ -43,6 +43,16 @@ pub trait Bot {
     /// I won a trick with the Dragon: which opponent gets it?
     fn dragon_recipient(&mut self, view: &PlayerView) -> Seat;
 
+    /// Diagnostic oracles only: return true to have the simulator call `peek`
+    /// with the full game state (every hand) before each of this bot's
+    /// decisions. Used to measure how much hidden information costs; a real
+    /// bot must leave this false.
+    fn cheats(&self) -> bool {
+        false
+    }
+
+    fn peek(&mut self, _state: &crate::engine::GameState) {}
+
     /// Called on all four bots when a round ends (for learning / logging).
     fn round_over(&mut self, _view: &PlayerView, _result: &crate::scoring::RoundResult) {}
 }
