@@ -74,6 +74,13 @@ Findings from the Oct 2026 play work:
   player (who must play it at once, so the wish never binds me), +4.2 ±
   1.8; Dragon to the opponent without a call 0.0 (it only moves
   points between opponents, which matters only if that one finishes last).
+- Dave's Dog rules (`h2~dog_mode`): lead the Dog to a calling partner
+  unless I hold the Mah Jong and a winner, or a bomb plus another card; as
+  the caller lead it unless I have a clear path out; with no call on our
+  side, Mah Jong first, else Dog unless I can cash out and exit on it; with
+  bomb + Dog, bomb an opponent on ≤5 cards taking a trick, then Dog. h2 vs
+  `dog_mode=0`: +6.6 ± 1.5 (8000 deals). Nearly all of it is the lead
+  rules: the bomb part alone is +0.1 ± 0.1 (bomb + Dog is rare).
 - Most of h2's gain came from card tracking plus the hand split. One rule
   backfired badly: steering leads away from lengths a near-out opponent can
   follow cost ~24/deal (`h2~danger=4` vs `h2`), so it's off. Other knobs
