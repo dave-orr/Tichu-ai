@@ -100,7 +100,7 @@ points:
   `--threads` defaults to all cores.
 
 Rough speed on 4 cores: ~4,000 heuristic-vs-heuristic rounds/s;
-`pimc20` vs `heuristic` is about 5 deals/s.
+`pimc20` vs `heuristic` is about 2 deals/s (it wins by +62 ± 8 per deal over 400 deals).
 
 ## Checking against the TS engine
 
