@@ -37,12 +37,12 @@ def main():
     ap.add_argument("--window", type=int, default=2, help="generations of data to train on")
     ap.add_argument("--epochs", type=float, default=8)
     ap.add_argument("--arena-rounds", type=int, default=4000)
-    ap.add_argument("--tichu", default=os.path.join(ROOT, "target", "release", "tichu"))
+    ap.add_argument("--tichu", default=os.path.join(ROOT, "target", "release", "tichu.exe" if os.name == "nt" else "tichu"))
     ap.add_argument("--train-args", default="", help="extra arguments for train.py")
     args = ap.parse_args()
     d = os.path.abspath(args.dir)
     os.makedirs(d, exist_ok=True)
-    log = open(os.path.join(d, "log.txt"), "a")
+    log = open(os.path.join(d, "log.txt"), "a", encoding="utf-8")
     model = lambda g: os.path.join(d, f"gen{g}.tnet")  # noqa: E731
     data = lambda g: os.path.join(d, f"gen{g}.bin")  # noqa: E731
 
