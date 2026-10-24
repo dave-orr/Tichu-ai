@@ -6,6 +6,7 @@
 pub mod bot;
 pub mod client;
 pub mod render;
+pub mod replay;
 pub mod run;
 
 pub use bot::{Decisions, LlmBot, LlmStats};

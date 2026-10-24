@@ -121,6 +121,12 @@ and how many questions it took. When the run ends it prints the full report.
   so the game goes the same way), so no call is ever repeated.
 - **More deals.** Rerun with a bigger `--deals`.
 - **Report only.** Run the same command with `--report` added.
+- **Replay a deal.** Add `--replay N`: it re-runs deal N's two games through
+  the engine from the log and narrates them trick by trick: dealt hands, the
+  passes, every play, and at each Claude decision the options and its reply.
+  `--full` prints Claude's whole reasoning (default: its last paragraphs),
+  `--hands` shows all four hands before each play, and `--baseline` narrates
+  the fallback bot's games of the same deal instead.
 - **Settings are locked per directory.** The opponent, fallback, seed, model,
   effort and decision set are stored in `config.json`. A rerun with different
   ones is refused, so a match never mixes setups. Use `--dir` for a second
@@ -152,6 +158,7 @@ and how many questions it took. When the run ends it prints the full report.
 | `config.json` | the locked settings |
 | `results.jsonl` | one line per finished deal: margins, both seatings' full round results, the baseline, question counts |
 | `answers.jsonl` | every reply, keyed by a hash of the prompt (the resume cache) |
+| `games/deal-NNNN.json` | the full log of each game of that deal (both seatings, plus the baseline games): the deck, every action in order, and each question Claude was asked with its full reply, in the order they happened. Enough to replay the game exactly |
 | `decisions.jsonl` | every decision: deal, seat, prompt, Claude's full reply (its reasoning), the answer. Useful for seeing *why* it played what it did |
 
 ## How it calls Claude

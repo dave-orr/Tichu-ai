@@ -27,10 +27,12 @@ use crate::bot::Bot;
 use crate::bots;
 use crate::engine::GameState;
 use crate::scoring::RoundResult;
-use crate::sim::play_round;
+use crate::deck::shuffled_deck;
+use crate::engine::Action;
+use crate::sim::play_dealt_round;
 use crate::types::*;
 
-use super::bot::{Decisions, LlmBot, LlmStats};
+use super::bot::{Decisions, Events, LlmBot, LlmStats};
 use super::client::Client;
 
 /// Settings that must stay fixed across restarts of one match directory.
@@ -65,24 +67,47 @@ pub struct DealResult {
     pub baseline: Vec<SeatingResult>,
     pub llm: LlmStats,
     pub seconds: f64,
+    /// Full logs of the deal's games, written to `games/deal-NNNN.json`.
+    #[serde(skip)]
+    pub games: Option<serde_json::Value>,
 }
 
 /// Plays one seating of deal `i`, seeded exactly like `arena::run_one`.
 /// `make(seat, seed, is_a)` builds the bot for a seat; A sits at 0/2 unless
-/// `swapped`.
+/// `swapped`. Every action is appended to `events` (LLM seats add their
+/// questions and replies there too), and the game log returned holds the
+/// deck and those events: enough to replay it exactly (`replay`).
 fn play_seating(
     seed: u64,
     i: usize,
     swapped: bool,
+    names: [&str; 2],
+    events: &Events,
     make: &mut dyn FnMut(Seat, u64, bool) -> Box<dyn Bot>,
-) -> Result<SeatingResult, String> {
+) -> Result<(SeatingResult, serde_json::Value), String> {
     let mut deck_rng = StdRng::seed_from_u64(mix(seed, i as u64, 0));
     let bot_seed = mix(seed, i as u64, 1 + swapped as u64);
     let a_team: Team = if swapped { 1 } else { 0 };
     let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|s| make(s, mix(bot_seed, s as u64, 1), team_for_seat(s) == a_team));
     let mut state = GameState::new(Settings::default());
-    let r = play_round(&mut state, &mut bots, &mut deck_rng, None).map_err(|e| format!("deal {i}: {e}"))?;
-    Ok(SeatingResult { team: a_team, margin: r.total(a_team) - r.total(1 - a_team), result: r })
+    let deck = shuffled_deck(&mut deck_rng);
+    state.start_round(deck.clone());
+    let r = {
+        let mut obs = |_: &GameState, a: &Action| {
+            events.lock().unwrap().push(serde_json::json!({ "type": "action", "action": a }));
+        };
+        play_dealt_round(&mut state, &mut bots, Some(&mut obs)).map_err(|e| format!("deal {i}: {e}"))?
+    };
+    let players: Vec<&str> = (0..4).map(|s| if team_for_seat(s) == a_team { names[0] } else { names[1] }).collect();
+    let log = serde_json::json!({
+        "deal": i,
+        "swapped": swapped,
+        "players": players,
+        "deck": deck,
+        "result": r,
+        "events": std::mem::take(&mut *events.lock().unwrap()),
+    });
+    Ok((SeatingResult { team: a_team, margin: r.total(a_team) - r.total(1 - a_team), result: r }, log))
 }
 
 fn named(name: &str, seed: u64) -> Box<dyn Bot> {
@@ -94,27 +119,37 @@ pub fn play_deal(cfg: &MatchConfig, client: &Arc<Client>, i: usize, baseline: bo
     let start = Instant::now();
     let stats = Arc::new(Mutex::new(LlmStats::default()));
     let mut seatings = Vec::new();
+    let mut logs = Vec::new();
+    let llm_name = format!("llm[{}]", cfg.backend);
     for swapped in [false, true] {
+        let events: Events = Default::default();
         let mut make = |seat: Seat, s: u64, is_a: bool| -> Box<dyn Bot> {
             if is_a {
                 let tag = serde_json::json!({ "deal": i, "swapped": swapped });
                 Box::new(
                     LlmBot::new(client.clone(), named(&cfg.fallback, s), cfg.decisions)
                         .with_tag(tag)
-                        .with_shared_stats(stats.clone()),
+                        .with_shared_stats(stats.clone())
+                        .with_events(events.clone()),
                 )
             } else {
                 let _ = seat;
                 named(&cfg.opponent, s)
             }
         };
-        seatings.push(play_seating(cfg.seed, i, swapped, &mut make)?);
+        let (r, log) = play_seating(cfg.seed, i, swapped, [&llm_name, &cfg.opponent], &events, &mut make)?;
+        seatings.push(r);
+        logs.push(log);
     }
     let mut base = Vec::new();
+    let mut base_logs = Vec::new();
     if baseline {
         for swapped in [false, true] {
+            let events: Events = Default::default();
             let mut make = |_: Seat, s: u64, is_a: bool| named(if is_a { &cfg.fallback } else { &cfg.opponent }, s);
-            base.push(play_seating(cfg.seed, i, swapped, &mut make)?);
+            let (r, log) = play_seating(cfg.seed, i, swapped, [&cfg.fallback, &cfg.opponent], &events, &mut make)?;
+            base.push(r);
+            base_logs.push(log);
         }
     }
     let mean = |v: &[SeatingResult]| v.iter().map(|s| s.margin as f64).sum::<f64>() / v.len() as f64;
@@ -127,7 +162,12 @@ pub fn play_deal(cfg: &MatchConfig, client: &Arc<Client>, i: usize, baseline: bo
         baseline: base,
         llm,
         seconds: start.elapsed().as_secs_f64(),
+        games: Some(serde_json::json!({ "deal": i, "llm": logs, "baseline": base_logs })),
     })
+}
+
+pub fn game_path(dir: &Path, deal: usize) -> PathBuf {
+    dir.join("games").join(format!("deal-{deal:04}.json"))
 }
 
 pub fn read_results(dir: &Path) -> Vec<DealResult> {
@@ -190,6 +230,11 @@ pub fn run(cfg: &MatchConfig, client: Arc<Client>, opts: &RunOptions) -> Result<
                 let Some(i) = queue.lock().unwrap().pop_front() else { return };
                 match play_deal(cfg, &client, i, opts.baseline) {
                     Ok(r) => {
+                        if let Some(g) = &r.games {
+                            let games = opts.dir.join("games");
+                            let _ = std::fs::create_dir_all(&games);
+                            let _ = std::fs::write(game_path(&opts.dir, i), serde_json::to_string(g).unwrap());
+                        }
                         let mut f = out.lock().unwrap();
                         let _ = writeln!(f, "{}", serde_json::to_string(&r).unwrap());
                         let _ = f.flush();
@@ -387,6 +432,17 @@ mod tests {
         let st = again.stats();
         assert!(st.cached >= first[2].llm.asked);
         assert_eq!(st.fresh + st.cached, second[2].llm.asked + second[3].llm.asked);
+
+        // Every finished deal has a game log that replays without diverging.
+        for i in 0..4 {
+            let g: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(game_path(&dir, i)).unwrap()).unwrap();
+            for log in g["llm"].as_array().unwrap() {
+                let opts = crate::llm::replay::ReplayOptions { full: true, hands: true };
+                let text = crate::llm::replay::narrate(log, &opts).unwrap();
+                assert!(text.contains("Result:") && text.contains("asked (play)"));
+            }
+        }
 
         let changed = MatchConfig { opponent: "random".into(), ..c };
         assert!(check_config(&dir, &changed).is_err());

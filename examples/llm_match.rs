@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use tichu_engine::bots;
 use tichu_engine::llm::client::{AskError, Reply};
+use tichu_engine::llm::replay::{self, ReplayOptions};
 use tichu_engine::llm::run::{self, MatchConfig, RunOptions};
 use tichu_engine::llm::{Backend, ClaudeCli, Client, Decisions, OnLimit, Stub};
 
@@ -37,6 +38,9 @@ llm_match [options]
   --backend claude|stub  stub = fake model, for testing the setup (no calls)
   --keep-api-key       pass ANTHROPIC_API_KEY through to claude (bills the API!)
   --report             print the report for --dir and exit
+  --replay N           narrate deal N's games from --dir (both seatings) and exit;
+                       add --full for Claude's whole replies, --hands for all hands
+                       before each play, --baseline for the fallback bot's games
   --show-prompt        print the system prompt and sample questions, then exit (no calls)";
 
 struct Args(Vec<String>);
@@ -150,6 +154,22 @@ fn main() {
         }
     };
     let cfg = MatchConfig { opponent, fallback, seed, backend: backend.id(), decisions };
+
+    if let Some(n) = args.val("--replay") {
+        let deal: usize = n.parse().unwrap_or_else(|_| die("bad --replay"));
+        let path = run::game_path(&dir, deal);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+        let games: serde_json::Value = serde_json::from_str(&text).unwrap_or_else(|e| die(&e.to_string()));
+        let opts = ReplayOptions { full: args.has("--full"), hands: args.has("--hands") };
+        let which = if args.has("--baseline") { "baseline" } else { "llm" };
+        for g in games[which].as_array().into_iter().flatten() {
+            match replay::narrate(g, &opts) {
+                Ok(t) => println!("{t}"),
+                Err(e) => eprintln!("{e}"),
+            }
+        }
+        return;
+    }
 
     if args.has("--report") {
         print!("{}", run::report(&cfg, &run::read_results(&dir)));

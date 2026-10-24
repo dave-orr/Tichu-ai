@@ -79,11 +79,17 @@ pub struct LlmBot {
     tag: serde_json::Value,
     pub stats: LlmStats,
     shared_stats: Option<Arc<std::sync::Mutex<LlmStats>>>,
+    events: Option<Events>,
 }
+
+/// A game's event stream: the runner's observer appends each action, and an
+/// `LlmBot` appends each question it asked and the reply, just before the
+/// action it led to. Replays read it back (`run::replay`).
+pub type Events = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
 
 impl LlmBot {
     pub fn new(client: Arc<Client>, inner: Box<dyn Bot>, decisions: Decisions) -> Self {
-        LlmBot { client, inner, decisions, tag: serde_json::Value::Null, stats: LlmStats::default(), shared_stats: None }
+        LlmBot { client, inner, decisions, tag: serde_json::Value::Null, stats: LlmStats::default(), shared_stats: None, events: None }
     }
 
     pub fn with_tag(mut self, tag: serde_json::Value) -> Self {
@@ -95,6 +101,12 @@ impl LlmBot {
     /// them after the round, when the bot itself is gone).
     pub fn with_shared_stats(mut self, s: Arc<std::sync::Mutex<LlmStats>>) -> Self {
         self.shared_stats = Some(s);
+        self
+    }
+
+    /// Also record each question and reply into a game's event stream.
+    pub fn with_events(mut self, e: Events) -> Self {
+        self.events = Some(e);
         self
     }
 
@@ -133,11 +145,12 @@ impl LlmBot {
             }
         }
         self.bump(|s| s.fallbacks += 1);
+        self.note_fallback(view, q.kind);
         None
     }
 
     fn record(&self, view: &PlayerView, q: &Question, prompt: &str, reply: &str, nums: Option<Vec<i64>>, cached: bool) {
-        self.client.log(&json!({
+        let mut rec = json!({
             "tag": self.tag,
             "seat": view.seat,
             "kind": q.kind,
@@ -145,7 +158,20 @@ impl LlmBot {
             "prompt": prompt,
             "reply": reply,
             "answer": nums,
-        }));
+        });
+        self.client.log(&rec);
+        if let Some(e) = &self.events {
+            rec["type"] = json!("llm");
+            rec.as_object_mut().unwrap().remove("tag");
+            e.lock().unwrap().push(rec);
+        }
+    }
+
+    /// Note in the event stream that `inner` made this decision.
+    fn note_fallback(&self, view: &PlayerView, kind: &str) {
+        if let Some(e) = &self.events {
+            e.lock().unwrap().push(json!({ "type": "fallback", "seat": view.seat, "kind": kind }));
+        }
     }
 }
 
