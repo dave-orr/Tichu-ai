@@ -80,7 +80,10 @@ Findings from the Oct 2026 play work:
   side, Mah Jong first, else Dog unless I can cash out and exit on it; with
   bomb + Dog, bomb an opponent on ≤5 cards taking a trick, then Dog. h2 vs
   `dog_mode=0`: +6.6 ± 1.5 (8000 deals). Nearly all of it is the lead
-  rules: the bomb part alone is +0.1 ± 0.1 (bomb + Dog is rare).
+  rules: the bomb part alone is +0.1 ± 0.1 (bomb + Dog is rare). A clear
+  path counts a loser covered by its own winner of the same type (44 AA
+  Dog: lead 44, win it back with AA, exit on the Dog); that refinement
+  changed results by under 0.1/deal.
 - Most of h2's gain came from card tracking plus the hand split. One rule
   backfired badly: steering leads away from lengths a near-out opponent can
   follow cost ~24/deal (`h2~danger=4` vs `h2`), so it's off. Other knobs

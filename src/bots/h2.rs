@@ -428,9 +428,25 @@ fn plan(mine: &Counts, unseen: &Counts, base_cost: usize) -> Plan {
     }
 }
 
-/// Every combination but the Dog wins the lead back: cash them, exit on the Dog.
-fn clear_path(p: &Plan, mine: &Counts) -> bool {
-    p.losers <= mine.dog as usize
+/// A clear path out: every combination but the Dog either wins the lead
+/// back or is a loser covered by its own winner of the same type (lead 44,
+/// win it back with AA). Then exit on the Dog.
+fn clear_path(mine: &Counts, unseen: &Counts) -> bool {
+    let sh = shape(mine);
+    let (mut bosses, losers): (Vec<RCombo>, Vec<RCombo>) = sh.combos.iter().partition(|c| !could_beat(c, unseen));
+    let mut dragon = mine.dragon;
+    for l in &losers {
+        if let Some(i) = bosses.iter().position(|b| b.kind == l.kind && b.len == l.len) {
+            bosses.swap_remove(i);
+        } else if let Some(i) = bosses.iter().position(|b| b.kind == ComboKind::FourOfAKindBomb) {
+            bosses.swap_remove(i);
+        } else if l.kind == ComboKind::Single && dragon {
+            dragon = false;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 fn minus(hand: &[Card], play: &Combo) -> Counts {
@@ -664,7 +680,7 @@ impl H2Bot {
         let mine = Counts::of(hand.iter().copied());
         let p = plan(&mine, &sit.unseen, base_cost);
         // I can run out from the lead: spend controls freely.
-        let running = p.losers <= p.regain + 1;
+        let running = p.losers <= p.regain + 1 || (self.p.dog_mode > 0.0 && mine.dog && clear_path(&mine, &sit.unseen));
 
         let mut best: Option<(f32, usize)> = None;
         for (i, c) in plays.iter().enumerate() {
@@ -721,7 +737,7 @@ impl H2Bot {
             return None;
         }
         let p = plan(mine, &sit.unseen, base_cost);
-        let clear = clear_path(&p, mine);
+        let clear = clear_path(mine, &sit.unseen);
         let has_mj = mine.n[1] > 0;
         let lead_dog = if sit.my_live_tichu {
             !clear
@@ -756,7 +772,7 @@ impl H2Bot {
         if !sit.partner_live_tichu {
             return (0..bombs.len()).find(|&i| {
                 let rest = minus(&view.hand, &bombs[i]);
-                clear_path(&plan(&rest, &sit.unseen, cost(&rest)), &rest)
+                clear_path(&rest, &sit.unseen)
             });
         }
         None
@@ -848,5 +864,15 @@ mod tests {
         assert!(!could_beat(&pair_k, &u));
         u.phoenix = true;
         assert!(could_beat(&ace, &u));
+    }
+
+    #[test]
+    fn clear_path_covers_losers() {
+        use Suit::*;
+        let u = Counts::of([n(Jade, 9), n(Star, 9), n(Sword, 12), n(Pagoda, 12), n(Jade, 13)]);
+        let mut h = vec![n(Jade, 4), n(Star, 4), n(Jade, 14), n(Star, 14), DOG];
+        assert!(clear_path(&Counts::of(h.iter().copied()), &u));
+        h.extend([n(Jade, 7), n(Star, 7)]);
+        assert!(!clear_path(&Counts::of(h.iter().copied()), &u));
     }
 }
