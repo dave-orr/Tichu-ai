@@ -22,6 +22,14 @@ usage:
       --threads T     worker threads (default: all cores)
       --no-duplicate  play each deal once instead of once per seating
       --clockwise     clockwise play direction
+      --log DIR       write game logs (deal-NNNN.json, both seatings) for
+                      the first --log-deals deals (default 20) to DIR
+  tichu replay <LOG.json>... [--out FILE] [--json]
+                                          build the visual replay viewer
+                                          (one HTML file, default replay.html)
+                                          from game logs (tichu arena --log,
+                                          llm_match games/); --json prints the
+                                          replay data instead
   tichu play <A> <B> [--seed S]           narrate one round (A = seats 0/2)
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -54,7 +62,7 @@ impl Args {
         while i < raw.len() {
             let s = &raw[i];
             if let Some(f) = s.strip_prefix("--") {
-                let takes_value = !matches!(f, "no-duplicate" | "clockwise");
+                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only");
                 let v = if takes_value { i += 1; raw.get(i).cloned() } else { None };
                 if takes_value && v.is_none() {
                     eprintln!("--{f} needs a value");
@@ -105,12 +113,58 @@ fn main() {
             } else {
                 cfg.count = args.num("rounds").unwrap_or(2000);
             }
+            if let Some((_, Some(dir))) = args.flags.iter().find(|(k, _)| k == "log") {
+                cfg.log_dir = Some(dir.into());
+                cfg.log_deals = args.num("log-deals").unwrap_or(20);
+            }
             let start = std::time::Instant::now();
             let report = arena::run(&a, &*factory(&a), &b, &*factory(&b), &cfg);
             print!("{}", report.summary());
             println!("  ({:.1}s)", start.elapsed().as_secs_f64());
             if !report.errors.is_empty() {
                 exit(1);
+            }
+        }
+        "replay" => {
+            if args.positional.is_empty() {
+                eprintln!("{USAGE}");
+                exit(2);
+            }
+            let mut replays = Vec::new();
+            for path in &args.positional {
+                let text = std::fs::read_to_string(path).unwrap_or_else(|e| {
+                    eprintln!("{path}: {e}");
+                    exit(1)
+                });
+                // A JSON document, or JSONL with one per line.
+                let docs: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+                    Ok(v) => vec![v],
+                    Err(_) => text.lines().filter(|l| !l.trim().is_empty()).filter_map(|l| serde_json::from_str(l).ok()).collect(),
+                };
+                let before = replays.len();
+                for doc in &docs {
+                    match tichu_engine::replay::build_all(doc) {
+                        Ok(r) => replays.extend(r),
+                        Err(e) => {
+                            eprintln!("{path}: {e}");
+                            exit(1);
+                        }
+                    }
+                }
+                if replays.len() == before {
+                    eprintln!("{path}: no game logs found");
+                }
+            }
+            if args.has("json") {
+                println!("{}", serde_json::Value::from(replays));
+            } else {
+                let out = args.flags.iter().find(|(k, _)| k == "out").and_then(|(_, v)| v.clone()).unwrap_or("replay.html".into());
+                let page = if args.has("body-only") { tichu_engine::replay::html_body(&replays) } else { tichu_engine::replay::html(&replays) };
+                std::fs::write(&out, page).unwrap_or_else(|e| {
+                    eprintln!("{out}: {e}");
+                    exit(1)
+                });
+                eprintln!("wrote {out} ({} game{})", replays.len(), if replays.len() == 1 { "" } else { "s" });
             }
         }
         "play" => {

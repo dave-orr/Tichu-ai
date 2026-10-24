@@ -1,0 +1,525 @@
+<title>Tichu Hand Replay</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Nunito:wght@400;600;800;900&display=swap">
+<style>
+/* Layout: a felt card table (the production client's papercraft look) with
+   the four hands at the compass points and the trick in the middle; the
+   transport bar and narration sit under it, the model's reasoning and the
+   play log beside it (below it on a phone). One dark world, by choice. */
+:root {
+  color-scheme: dark;
+  --felt: #22342A;
+  --felt-deep: #17261E;
+  --felt-edge: #35473D;
+  --panel: #1B2B22;
+  --ink: #FFF8EC;
+  --ink-soft: #D3C8B5;
+  --ink-mute: #A9AE9F;
+  --ochre: #E8AA38;
+  --ochre-soft: #F6CF7A;
+  --stock: #FFF9EE;
+  --stock-ink: #22342A;
+  --jade: #2F8A55;
+  --pagoda: #3B6FD6;
+  --star: #D93A3A;
+  --sword: #22342A;
+  --bomb: #E0563F;
+  --claude: #D9A0F0;
+  --font-display: "Fraunces", Georgia, serif;
+  --font-body: "Nunito", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --cw: 38px;  /* hand card width */
+  --ch: 56px;
+}
+* { box-sizing: border-box; }
+html, body { background: var(--felt-deep); color: var(--ink); }
+body {
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.45;
+  padding-left: max(16px, env(safe-area-inset-left, 0px));
+  padding-right: max(16px, env(safe-area-inset-right, 0px));
+  padding-block: 16px 32px;
+}
+button, select, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--ochre); outline-offset: 2px; }
+
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 20px; margin-bottom: 14px; }
+h1 { font-family: var(--font-display); font-weight: 700; font-size: 1.6rem; margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+.game-pick { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+select, .file-btn {
+  background: var(--panel); border: 1px solid var(--felt-edge); border-radius: 8px; padding: 6px 10px; cursor: pointer;
+}
+.file-btn { color: var(--ink-soft); font-size: 0.85rem; }
+.file-btn input { display: none; }
+.result-line { color: var(--ink-soft); font-size: 0.9rem; font-variant-numeric: tabular-nums; }
+
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 420px); gap: 16px; align-items: start; }
+@media (max-width: 1000px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+
+/* ---- The table ---- */
+.table {
+  position: relative;
+  border-radius: 22px;
+  background: radial-gradient(ellipse at 50% 45%, #2C4436 0%, var(--felt) 55%, var(--felt-deep) 100%);
+  box-shadow: inset 0 0 0 1px var(--felt-edge), inset 0 0 60px rgba(0,0,0,0.35);
+  padding: 14px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) minmax(0, 1fr);
+  grid-template-areas: "top top top" "left mid right" "bottom bottom bottom";
+  gap: 12px;
+}
+.seat { display: flex; flex-direction: column; gap: 6px; min-width: 0; align-items: center; }
+.seat.s0 { grid-area: bottom; }
+.seat.s1 { grid-area: right; }
+.seat.s2 { grid-area: top; }
+.seat.s3 { grid-area: left; }
+.seat-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px 8px; font-size: 0.85rem; }
+.seat-name { font-weight: 800; padding: 2px 9px; border-radius: 999px; background: rgba(0,0,0,0.25); white-space: nowrap; }
+.seat.turn .seat-name { background: var(--ochre); color: var(--stock-ink); }
+.seat.actor .seat-name { box-shadow: 0 0 0 2px var(--ochre-soft); }
+.who { color: var(--ink-mute); font-weight: 600; }
+.who.claude { color: var(--claude); }
+.stat { color: var(--ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.badge { font-size: 0.72rem; font-weight: 900; letter-spacing: 0.06em; text-transform: uppercase; padding: 1px 7px; border-radius: 5px; }
+.badge.call { background: var(--star); color: var(--ink); }
+.badge.out { background: var(--ink-soft); color: var(--stock-ink); }
+.team-tag { font-size: 0.7rem; color: var(--ink-mute); letter-spacing: 0.06em; text-transform: uppercase; }
+
+.hand { display: flex; flex-wrap: wrap; justify-content: center; padding-left: 14px; row-gap: 6px; min-height: var(--ch); }
+.hand .card { margin-left: -14px; }
+.hand-empty { color: var(--ink-mute); font-style: italic; min-height: var(--ch); display: flex; align-items: center; }
+
+/* ---- Cards (after client/src/index.css) ---- */
+.card {
+  position: relative; flex: none;
+  width: var(--cw); height: var(--ch); border-radius: 6px;
+  background: linear-gradient(160deg, #FFFDF7 0%, #FBF1DE 100%);
+  box-shadow: inset 0 0 0 1px rgba(122,96,58,0.28), 0 1px 1px rgba(30,24,18,0.3), -2px 0 4px -2px rgba(40,28,16,0.35), 0 3px 6px -3px rgba(16,24,18,0.5);
+  color: var(--stock-ink);
+  transition: transform 0.18s ease, opacity 0.18s ease;
+}
+.card .r { position: absolute; top: 2px; left: 4px; font-weight: 900; font-size: 15px; line-height: 1; letter-spacing: -0.03em; }
+.card .p { position: absolute; top: 19px; left: 3px; width: 13px; height: 13px; }
+.card .big { position: absolute; right: 3px; bottom: 3px; width: 18px; height: 18px; opacity: 0.9; }
+.card.jade { color: var(--jade); }
+.card.pagoda { color: var(--pagoda); }
+.card.star { color: var(--star); }
+.card.sword { color: var(--sword); }
+.card.special { display: flex; align-items: center; justify-content: center; }
+.card.special img { width: 82%; height: auto; }
+.card.special .r { font-size: 13px; }
+.card.mahjong { background: #FFF4D6; color: #9A6A12; }
+.card.dog { background: #EEF2F8; color: #3F5B86; }
+.card.phoenix { background: #FFEDE0; color: #C2532A; }
+.card.dragon { background: #EAF4E6; color: #2F7A47; }
+.card.later { opacity: 0.45; }
+.card.gone { opacity: 0.18; }
+.card.recv::after {
+  content: attr(data-from); position: absolute; left: 50%; bottom: -7px; transform: translateX(-50%);
+  font-size: 9px; font-weight: 900; background: var(--ochre); color: var(--stock-ink); border-radius: 4px; padding: 0 3px; white-space: nowrap;
+}
+.card.lift { transform: translateY(-6px); box-shadow: 0 0 0 2px var(--ochre), 0 6px 10px -4px rgba(0,0,0,0.6); z-index: 1; }
+.played .card { --cw: 44px; --ch: 64px; }
+.played .card .r { font-size: 17px; }
+.played .card .p { top: 21px; width: 15px; height: 15px; }
+
+/* ---- The middle: this trick ---- */
+.mid {
+  grid-area: mid; min-width: 0;
+  border-radius: 16px; background: rgba(0,0,0,0.16); box-shadow: inset 0 0 0 1px rgba(255,248,236,0.06);
+  padding: 10px; display: grid; gap: 8px;
+  grid-template-columns: minmax(0,1fr) minmax(0,1fr) minmax(0,1fr);
+  grid-template-areas: ". t2 ." "t3 info t1" ". t0 .";
+  align-items: center; justify-items: center; min-height: 260px;
+}
+.slot { min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 3px; }
+.slot.t0 { grid-area: t0; } .slot.t1 { grid-area: t1; } .slot.t2 { grid-area: t2; } .slot.t3 { grid-area: t3; }
+.slot .played { display: flex; flex-wrap: wrap; justify-content: center; padding-left: 16px; }
+.slot .played .card { margin-left: -16px; }
+.slot .lbl { font-size: 0.75rem; color: var(--ink-soft); text-align: center; }
+.slot.latest .lbl { color: var(--ochre-soft); font-weight: 800; }
+.slot.beaten .played { opacity: 0.5; }
+.slot.latest .pass { color: var(--ochre-soft); border-color: var(--ochre); }
+.slot .played + .lbl + .pass { padding: 1px 8px; font-size: 0.7rem; }
+.slot .pass { font-weight: 900; color: var(--ink-mute); letter-spacing: 0.08em; text-transform: uppercase; font-size: 0.8rem; padding: 6px 10px; border: 1px dashed var(--felt-edge); border-radius: 8px; }
+.slot.bomb .lbl { color: var(--bomb); font-weight: 900; }
+.info { grid-area: info; text-align: center; display: flex; flex-direction: column; gap: 4px; align-items: center; }
+.info .trick-no { font-family: var(--font-display); font-size: 1.1rem; }
+.info .pts { color: var(--ink-soft); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+.info .wish { font-size: 0.8rem; font-weight: 800; color: var(--stock-ink); background: var(--ochre-soft); border-radius: 6px; padding: 1px 8px; }
+.info .won { font-weight: 800; color: var(--ochre); }
+
+@media (max-width: 640px) {
+  :root { --cw: 30px; --ch: 44px; }
+  .card .r { font-size: 12px; left: 3px; }
+  .card .p { top: 15px; width: 10px; height: 10px; left: 2px; }
+  .card .big { display: none; }
+  .hand { padding-left: 12px; } .hand .card { margin-left: -12px; }
+  .played .card { --cw: 34px; --ch: 50px; }
+  .played .card .r { font-size: 13px; }
+  .played .card .p { top: 16px; width: 11px; height: 11px; }
+  .table { padding: 8px; gap: 8px; grid-template-columns: minmax(0,1fr) minmax(0,1fr); grid-template-areas: "top top" "left right" "mid mid" "bottom bottom"; }
+  .mid { min-height: 0; }
+}
+
+/* ---- Transport and narration ---- */
+.bar { margin-top: 12px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.bar button {
+  background: var(--panel); border: 1px solid var(--felt-edge); border-radius: 8px; min-width: 40px; height: 36px; padding: 0 10px; cursor: pointer; font-weight: 800;
+}
+.bar button:hover { border-color: var(--ochre); }
+.bar button.primary { background: var(--ochre); color: var(--stock-ink); border-color: var(--ochre); min-width: 76px; }
+.bar input[type=range] { flex: 1 1 180px; min-width: 120px; accent-color: var(--ochre); }
+.counter { font-variant-numeric: tabular-nums; color: var(--ink-soft); font-size: 0.85rem; white-space: nowrap; }
+.speed { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; color: var(--ink-soft); }
+.narration {
+  margin-top: 10px; padding: 12px 14px; border-radius: 12px; background: var(--panel); box-shadow: inset 0 0 0 1px var(--felt-edge);
+  font-size: 1.05rem; font-weight: 600; min-height: 3.2em;
+}
+.narration .k { display: block; font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-mute); margin-bottom: 2px; }
+.keys { margin-top: 6px; font-size: 0.78rem; color: var(--ink-mute); }
+kbd { font-family: var(--font-body); font-weight: 800; border: 1px solid var(--felt-edge); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; }
+
+/* ---- Side: reasoning and log ---- */
+aside { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.panel { background: var(--panel); border-radius: 14px; box-shadow: inset 0 0 0 1px var(--felt-edge); padding: 12px 14px; min-width: 0; }
+.panel h2 { font-family: var(--font-display); font-weight: 500; font-size: 1.1rem; margin: 0 0 8px; }
+.thought + .thought { border-top: 1px solid var(--felt-edge); margin-top: 12px; padding-top: 12px; }
+.thought .th { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; margin-bottom: 6px; }
+.thought .th b { color: var(--claude); }
+.thought .kind { font-size: 0.72rem; font-weight: 900; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-mute); }
+.thought .chose { background: rgba(232,170,56,0.14); border-left: 3px solid var(--ochre); padding: 4px 8px; border-radius: 0 6px 6px 0; font-weight: 700; margin-bottom: 8px; overflow-wrap: anywhere; }
+.reply { color: var(--ink-soft); overflow-wrap: anywhere; }
+.reply p { margin: 0 0 8px; }
+.reply ul { margin: 0 0 8px; padding-left: 18px; }
+.reply strong { color: var(--ink); }
+.reply code { font-size: 0.9em; background: rgba(0,0,0,0.25); padding: 0 3px; border-radius: 3px; }
+.reply .answer { color: var(--ink-mute); font-size: 0.85rem; }
+details { margin-top: 6px; }
+summary { cursor: pointer; color: var(--ink-mute); font-size: 0.85rem; }
+details pre { white-space: pre-wrap; font-size: 0.78rem; color: var(--ink-soft); background: rgba(0,0,0,0.25); padding: 8px; border-radius: 8px; max-height: 320px; overflow: auto; margin: 6px 0 0; }
+#thoughtBody.stale .thought { opacity: 0.72; }
+.earlier { margin: 0 0 10px; font-size: 0.85rem; }
+.none { color: var(--ink-mute); font-style: italic; }
+.none button { font-style: normal; background: none; border: 0; color: var(--ochre-soft); text-decoration: underline; cursor: pointer; padding: 0; }
+.log { max-height: 420px; overflow-y: auto; margin: 0; padding: 0; list-style: none; font-size: 0.85rem; }
+.log li { padding: 3px 6px; border-radius: 6px; cursor: pointer; display: flex; gap: 8px; color: var(--ink-soft); }
+.log li:hover { background: rgba(255,248,236,0.05); }
+.log li.cur { background: rgba(232,170,56,0.18); color: var(--ink); }
+.log li .n { color: var(--ink-mute); font-variant-numeric: tabular-nums; min-width: 2.2em; text-align: right; }
+.log li .t { min-width: 0; overflow-wrap: anywhere; }
+.log li.thinks .t::after { content: " · reasoning"; color: var(--claude); font-size: 0.75rem; font-weight: 800; }
+.log li.trick { color: var(--ochre-soft); }
+.empty-state { padding: 40px 16px; text-align: center; color: var(--ink-soft); }
+@media (prefers-reduced-motion: reduce) { .card { transition: none; } }
+</style>
+
+<header>
+  <h1>Tichu Hand Replay</h1>
+  <div class="game-pick">
+    <select id="game" aria-label="Game"></select>
+    <label class="file-btn">Open replay JSON…<input id="file" type="file" accept=".json,application/json"></label>
+  </div>
+  <div class="result-line" id="resultLine"></div>
+</header>
+
+<div class="layout" id="app">
+  <main>
+    <div class="table" id="table"></div>
+    <div class="bar">
+      <button id="first" title="First step (Home)" aria-label="First step">⏮</button>
+      <button id="prev" title="Previous step (←)" aria-label="Previous step">◀</button>
+      <button id="play" class="primary" title="Play / pause (space)">Play</button>
+      <button id="next" title="Next step (→)" aria-label="Next step">▶</button>
+      <button id="nextTrick" title="Next trick (↓)">Trick ⏭</button>
+      <input id="scrub" type="range" min="0" value="0" aria-label="Step">
+      <span class="counter" id="counter"></span>
+      <label class="speed">Speed
+        <select id="speed">
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="4">4×</option>
+        </select>
+      </label>
+    </div>
+    <div class="narration" id="narration"></div>
+    <div class="keys"><kbd>←</kbd> <kbd>→</kbd> step · <kbd>↑</kbd> <kbd>↓</kbd> trick · <kbd>space</kbd> play/pause ·
+      <label><input type="checkbox" id="pauseThink"> pause at each model decision</label></div>
+  </main>
+  <aside>
+    <section class="panel" id="thoughts"><h2>Reasoning</h2><div id="thoughtBody"></div></section>
+    <section class="panel"><h2>Play log</h2><ol class="log" id="log"></ol></section>
+  </aside>
+</div>
+
+<script id="replay-data" type="application/json">/*REPLAY_DATA*/[]</script>
+<script id="card-art" type="application/json">/*CARD_ART*/{}</script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let replays = JSON.parse($('replay-data').textContent || '[]');
+  const artSrc = JSON.parse($('card-art').textContent || '{}');
+  const art = {};
+  for (const [k, v] of Object.entries(artSrc)) art[k] = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(v);
+
+  const RANKS = { 11: 'J', 12: 'Q', 13: 'K', 14: 'A' };
+  const SPECIAL = { mahjong: 'Mah Jong', dog: 'Dog', phoenix: 'Phoenix', dragon: 'Dragon' };
+  const SUITNAME = { jade: 'Jade', sword: 'Sword', pagoda: 'Pagoda', star: 'Star' };
+  const ORD = ['', '1st', '2nd', '3rd', '4th'];
+  const KIND = { deal: 'Deal', exchange: 'Pass', grandTichu: 'Grand Tichu', tichu: 'Tichu', play: 'Play', bomb: 'Bomb', passTurn: 'Pass', wish: 'Wish', resolve: 'Trick won', giveDragon: 'Dragon', result: 'Result' };
+
+  let game = null, idx = 0, timer = null;
+
+  const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  const isLlm = name => /^llm/.test(name || '');
+  const shortName = name => isLlm(name) ? 'Claude' : name;
+
+  function cardHTML(id, cls = '', from = null) {
+    const title = SPECIAL[id] || (() => { const [s, r] = id.split('-'); return `${RANKS[r] || r} of ${SUITNAME[s]}`; })();
+    const extra = from !== null ? ` recv" data-from="from S${from}` : '';
+    if (SPECIAL[id]) {
+      const r = id === 'mahjong' ? '<span class="r">1</span>' : '';
+      return `<div class="card special ${id} ${cls}${extra}" title="${title}">${r}<img src="${art[id] || ''}" alt="${title}"></div>`;
+    }
+    const [suit, rank] = id.split('-');
+    const pip = art['pip-' + suit] || '';
+    const big = +rank >= 11 ? `<img class="big" src="${pip}" alt="">` : '';
+    return `<div class="card ${suit} ${cls}${extra}" title="${title}"><span class="r">${RANKS[rank] || rank}</span><img class="p" src="${pip}" alt="">${big}</div>`;
+  }
+
+  function md(text) {
+    const lines = esc(text).trim().split('\n');
+    let html = '', inList = false, para = [];
+    const inline = s => s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/`([^`]+)`/g, '<code>$1</code>');
+    const flush = () => { if (para.length) { html += `<p>${inline(para.join(' '))}</p>`; para = []; } };
+    for (const raw of lines) {
+      const l = raw.trim();
+      const li = l.match(/^[-*]\s+(.*)/) || l.match(/^\d+\.\s+(.*)/);
+      if (li) { flush(); if (!inList) { html += '<ul>'; inList = true; } html += `<li>${inline(li[1])}</li>`; continue; }
+      if (inList) { html += '</ul>'; inList = false; }
+      if (!l) { flush(); continue; }
+      if (/^ANSWER:/.test(l)) { flush(); html += `<p class="answer">${l}</p>`; continue; }
+      para.push(l);
+    }
+    flush(); if (inList) html += '</ul>';
+    return html;
+  }
+
+  function loadGame(i) {
+    stop();
+    game = replays[i];
+    idx = 0;
+    $('scrub').max = game.steps.length - 1;
+    const r = game.result, p = game.players;
+    const team = t => [...new Set([p[t], p[t + 2]])].map(shortName).join(' & ');
+    $('resultLine').innerHTML = `S0/S2 ${esc(team(0))} <b>${fmt(game.totals[0])}</b> · S1/S3 ${esc(team(1))} <b>${fmt(game.totals[1])}</b>` +
+      (r.double_victory !== null && r.double_victory !== undefined ? ' · 1-2 finish' : '');
+    $('log').innerHTML = game.steps.map((s, n) =>
+      `<li data-n="${n}" class="${s.thoughts && s.thoughts.some(t => !t.fallback) ? 'thinks' : ''} ${s.kind === 'resolve' || s.kind === 'giveDragon' ? 'trick' : ''}"><span class="n">${n}</span><span class="t">${esc(s.text)}</span></li>`).join('');
+    render();
+  }
+  const fmt = n => (n > 0 ? '+' : '') + n;
+
+  function render() {
+    const s = game.steps[idx];
+    const p = game.players;
+    // Seats: S0 bottom, S1 right, S2 top, S3 left (the client's relative seating).
+    let html = '';
+    for (let seat = 0; seat < 4; seat++) {
+      const hand = s.hands[seat];
+      const recv = {};
+      (s.received?.[seat] || []).forEach(x => { recv[x.card] = x.from; });
+      const first8 = s.firstEight ? new Set(s.firstEight[seat]) : null;
+      const justPlayed = s.seat === seat && s.cards?.length ? s.cards : [];
+      const prevHand = idx > 0 ? game.steps[idx - 1].hands[seat] : hand;
+      // Show the cards this step played as faded ghosts, so the eye sees what left.
+      const ghosts = justPlayed.filter(c => !hand.includes(c) && prevHand.includes(c));
+      const all = [...hand, ...ghosts].sort((a, b) => order(a) - order(b));
+      const cards = all.map(c => cardHTML(c,
+        ghosts.includes(c) ? 'gone' : (first8 && !first8.has(c) ? 'later' : ''),
+        c in recv ? recv[c] : null)).join('');
+      const call = s.calls[seat] !== 'none' ? `<span class="badge call">${s.calls[seat] === 'grand' ? 'Grand Tichu' : 'Tichu'}</span>` : '';
+      const out = s.out[seat] ? `<span class="badge out">Out ${ORD[s.out[seat]]}</span>` : '';
+      html += `<div class="seat s${seat} ${s.turn === seat ? 'turn' : ''} ${s.seat === seat && s.kind !== 'deal' && s.kind !== 'exchange' ? 'actor' : ''}">
+        <div class="seat-head">
+          <span class="seat-name">S${seat}</span>
+          <span class="who ${isLlm(p[seat]) ? 'claude' : ''}" title="${esc(p[seat])}">${esc(shortName(p[seat]))}</span>
+          ${call}${out}
+          <span class="stat">${hand.length} cards · ${s.tricks[seat]} tricks · ${s.taken[seat]} pts</span>
+        </div>
+        ${all.length ? `<div class="hand">${cards}</div>` : `<div class="hand-empty">no cards</div>`}
+      </div>`;
+    }
+    html += midHTML(s);
+    $('table').innerHTML = html;
+
+    $('narration').innerHTML = `<span class="k">${KIND[s.kind] || s.kind}${s.trickNo ? ' · trick ' + s.trickNo : ''}</span>${esc(s.text)}`;
+    $('scrub').value = idx;
+    $('counter').textContent = `step ${idx} / ${game.steps.length - 1}`;
+    renderThoughts(s);
+    const logEl = $('log');
+    logEl.querySelectorAll('li.cur').forEach(li => li.classList.remove('cur'));
+    const cur = logEl.querySelector(`li[data-n="${idx}"]`);
+    if (cur) {
+      cur.classList.add('cur');
+      const top = cur.offsetTop - logEl.offsetTop;
+      if (top < logEl.scrollTop || top > logEl.scrollTop + logEl.clientHeight - 30) logEl.scrollTop = top - logEl.clientHeight / 2;
+    }
+  }
+
+  function order(id) {
+    const sp = { mahjong: 1, dog: 0, phoenix: 15, dragon: 16 };
+    if (id in sp) return sp[id] * 10;
+    const [suit, rank] = id.split('-');
+    return +rank * 10 + ['jade', 'sword', 'pagoda', 'star'].indexOf(suit);
+  }
+
+  function midHTML(s) {
+    const table = s.table || [];
+    // Each seat's latest action in this trick sits in front of them.
+    const last = {}, passed = {};
+    table.forEach((e, n) => {
+      if (e.kind === 'pass') passed[e.seat] = n;
+      else { last[e.seat] = { ...e, n }; delete passed[e.seat]; }
+    });
+    let lastPlayN = -1;
+    table.forEach((e, n) => { if (e.kind !== 'pass') lastPlayN = n; });
+    let html = '<div class="mid">';
+    for (let seat = 0; seat < 4; seat++) {
+      const e = last[seat];
+      const passChip = seat in passed ? `<span class="pass">Pass</span>` : '';
+      const passLatest = passed[seat] === table.length - 1;
+      if (!e) { html += `<div class="slot t${seat} ${passLatest ? 'latest' : ''}">${passChip}</div>`; continue; }
+      const latest = e.n === table.length - 1;
+      const beaten = e.n !== lastPlayN;
+      html += `<div class="slot t${seat} ${latest || passLatest ? 'latest' : ''} ${e.kind === 'bomb' ? 'bomb' : ''} ${beaten ? 'beaten' : ''}">
+        <div class="played">${e.cards.map(c => cardHTML(c, latest ? 'lift' : '')).join('')}</div>
+        <span class="lbl">${esc(e.text)}</span>${passChip}</div>`;
+    }
+    const pts = table.filter(e => e.kind !== 'pass').flatMap(e => e.cards).reduce((a, c) => a + cardPts(c), 0);
+    let info = '';
+    if (s.kind === 'deal' || s.kind === 'exchange' || s.kind === 'grandTichu') info = `<span class="trick-no">${s.kind === 'exchange' ? 'Passing' : 'The deal'}</span>`;
+    else if (s.kind === 'result') {
+      const r = game.result;
+      info = `<span class="trick-no">Round over</span><span class="pts">cards ${r.card_points[0]} – ${r.card_points[1]}</span>` +
+        (r.tichu_bonuses.some(b => b) ? `<span class="pts">calls ${fmt(r.tichu_bonuses[0])} / ${fmt(r.tichu_bonuses[1])}</span>` : '') +
+        `<span class="won">${fmt(game.totals[0])} / ${fmt(game.totals[1])}</span>`;
+    } else if (table.length) {
+      info = `<span class="trick-no">Trick ${s.trickNo}</span><span class="pts">${pts} pts on the table</span>`;
+      if (s.won) info += `<span class="won">${esc(s.text.replace(/ \(\d+ pts\)/, '').replace(/^.*?(S\d) wins.*$/, '$1 takes it'))}</span>`;
+    } else if (s.kind !== 'result') info = `<span class="pts">S${s.turn ?? '?'} to lead</span>`;
+    if (s.wish) info += `<span class="wish">Wish: ${RANKS[s.wish] || s.wish}</span>`;
+    html += `<div class="info">${info}</div></div>`;
+    return html;
+  }
+  function cardPts(id) {
+    if (id === 'dragon') return 25;
+    if (id === 'phoenix') return -25;
+    const r = +id.split('-')[1];
+    return r === 5 ? 5 : (r === 10 || r === 13) ? 10 : 0;
+  }
+
+  function renderThoughts(s) {
+    const body = $('thoughtBody');
+    // The latest decision at or before this step stays up while play goes on.
+    let at = -1;
+    for (let n = idx; n >= 0; n--) if ((game.steps[n].thoughts || []).length) { at = n; break; }
+    if (at < 0) {
+      body.innerHTML = `<p class="none">${game.players.some(isLlm) ? 'No model decision yet.' : 'Bot game: this log has no model reasoning.'}</p>`;
+      return;
+    }
+    const ts = game.steps[at].thoughts;
+    const earlier = at < idx ? `<p class="none earlier">From step ${at}: <button data-go="${at}">${esc(game.steps[at].text)}</button></p>` : '';
+    body.classList.toggle('stale', at < idx);
+    body.innerHTML = earlier + ts.map(t => {
+      if (t.fallback) return `<div class="thought"><div class="th"><b>S${t.seat}</b><span class="kind">${esc(t.kind)}</span></div><p class="none">No usable answer; the fallback bot decided.</p></div>`;
+      const menu = t.menu ? `<details><summary>Options offered</summary><pre>${esc(t.menu)}</pre></details>` : '';
+      const prompt = t.prompt ? `<details><summary>Full prompt</summary><pre>${esc(t.prompt)}</pre></details>` : '';
+      return `<div class="thought">
+        <div class="th"><b>S${t.seat} · ${esc(shortName(game.players[t.seat]))}</b><span class="kind">${esc(t.kind)} decision${t.cached ? ' · cached' : ''}</span></div>
+        ${t.chose && t.chose.length ? `<div class="chose">Chose: ${t.chose.map(esc).join(' · ')}</div>` : ''}
+        <div class="reply">${md(t.reply || '')}</div>${menu}${prompt}</div>`;
+    }).join('');
+  }
+
+  function go(n) {
+    if (!game) return;
+    idx = Math.max(0, Math.min(game.steps.length - 1, n));
+    render();
+  }
+  function trickStep(dir) {
+    let n = idx + dir;
+    const isEnd = k => ['resolve', 'giveDragon', 'exchange', 'result'].includes(game.steps[k].kind);
+    while (n > 0 && n < game.steps.length - 1 && !isEnd(n)) n += dir;
+    go(n);
+  }
+  function delay(s) {
+    const base = 1100 / +$('speed').value;
+    if (s.kind === 'passTurn') return base * 0.5;
+    if (s.kind === 'resolve' || s.kind === 'giveDragon' || s.kind === 'exchange' || s.kind === 'deal') return base * 1.6;
+    return base;
+  }
+  function tick() {
+    if (idx >= game.steps.length - 1) { stop(); return; }
+    go(idx + 1);
+    const s = game.steps[idx];
+    if ($('pauseThink').checked && (s.thoughts || []).some(t => !t.fallback)) { stop(); return; }
+    timer = setTimeout(tick, delay(s));
+  }
+  function start() {
+    if (!game) return;
+    if (idx >= game.steps.length - 1) go(0);
+    $('play').textContent = 'Pause';
+    timer = setTimeout(tick, delay(game.steps[idx]) * 0.5);
+  }
+  function stop() { clearTimeout(timer); timer = null; $('play').textContent = 'Play'; }
+
+  $('play').onclick = () => (timer ? stop() : start());
+  $('next').onclick = () => { stop(); go(idx + 1); };
+  $('prev').onclick = () => { stop(); go(idx - 1); };
+  $('first').onclick = () => { stop(); go(0); };
+  $('nextTrick').onclick = () => { stop(); trickStep(1); };
+  $('scrub').oninput = e => { stop(); go(+e.target.value); };
+  $('log').onclick = e => { const li = e.target.closest('li'); if (li) { stop(); go(+li.dataset.n); } };
+  $('thoughtBody').onclick = e => { const b = e.target.closest('button[data-go]'); if (b) { stop(); go(+b.dataset.go); } };
+  $('game').onchange = e => loadGame(+e.target.value);
+  document.addEventListener('keydown', e => {
+    if (e.target.matches('input[type=text], textarea, select')) return;
+    if (e.key === 'ArrowRight') { stop(); go(idx + 1); e.preventDefault(); }
+    else if (e.key === 'ArrowLeft') { stop(); go(idx - 1); e.preventDefault(); }
+    else if (e.key === 'ArrowDown') { stop(); trickStep(1); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { stop(); trickStep(-1); e.preventDefault(); }
+    else if (e.key === 'Home') { stop(); go(0); }
+    else if (e.key === 'End') { stop(); go(game.steps.length - 1); }
+    else if (e.key === ' ') { timer ? stop() : start(); e.preventDefault(); }
+  });
+  $('file').onchange = async e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    try {
+      const v = JSON.parse(await f.text());
+      const list = Array.isArray(v) ? v : [v];
+      if (!list.length || !list[0].steps) throw new Error('not replay data');
+      replays = list;
+      init();
+    } catch (err) {
+      $('narration').innerHTML = `<span class="k">Could not open ${esc(f.name)}</span>This viewer reads replay data. Make it from a game log with <code>tichu replay LOG.json --json &gt; replay.json</code>, or build the page directly with <code>tichu replay LOG.json --out replay.html</code>.`;
+    }
+  };
+
+  function init() {
+    if (!replays.length) {
+      $('app').innerHTML = `<div class="empty-state">No games in this page. Build one from a game log: <code>tichu replay games/deal-0000.json --out replay.html</code>, or open replay JSON above.</div>`;
+      return;
+    }
+    $('game').innerHTML = replays.map((r, i) => `<option value="${i}">${esc(r.title)}</option>`).join('');
+    // Start on the first game with model reasoning in it, if any.
+    const first = Math.max(0, replays.findIndex(r => r.players.some(isLlm)));
+    $('game').value = first;
+    loadGame(first);
+  }
+  init();
+})();
+</script>

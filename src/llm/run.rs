@@ -94,19 +94,12 @@ fn play_seating(
     state.start_round(deck.clone());
     let r = {
         let mut obs = |_: &GameState, a: &Action| {
-            events.lock().unwrap().push(serde_json::json!({ "type": "action", "action": a }));
+            events.lock().unwrap().push(crate::replay::action_event(a));
         };
         play_dealt_round(&mut state, &mut bots, Some(&mut obs)).map_err(|e| format!("deal {i}: {e}"))?
     };
     let players: Vec<&str> = (0..4).map(|s| if team_for_seat(s) == a_team { names[0] } else { names[1] }).collect();
-    let log = serde_json::json!({
-        "deal": i,
-        "swapped": swapped,
-        "players": players,
-        "deck": deck,
-        "result": r,
-        "events": std::mem::take(&mut *events.lock().unwrap()),
-    });
+    let log = crate::replay::game_log(i, swapped, &players, &state.settings, &deck, &r, std::mem::take(&mut *events.lock().unwrap()));
     Ok((SeatingResult { team: a_team, margin: r.total(a_team) - r.total(1 - a_team), result: r }, log))
 }
 

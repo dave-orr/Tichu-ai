@@ -15,7 +15,9 @@ use rand::SeedableRng;
 use crate::bot::{Bot, BotFactory};
 use crate::engine::GameState;
 use crate::scoring::RoundResult;
-use crate::sim::{play_game, play_round, SimError};
+use crate::deck::shuffled_deck;
+use crate::replay;
+use crate::sim::{play_dealt_round, play_game, play_round, SimError};
 use crate::types::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +36,11 @@ pub struct ArenaConfig {
     pub threads: usize,
     pub duplicate: bool,
     pub settings: Settings,
+    /// Write game logs (`replay::game_log`, both seatings of a deal in
+    /// `deal-NNNN.json`) for the first `log_deals` deals to this directory.
+    /// Round mode only.
+    pub log_dir: Option<std::path::PathBuf>,
+    pub log_deals: usize,
 }
 
 impl Default for ArenaConfig {
@@ -45,6 +52,8 @@ impl Default for ArenaConfig {
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
             duplicate: true,
             settings: Settings::default(),
+            log_dir: None,
+            log_deals: 0,
         }
     }
 }
@@ -198,9 +207,11 @@ struct Sample {
 }
 
 /// Play one deal (round mode) or game (game mode), once per seating.
-fn run_one(i: usize, cfg: &ArenaConfig, a: &BotFactory, b: &BotFactory) -> Sample {
+fn run_one(i: usize, cfg: &ArenaConfig, a: &BotFactory, b: &BotFactory, names: [&str; 2]) -> Sample {
     let mut out = Sample { diff: 0.0, a_win: 0.0, a: SideStats::default(), b: SideStats::default(), error: None };
     let seatings: &[bool] = if cfg.duplicate { &[false, true] } else { &[false] };
+    let log_dir = cfg.log_dir.as_ref().filter(|_| i < cfg.log_deals && cfg.mode == Mode::Rounds);
+    let mut logs = Vec::new();
     for &swapped in seatings {
         // Same deck stream for both seatings; bots seeded by seating too.
         let mut deck_rng = StdRng::seed_from_u64(mix(cfg.seed, i as u64, 0));
@@ -208,6 +219,19 @@ fn run_one(i: usize, cfg: &ArenaConfig, a: &BotFactory, b: &BotFactory) -> Sampl
         let mut bots = if swapped { make_bots(b, a, bot_seed) } else { make_bots(a, b, bot_seed) };
         let a_team: Team = if swapped { 1 } else { 0 };
         let result: Result<Vec<RoundResult>, SimError> = match cfg.mode {
+            Mode::Rounds if log_dir.is_some() => {
+                let mut state = GameState::new(cfg.settings);
+                let deck = shuffled_deck(&mut deck_rng);
+                state.start_round(deck.clone());
+                let mut events = Vec::new();
+                let mut obs = |_: &GameState, a: &crate::engine::Action| events.push(replay::action_event(a));
+                let r = play_dealt_round(&mut state, &mut bots, Some(&mut obs));
+                if let Ok(r) = &r {
+                    let players: Vec<&str> = (0..4).map(|s| names[(team_for_seat(s) != a_team) as usize]).collect();
+                    logs.push(replay::game_log(i, swapped, &players, &cfg.settings, &deck, r, events));
+                }
+                r.map(|r| vec![r])
+            }
             Mode::Rounds => {
                 let mut state = GameState::new(cfg.settings);
                 play_round(&mut state, &mut bots, &mut deck_rng, None).map(|r| vec![r])
@@ -231,6 +255,13 @@ fn run_one(i: usize, cfg: &ArenaConfig, a: &BotFactory, b: &BotFactory) -> Sampl
             }
         }
     }
+    if let Some(dir) = log_dir {
+        let path = dir.join(format!("deal-{i:04}.json"));
+        let body = serde_json::json!({ "deal": i, "games": logs });
+        if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, body.to_string())) {
+            out.error = Some(format!("#{i}: writing {}: {e}", path.display()));
+        }
+    }
     out.diff /= seatings.len() as f64;
     out.a_win /= seatings.len() as f64;
     out
@@ -244,7 +275,7 @@ pub fn run(a_name: &str, a: &BotFactory, b_name: &str, b: &BotFactory, cfg: &Are
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 scope.spawn(move || {
-                    (t..cfg.count).step_by(threads).map(|i| (i, run_one(i, cfg, a, b))).collect::<Vec<_>>()
+                    (t..cfg.count).step_by(threads).map(|i| (i, run_one(i, cfg, a, b, [a_name, b_name]))).collect::<Vec<_>>()
                 })
             })
             .collect();

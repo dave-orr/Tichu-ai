@@ -127,6 +127,10 @@ and how many questions it took. When the run ends it prints the full report.
   `--full` prints Claude's whole reasoning (default: its last paragraphs),
   `--hands` shows all four hands before each play, and `--baseline` narrates
   the fallback bot's games of the same deal instead.
+- **Watch a deal.** `tichu replay DIR/games/deal-0000.json --out deal0.html`
+  builds a visual replay of all of that deal's games: the four hands on a
+  card table, step by step or auto-play, with Claude's reasoning beside each
+  of its decisions (see "Watching a game" in the README).
 - **Settings are locked per directory.** The opponent, fallback, seed, model,
   effort and decision set are stored in `config.json`. A rerun with different
   ones is refused, so a match never mixes setups. Use `--dir` for a second
