@@ -1,2 +1,5 @@
 /target
 /.claude/worktrees
+/data
+/models
+__pycache__/

@@ -23,6 +23,13 @@ usage:
       --no-duplicate  play each deal once instead of once per seating
       --clockwise     clockwise play direction
   tichu play <A> <B> [--seed S]           narrate one round (A = seats 0/2)
+  tichu selfplay --out FILE [options]     export training records (see train/README.md)
+      --bot NAME      bot in all four seats, and the label unless --q (default heuristic)
+      --rounds N      rounds to play (default 10000)
+      --q N           label with an N-sample PIMC search instead, and write its Q-values
+      --rollout NAME  rollout policy for --q (default heuristic; e.g. net:models/q10.tnet)
+      --explore P     play a random option with probability P (the label is still recorded)
+      --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
 
@@ -118,6 +125,39 @@ fn main() {
             let (fa, fb) = (factory(&a), factory(&b));
             let mut bots: [Box<dyn Bot>; 4] = [fa(seed), fb(seed + 1), fa(seed + 2), fb(seed + 3)];
             narrate(&mut bots, seed, settings);
+        }
+        "selfplay" => {
+            let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());
+            let Some(out) = flag("out") else {
+                eprintln!("selfplay needs --out FILE");
+                exit(2);
+            };
+            let bot = flag("bot").unwrap_or_else(|| "heuristic".into());
+            let _ = factory(&bot); // exits on an unknown name
+            if let Some(r) = flag("rollout") {
+                let _ = factory(&r);
+            }
+            let cfg = tichu_engine::selfplay::SelfplayConfig {
+                bot,
+                rounds: args.num("rounds").unwrap_or(10000),
+                seed,
+                threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
+                q_samples: args.num("q").unwrap_or(0),
+                rollout: flag("rollout").unwrap_or_else(|| "heuristic".into()),
+                explore: args.num("explore").unwrap_or(0.0),
+            };
+            let file = std::fs::File::create(&out).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                exit(1)
+            });
+            let start = std::time::Instant::now();
+            match tichu_engine::selfplay::run(&cfg, &mut std::io::BufWriter::new(file)) {
+                Ok(n) => println!("wrote {n} records to {out} ({:.1}s)", start.elapsed().as_secs_f64()),
+                Err(e) => {
+                    eprintln!("{out}: {e}");
+                    exit(1)
+                }
+            }
         }
         "trace" => {
             let n: usize = args.num("rounds").unwrap_or(100);
