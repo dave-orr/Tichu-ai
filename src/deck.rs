@@ -1,9 +1,9 @@
 use rand::seq::SliceRandom;
-use rand::thread_rng;
+use rand::Rng;
 
 use crate::types::*;
 
-/// Create the full 56-card Tichu deck.
+/// The full 56-card deck, in the same order as TS `createDeck`.
 pub fn create_deck() -> Vec<Card> {
     let mut deck = Vec::with_capacity(56);
     for &suit in &Suit::ALL {
@@ -11,20 +11,19 @@ pub fn create_deck() -> Vec<Card> {
             deck.push(Card::Normal { suit, rank });
         }
     }
-    deck.push(Card::Special(SpecialKind::MahJong));
-    deck.push(Card::Special(SpecialKind::Dog));
-    deck.push(Card::Special(SpecialKind::Phoenix));
-    deck.push(Card::Special(SpecialKind::Dragon));
+    deck.extend_from_slice(&[MAH_JONG, DOG, PHOENIX, DRAGON]);
     deck
 }
 
-/// Fisher-Yates shuffle in place.
-pub fn shuffle(deck: &mut Vec<Card>) {
-    let mut rng = thread_rng();
-    deck.shuffle(&mut rng);
+/// A shuffled deck. Seat `i` is dealt `deck[14i..14i+8]` first and
+/// `deck[14i+8..14i+14]` after the Grand Tichu window (same layout as TS).
+pub fn shuffled_deck<R: Rng + ?Sized>(rng: &mut R) -> Vec<Card> {
+    let mut deck = create_deck();
+    deck.shuffle(rng);
+    deck
 }
 
 /// Sort a hand by the canonical Tichu ordering.
-pub fn sort_hand(hand: &mut Vec<Card>) {
-    hand.sort_by(|a, b| a.sort_key().partial_cmp(&b.sort_key()).unwrap());
+pub fn sort_hand(hand: &mut [Card]) {
+    hand.sort_by_key(|c| c.sort_key());
 }

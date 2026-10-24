@@ -1,18 +1,23 @@
+//! The game state machine. A port of `shared/src/engine.ts` (the production
+//! engine at tichu.squidbox.com): same phases, same turn order, same rule
+//! edge cases (Mah Jong wish, Dog, Dragon giveaway, trick countdown during
+//! which anyone may bomb). Mutable rather than immutable, for speed.
+//!
+//! Every accepted action is appended to `log`, so a round can be replayed
+//! (see `tests/ts_diff`, which replays Rust games through the TS engine).
+
+use serde::{Deserialize, Serialize};
+
 use crate::combinations::*;
 use crate::deck::*;
 use crate::scoring::*;
 use crate::types::*;
 
-use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameError {
     WrongPhase,
     NotYourTurn,
+    AlreadyDecided,
     InvalidCards,
     InvalidCombo,
     CannotBeatCurrentTrick,
@@ -21,9 +26,10 @@ pub enum GameError {
     InvalidSeat,
     InvalidDragonTarget,
     AlreadyCalledTichu,
-    MustLeadWithMahJong,
     DogMustBeLead,
-    CardNotInHand,
+    NotABomb,
+    InvalidWish,
+    Blocked,
 }
 
 impl std::fmt::Display for GameError {
@@ -34,169 +40,296 @@ impl std::fmt::Display for GameError {
 
 impl std::error::Error for GameError {}
 
-// ---------------------------------------------------------------------------
-// Game state
-// ---------------------------------------------------------------------------
+/// An action a seat (or the table) takes. Logged in application order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum Action {
+    GrandTichu { seat: Seat, call: bool },
+    SmallTichu { seat: Seat },
+    PassCards { seat: Seat, pass: PassInfo },
+    /// A play on the seat's turn (includes the Dog and on-turn bombs).
+    Play { seat: Seat, cards: Vec<Card>, #[serde(rename = "phoenixAs")] phoenix_as: Option<u8> },
+    PassTurn { seat: Seat },
+    /// A bomb thrown out of turn (or during the trick countdown).
+    Bomb { seat: Seat, cards: Vec<Card> },
+    Wish { seat: Seat, rank: Option<u8> },
+    /// The trick countdown expired with nobody bombing: award the trick.
+    ResolveTrick,
+    GiveDragon { seat: Seat, to: Seat },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Player {
+    pub hand: Vec<Card>,
+    pub tricks_won: Vec<Vec<Card>>,
+    pub tichu: TichuCall,
+    pub has_played_first_card: bool,
+    /// 0 = still in, otherwise 1-based finishing position.
+    pub out_order: u8,
+    pub grand_decided: bool,
+    pub pass: Option<PassInfo>,
+}
+
+impl Player {
+    fn new() -> Self {
+        Player {
+            hand: vec![],
+            tricks_won: vec![],
+            tichu: TichuCall::None,
+            has_played_first_card: false,
+            out_order: 0,
+            grand_decided: false,
+            pass: None,
+        }
+    }
+    pub fn is_out(&self) -> bool {
+        self.out_order != 0
+    }
+    pub fn captured_points(&self) -> i32 {
+        self.tricks_won.iter().map(|t| total_points(t)).sum()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrickPlay {
+    pub seat: Seat,
+    pub combo: Combo,
+}
+
+/// Who has to act next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pending {
+    /// These seats still have to decide on Grand Tichu (simultaneous).
+    GrandTichu(Vec<Seat>),
+    /// These seats still have to choose their pass (simultaneous).
+    Passing(Vec<Seat>),
+    /// It's this seat's turn to play or pass.
+    Turn(Seat),
+    /// This seat played the Mah Jong and must name a wish (or none).
+    Wish(Seat),
+    /// Everyone passed; the trick goes to this seat unless someone bombs.
+    TrickCountdown(Seat),
+    /// This seat won a trick with the Dragon and must give it away.
+    DragonGiveaway(Seat),
+    RoundOver,
+    GameOver,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameState {
     pub phase: Phase,
-    pub hands: [Vec<Card>; 4],
-    pub tricks_won: [Vec<Vec<Card>>; 4], // tricks_won[seat] = list of captured card piles
-    pub current_trick: Option<Combo>,    // the combo to beat (None = lead)
-    pub current_trick_cards: Vec<Card>,  // all cards in the current trick pile
-    pub current_player: Seat,
-    pub pass_count: usize,               // consecutive passes
+    pub settings: Settings,
+    pub players: [Player; 4],
+    /// Cumulative team scores.
+    pub scores: [i32; 2],
+    pub round_number: u32,
+    /// The combination to beat (None = the turn player leads).
+    pub current_trick: Option<Combo>,
+    pub trick_plays: Vec<TrickPlay>,
+    pub pass_count: usize,
+    pub turn: Seat,
     pub last_played_by: Option<Seat>,
-    pub out_order: Vec<Seat>,            // seats in the order they went out
-    pub tichu_calls: [Option<TichuCall>; 4],
-    pub grand_tichu_decided: [bool; 4],
-    pub passes: [Option<[Card; 3]>; 4],  // cards each player passes (before applying)
-    pub received_cards: [Vec<Card>; 4],
-    pub mah_jong_wish: Option<u8>,        // wished rank (None = no active wish)
-    pub dragon_giveaway: bool,            // waiting for dragon trick recipient
-    pub dragon_giveaway_seat: Option<Seat>,
-    pub scores: [i32; 2],                // cumulative team scores
-    pub round_history: Vec<(i32, i32)>,  // per-round scores
-    pub target_score: i32,
-    pub direction: Direction,
-    pub first_card_played: bool,         // has any card been played this round?
-    #[serde(skip)]
-    _remaining_cards: Option<Vec<Card>>, // stashed between deal phases
-}
-
-impl Default for GameState {
-    fn default() -> Self {
-        Self::new()
-    }
+    pub wish: Option<Rank>,
+    pub wish_pending: bool,
+    pub out_count: u8,
+    /// The undealt deck for this round (seat i gets deck[14i..14i+14]).
+    pub deck: Vec<Card>,
+    /// Some(winner) while the trick countdown runs (bombs still allowed).
+    pub trick_countdown: Option<Seat>,
+    pub dragon_giveaway_by: Option<Seat>,
+    /// Every card played this round, in order (including the Dog).
+    pub played_cards: Vec<Card>,
+    /// Cards each seat received in the pass, with the seat they came from.
+    pub received: [Vec<(Card, Seat)>; 4],
+    /// Actions applied this round.
+    pub log: Vec<Action>,
+    pub round_results: Vec<RoundResult>,
 }
 
 impl GameState {
-    pub fn new() -> Self {
+    /// A new game. Call `start_round` to deal.
+    pub fn new(settings: Settings) -> Self {
         GameState {
-            phase: Phase::Dealing,
-            hands: [vec![], vec![], vec![], vec![]],
-            tricks_won: [vec![], vec![], vec![], vec![]],
-            current_trick: None,
-            current_trick_cards: Vec::new(),
-            current_player: 0,
-            pass_count: 0,
-            last_played_by: None,
-            out_order: Vec::new(),
-            tichu_calls: [None; 4],
-            grand_tichu_decided: [false; 4],
-            passes: [None, None, None, None],
-            received_cards: [vec![], vec![], vec![], vec![]],
-            mah_jong_wish: None,
-            dragon_giveaway: false,
-            dragon_giveaway_seat: None,
+            phase: Phase::RoundEnd,
+            settings,
+            players: [Player::new(), Player::new(), Player::new(), Player::new()],
             scores: [0, 0],
-            round_history: Vec::new(),
-            target_score: 1000,
-            direction: Direction::Clockwise,
-            first_card_played: false,
-            _remaining_cards: None,
+            round_number: 0,
+            current_trick: None,
+            trick_plays: vec![],
+            pass_count: 0,
+            turn: 0,
+            last_played_by: None,
+            wish: None,
+            wish_pending: false,
+            out_count: 0,
+            deck: vec![],
+            trick_countdown: None,
+            dragon_giveaway_by: None,
+            played_cards: vec![],
+            received: Default::default(),
+            log: vec![],
+            round_results: vec![],
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Phase: Dealing
-    // -----------------------------------------------------------------------
-
-    /// Start a new round: shuffle deck, deal first 8 cards to each player.
-    pub fn start_new_round(&mut self) {
-        let mut deck = create_deck();
-        shuffle(&mut deck);
-
-        self.hands = [vec![], vec![], vec![], vec![]];
-        self.tricks_won = [vec![], vec![], vec![], vec![]];
-        self.current_trick = None;
-        self.current_trick_cards = Vec::new();
-        self.pass_count = 0;
-        self.last_played_by = None;
-        self.out_order = Vec::new();
-        self.tichu_calls = [None; 4];
-        self.grand_tichu_decided = [false; 4];
-        self.passes = [None, None, None, None];
-        self.received_cards = [vec![], vec![], vec![], vec![]];
-        self.mah_jong_wish = None;
-        self.dragon_giveaway = false;
-        self.dragon_giveaway_seat = None;
-        self.first_card_played = false;
-
-        // Deal first 8 cards.
-        for seat in 0..4 {
-            self.hands[seat] = deck[seat * 8..(seat + 1) * 8].to_vec();
-            sort_hand(&mut self.hands[seat]);
+    /// A state in the middle of play, with the given hands and `turn` to act
+    /// on an empty table. Everyone counts as having played a card already
+    /// (so no Small Tichu). Mostly for tests; see also `from_view`.
+    pub fn mid_play(settings: Settings, hands: [Vec<Card>; 4], turn: Seat) -> Self {
+        let mut s = GameState::new(settings);
+        s.phase = Phase::Playing;
+        s.round_number = 1;
+        s.turn = turn;
+        for (p, mut h) in s.players.iter_mut().zip(hands) {
+            sort_hand(&mut h);
+            p.hand = h;
+            p.grand_decided = true;
+            p.has_played_first_card = true;
         }
+        s
+    }
 
-        // Store remaining 24 cards temporarily (will be dealt after Grand Tichu window).
-        // We stash them in a deterministic way.
-        self._remaining_cards = Some(deck[32..].to_vec());
+    /// Rebuild a full game state from one seat's view plus a guess at every
+    /// hand (`hands[view.seat]` should be the view's own hand). This is the
+    /// "determinization" step of sampling-based search: sample hidden hands
+    /// (`PlayerView::sample_hands`), rebuild, then simulate with the engine.
+    ///
+    /// Captured trick piles aren't in the view, only their point totals, so
+    /// each seat's pile is replaced by placeholder cards worth the same points
+    /// (only scoring reads piles). Only valid during the playing phase.
+    pub fn from_view(view: &crate::view::PlayerView, hands: [Vec<Card>; 4]) -> Self {
+        assert_eq!(view.phase, Phase::Playing, "from_view needs the playing phase");
+        let mut s = GameState::new(view.settings);
+        s.phase = Phase::Playing;
+        s.scores = view.scores;
+        s.round_number = view.round_number;
+        for (seat, mut h) in hands.into_iter().enumerate() {
+            let pub_ = &view.players[seat];
+            sort_hand(&mut h);
+            let p = &mut s.players[seat];
+            p.hand = h;
+            p.tichu = pub_.tichu;
+            p.has_played_first_card = pub_.has_played_first_card;
+            p.out_order = pub_.out_order;
+            p.grand_decided = true;
+            p.tricks_won = vec![placeholder_pile(pub_.captured_points)];
+        }
+        s.out_count = view.players.iter().filter(|p| p.is_out()).count() as u8;
+        s.current_trick = view.current_trick.clone();
+        s.trick_plays = view.trick_plays.clone();
+        s.pass_count = view.pass_count;
+        s.turn = view.turn;
+        s.last_played_by = view.last_played_by;
+        s.wish = view.wish;
+        s.wish_pending = view.wish_pending;
+        s.trick_countdown = view.trick_countdown;
+        s.dragon_giveaway_by = view.dragon_giveaway_by;
+        s.played_cards = view.played_cards.clone();
+        s.received[view.seat] = view.received.clone();
+        s
+    }
+
+    // -----------------------------------------------------------------------
+    // Round setup
+    // -----------------------------------------------------------------------
+
+    /// Deal a new round from `deck` (56 cards; see `deck::shuffled_deck`).
+    pub fn start_round(&mut self, deck: Vec<Card>) {
+        assert_eq!(deck.len(), 56, "deck must have 56 cards");
+        for (i, p) in self.players.iter_mut().enumerate() {
+            *p = Player::new();
+            p.hand = deck[i * 14..i * 14 + 8].to_vec();
+            sort_hand(&mut p.hand);
+        }
         self.phase = Phase::GrandTichuWindow;
+        self.round_number += 1;
+        self.current_trick = None;
+        self.trick_plays.clear();
+        self.pass_count = 0;
+        self.turn = 0;
+        self.last_played_by = None;
+        self.wish = None;
+        self.wish_pending = false;
+        self.out_count = 0;
+        self.deck = deck;
+        self.trick_countdown = None;
+        self.dragon_giveaway_by = None;
+        self.played_cards.clear();
+        self.received = Default::default();
+        self.log.clear();
     }
 
-    /// Deal remaining 6 cards to each player (after Grand Tichu decisions).
-    fn deal_remaining(&mut self, remaining: Vec<Card>) {
-        for seat in 0..4 {
-            let start = seat * 6;
-            let end = start + 6;
-            self.hands[seat].extend_from_slice(&remaining[start..end]);
-            sort_hand(&mut self.hands[seat]);
+    fn deal_remaining(&mut self) {
+        for (i, p) in self.players.iter_mut().enumerate() {
+            p.hand.extend_from_slice(&self.deck[i * 14 + 8..i * 14 + 14]);
+            sort_hand(&mut p.hand);
         }
         self.phase = Phase::Passing;
     }
 
     // -----------------------------------------------------------------------
-    // Grand Tichu
+    // Generic dispatch
     // -----------------------------------------------------------------------
 
-    /// Player decides on Grand Tichu (call or decline).
-    pub fn decide_grand_tichu(&mut self, seat: Seat, call: bool) -> Result<(), GameError> {
+    pub fn apply(&mut self, action: &Action) -> Result<(), GameError> {
+        match action {
+            Action::GrandTichu { seat, call } => self.call_grand_tichu(*seat, *call),
+            Action::SmallTichu { seat } => self.call_small_tichu(*seat),
+            Action::PassCards { seat, pass } => self.pass_cards(*seat, *pass),
+            Action::Play { seat, cards, phoenix_as } => self.play(*seat, cards, *phoenix_as),
+            Action::PassTurn { seat } => self.pass_turn(*seat),
+            Action::Bomb { seat, cards } => self.bomb(*seat, cards),
+            Action::Wish { seat, rank } => self.set_wish(*seat, *rank),
+            Action::ResolveTrick => self.resolve_trick(),
+            Action::GiveDragon { seat, to } => self.give_dragon(*seat, *to),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tichu calls
+    // -----------------------------------------------------------------------
+
+    pub fn call_grand_tichu(&mut self, seat: Seat, call: bool) -> Result<(), GameError> {
+        check_seat(seat)?;
         if self.phase != Phase::GrandTichuWindow {
             return Err(GameError::WrongPhase);
         }
-        if seat >= 4 {
-            return Err(GameError::InvalidSeat);
+        if self.players[seat].grand_decided {
+            return Err(GameError::AlreadyDecided);
         }
-
+        let p = &mut self.players[seat];
+        p.grand_decided = true;
         if call {
-            self.tichu_calls[seat] = Some(TichuCall::Grand);
+            p.tichu = TichuCall::Grand;
         }
-        self.grand_tichu_decided[seat] = true;
-
-        // If all 4 have decided, deal remaining cards.
-        if self.grand_tichu_decided.iter().all(|&d| d) {
-            if let Some(remaining) = self._remaining_cards.take() {
-                self.deal_remaining(remaining);
-            }
+        self.log.push(Action::GrandTichu { seat, call });
+        if self.players.iter().all(|p| p.grand_decided) {
+            self.deal_remaining();
         }
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Small Tichu
-    // -----------------------------------------------------------------------
+    /// Whether `seat` may call Small Tichu now: during play, before their
+    /// first card, without an earlier call, and before anyone has gone out.
+    pub fn can_call_small_tichu(&self, seat: Seat) -> bool {
+        let p = &self.players[seat];
+        self.phase == Phase::Playing && !p.has_played_first_card && p.tichu == TichuCall::None && self.out_count == 0
+    }
 
-    /// Call Small Tichu (only allowed before the player's first card is played).
     pub fn call_small_tichu(&mut self, seat: Seat) -> Result<(), GameError> {
-        if self.phase != Phase::Playing && self.phase != Phase::Passing {
+        check_seat(seat)?;
+        if self.phase != Phase::Playing {
             return Err(GameError::WrongPhase);
         }
-        if seat >= 4 {
-            return Err(GameError::InvalidSeat);
-        }
-        if self.tichu_calls[seat].is_some() {
+        if self.players[seat].tichu != TichuCall::None {
             return Err(GameError::AlreadyCalledTichu);
         }
-        // Small tichu: must be before the player has played any card.
-        // In the TS engine: allowed before firstCardPlayed for any player,
-        // but actually it's per-player. The TS checks !firstCardPlayed.
-        // We'll follow the same logic: allowed before any card is played this round.
-        if self.first_card_played {
+        if !self.can_call_small_tichu(seat) {
             return Err(GameError::WrongPhase);
         }
-        self.tichu_calls[seat] = Some(TichuCall::Small);
+        self.players[seat].tichu = TichuCall::Small;
+        self.log.push(Action::SmallTichu { seat });
         Ok(())
     }
 
@@ -204,434 +337,382 @@ impl GameState {
     // Passing
     // -----------------------------------------------------------------------
 
-    /// Player submits 3 cards to pass (one to each other player).
-    /// cards[0] -> left, cards[1] -> partner, cards[2] -> right
-    pub fn pass_cards(&mut self, seat: Seat, cards: [Card; 3]) -> Result<(), GameError> {
+    pub fn pass_cards(&mut self, seat: Seat, pass: PassInfo) -> Result<(), GameError> {
+        check_seat(seat)?;
         if self.phase != Phase::Passing {
             return Err(GameError::WrongPhase);
         }
-        if seat >= 4 {
-            return Err(GameError::InvalidSeat);
+        if self.players[seat].pass.is_some() {
+            return Err(GameError::AlreadyDecided);
         }
-        // Validate cards are in hand.
-        for c in &cards {
-            if !self.hands[seat].contains(c) {
-                return Err(GameError::CardNotInHand);
-            }
-        }
-        // Validate no duplicates.
-        if cards[0] == cards[1] || cards[0] == cards[2] || cards[1] == cards[2] {
+        if !holds_distinct(&self.players[seat].hand, &pass.cards()) {
             return Err(GameError::InvalidCards);
         }
-
-        self.passes[seat] = Some(cards);
-
-        // If all 4 have submitted passes, apply them.
-        if self.passes.iter().all(|p| p.is_some()) {
+        self.players[seat].pass = Some(pass);
+        self.log.push(Action::PassCards { seat, pass });
+        if self.players.iter().all(|p| p.pass.is_some()) {
             self.apply_passes();
         }
         Ok(())
     }
 
     fn apply_passes(&mut self) {
-        // Remove passed cards from each hand and deliver to recipients.
-        // passes[seat] = [to_left, to_partner, to_right]
-        let passes: Vec<[Card; 3]> = self.passes.iter().map(|p| p.unwrap()).collect();
-
-        for seat in 0..4 {
-            let [to_left, to_partner, to_right] = passes[seat];
-            // Remove from hand.
-            for card in &[to_left, to_partner, to_right] {
-                if let Some(pos) = self.hands[seat].iter().position(|c| c == card) {
-                    self.hands[seat].remove(pos);
-                }
+        let passes: Vec<PassInfo> = self.players.iter().map(|p| p.pass.unwrap()).collect();
+        for (seat, pass) in passes.iter().enumerate() {
+            for c in pass.cards() {
+                remove_card(&mut self.players[seat].hand, c);
             }
         }
-
-        // Deliver cards.
-        for seat in 0..4 {
-            let [to_left, to_partner, to_right] = passes[seat];
-            let left = left_seat(seat);
-            let partner = partner_seat(seat);
-            let right = right_seat(seat);
-
-            self.hands[left].push(to_left);
-            self.received_cards[left].push(to_left);
-
-            self.hands[partner].push(to_partner);
-            self.received_cards[partner].push(to_partner);
-
-            self.hands[right].push(to_right);
-            self.received_cards[right].push(to_right);
-        }
-
-        // Sort all hands.
-        for seat in 0..4 {
-            sort_hand(&mut self.hands[seat]);
-        }
-
-        // Whoever holds MahJong starts.
-        for seat in 0..4 {
-            if self.hands[seat]
-                .iter()
-                .any(|c| matches!(c, Card::Special(SpecialKind::MahJong)))
-            {
-                self.current_player = seat;
-                break;
+        for r in 0..4 {
+            let (l, p, rt) = (left_seat(r), partner_seat(r), right_seat(r));
+            let got = [(passes[l].right, l), (passes[p].partner, p), (passes[rt].left, rt)];
+            for (card, from) in got {
+                self.players[r].hand.push(card);
+                self.received[r].push((card, from));
             }
         }
-
+        for p in self.players.iter_mut() {
+            sort_hand(&mut p.hand);
+        }
+        self.turn = (0..4).find(|&s| self.players[s].hand.contains(&MAH_JONG)).unwrap_or(0);
         self.phase = Phase::Playing;
     }
 
     // -----------------------------------------------------------------------
-    // Playing cards
+    // Playing
     // -----------------------------------------------------------------------
 
-    /// Play a set of cards as the current player.
-    pub fn play_cards(
-        &mut self,
-        seat: Seat,
-        cards: &[Card],
-        phoenix_as: Option<u8>,
-        mah_jong_wish: Option<u8>,
-    ) -> Result<(), GameError> {
+    /// Who has to act next.
+    pub fn pending(&self) -> Pending {
+        match self.phase {
+            Phase::GrandTichuWindow => {
+                Pending::GrandTichu((0..4).filter(|&s| !self.players[s].grand_decided).collect())
+            }
+            Phase::Passing => Pending::Passing((0..4).filter(|&s| self.players[s].pass.is_none()).collect()),
+            Phase::Playing => {
+                if let Some(s) = self.dragon_giveaway_by {
+                    Pending::DragonGiveaway(s)
+                } else if self.wish_pending {
+                    Pending::Wish(self.turn)
+                } else if let Some(w) = self.trick_countdown {
+                    Pending::TrickCountdown(w)
+                } else {
+                    Pending::Turn(self.turn)
+                }
+            }
+            Phase::RoundEnd => Pending::RoundOver,
+            Phase::GameEnd => Pending::GameOver,
+        }
+    }
+
+    /// Is the table waiting on an on-turn play/pass from `seat`?
+    fn is_turn_of(&self, seat: Seat) -> bool {
+        self.phase == Phase::Playing
+            && self.turn == seat
+            && self.dragon_giveaway_by.is_none()
+            && !self.wish_pending
+            && self.trick_countdown.is_none()
+            && !self.players[seat].is_out()
+    }
+
+    /// Play `cards` on `seat`'s turn. `phoenix_as` picks the Phoenix's reading
+    /// where ambiguous (use the value from a generated `Combo`).
+    pub fn play(&mut self, seat: Seat, cards: &[Card], phoenix_as: Option<u8>) -> Result<(), GameError> {
+        check_seat(seat)?;
         if self.phase != Phase::Playing {
             return Err(GameError::WrongPhase);
         }
-        if seat != self.current_player {
+        if self.dragon_giveaway_by.is_some() || self.wish_pending || self.trick_countdown.is_some() {
+            return Err(GameError::Blocked);
+        }
+        if self.turn != seat || self.players[seat].is_out() {
             return Err(GameError::NotYourTurn);
         }
-        if self.dragon_giveaway {
-            return Err(GameError::WrongPhase);
-        }
-        if self.is_out(seat) {
-            return Err(GameError::NotYourTurn);
+        if !holds_distinct(&self.players[seat].hand, cards) {
+            return Err(GameError::InvalidCards);
         }
 
-        // Validate all cards are in hand.
-        let mut hand_copy = self.hands[seat].clone();
-        for c in cards {
-            if let Some(pos) = hand_copy.iter().position(|h| h == c) {
-                hand_copy.remove(pos);
-            } else {
-                return Err(GameError::CardNotInHand);
+        if cards.len() == 1 && cards[0] == DOG {
+            if self.wish.is_some() && !self.wish_compliant(seat, cards) {
+                return Err(GameError::MustFulfillWish);
             }
-        }
-
-        // Dog: special handling.
-        if cards.len() == 1 && matches!(cards[0], Card::Special(SpecialKind::Dog)) {
             return self.play_dog(seat);
         }
 
-        // Identify the combination.
         let mut combo = identify_combo(cards, phoenix_as).ok_or(GameError::InvalidCombo)?;
-
-        // If playing phoenix as single, adjust rank based on current trick.
-        if cards.len() == 1 && matches!(cards[0], Card::Special(SpecialKind::Phoenix)) {
-            let last_rank = self.current_trick.as_ref().map(|ct| ct.rank);
-            combo.rank = single_card_rank(&cards[0], last_rank);
+        if combo.kind == ComboKind::Single && cards[0] == PHOENIX {
+            if let Some(cur) = &self.current_trick {
+                combo.rank = cur.rank + 0.5;
+            }
         }
-
-        // Must beat current trick (if any).
-        if let Some(ref current) = self.current_trick {
-            if !can_beat(current, &combo) {
+        if let Some(cur) = &self.current_trick {
+            if !can_beat(cur, &combo) {
                 return Err(GameError::CannotBeatCurrentTrick);
             }
         }
-
-        // MahJong wish enforcement: if there's an active wish and you're not playing
-        // a card of the wished rank, check if you COULD play a legal combo containing
-        // the wished rank. If so, you MUST include it (or play a bomb).
-        if let Some(wish_rank) = self.mah_jong_wish {
-            let plays_wish = cards.iter().any(|c| match c {
-                Card::Normal { rank, .. } => *rank == wish_rank,
-                _ => false,
-            });
-            if !plays_wish {
-                // Check if hand has a card of the wished rank and can form a legal combo.
-                let has_wished = self.hands[seat].iter().any(|c| match c {
-                    Card::Normal { rank, .. } => *rank == wish_rank,
-                    _ => false,
-                });
-                if has_wished && can_fulfill_wish(&self.hands[seat], wish_rank, self.current_trick.as_ref()) {
-                    // Allow bombs even when not fulfilling wish.
-                    if !is_bomb_combo(&combo) {
-                        return Err(GameError::MustFulfillWish);
-                    }
-                }
-            }
+        if self.wish.is_some() && !combo.is_bomb() && !self.wish_compliant(seat, cards) {
+            return Err(GameError::MustFulfillWish);
         }
 
-        // Remove cards from hand.
+        self.log.push(Action::Play { seat, cards: cards.to_vec(), phoenix_as });
+        let p = &mut self.players[seat];
         for c in cards {
-            if let Some(pos) = self.hands[seat].iter().position(|h| h == c) {
-                self.hands[seat].remove(pos);
+            remove_card(&mut p.hand, *c);
+        }
+        p.has_played_first_card = true;
+        if let Some(w) = self.wish {
+            if cards.iter().any(|c| c.rank() == Some(w)) {
+                self.wish = None;
             }
         }
+        let need_wish = cards.contains(&MAH_JONG);
+        self.mark_out_if_empty(seat);
 
-        // Check if MahJong was played -> prompt for wish.
-        let played_mahjong = cards
-            .iter()
-            .any(|c| matches!(c, Card::Special(SpecialKind::MahJong)));
-        if played_mahjong {
-            if let Some(wish) = mah_jong_wish {
-                if wish >= 2 && wish <= 14 {
-                    self.mah_jong_wish = Some(wish);
-                }
-            }
-            // If no wish provided, that's fine (player chose not to wish).
-        }
-
-        // Update trick state.
-        self.current_trick_cards.extend_from_slice(cards);
+        self.trick_plays.push(TrickPlay { seat, combo: combo.clone() });
         self.current_trick = Some(combo);
-        self.last_played_by = Some(seat);
         self.pass_count = 0;
-        self.first_card_played = true;
+        self.last_played_by = Some(seat);
+        self.wish_pending = need_wish;
+        // The turn is held on the Mah Jong player until they name a wish.
+        self.turn = if need_wish { seat } else { self.next_active(seat) };
+        self.played_cards.extend_from_slice(cards);
 
-        // Check if player went out.
-        if self.hands[seat].is_empty() {
-            self.out_order.push(seat);
-
-            // Check if wish is fulfilled (no one left with wished rank).
-            self.check_wish_fulfillment();
-        }
-
-        // Check for round end.
         if self.should_round_end() {
-            self.end_round();
-            return Ok(());
+            self.end_round_or_await_dragon();
         }
-
-        // Advance to next player.
-        self.current_player = self.get_next_active_seat(seat);
-
-        // If the new current player is the one who last played (everyone else passed or is out),
-        // award the trick.
-        if Some(self.current_player) == self.last_played_by {
-            self.award_trick();
-        }
-
         Ok(())
     }
 
     fn play_dog(&mut self, seat: Seat) -> Result<(), GameError> {
-        // Dog must be played as lead (no current trick).
         if self.current_trick.is_some() {
             return Err(GameError::DogMustBeLead);
         }
+        self.log.push(Action::Play { seat, cards: vec![DOG], phoenix_as: None });
+        remove_card(&mut self.players[seat].hand, DOG);
+        self.players[seat].has_played_first_card = true;
+        self.mark_out_if_empty(seat);
+        self.played_cards.push(DOG);
 
-        // Remove dog from hand.
-        let pos = self.hands[seat]
-            .iter()
-            .position(|c| matches!(c, Card::Special(SpecialKind::Dog)))
-            .ok_or(GameError::CardNotInHand)?;
-        self.hands[seat].remove(pos);
-        self.first_card_played = true;
-
-        // Check if player went out.
-        if self.hands[seat].is_empty() {
-            self.out_order.push(seat);
+        let mut next = partner_seat(seat);
+        if self.players[next].is_out() {
+            next = self.next_active(next);
         }
-
-        // Turn passes to partner (or next active if partner is out).
-        let partner = partner_seat(seat);
-        if self.is_out(partner) {
-            self.current_player = self.get_next_active_seat(seat);
-        } else {
-            self.current_player = partner;
+        if self.should_round_end() {
+            self.end_round();
+            return Ok(());
         }
-
-        // No trick to beat - next player leads.
+        self.turn = next;
+        self.current_trick = None;
+        self.trick_plays.clear();
+        self.pass_count = 0;
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Passing turn
-    // -----------------------------------------------------------------------
-
     pub fn pass_turn(&mut self, seat: Seat) -> Result<(), GameError> {
+        check_seat(seat)?;
         if self.phase != Phase::Playing {
             return Err(GameError::WrongPhase);
         }
-        if seat != self.current_player {
+        if self.turn != seat {
             return Err(GameError::NotYourTurn);
         }
-        if self.dragon_giveaway {
-            return Err(GameError::WrongPhase);
-        }
-
-        // Cannot pass when leading.
         if self.current_trick.is_none() {
             return Err(GameError::CannotPass);
         }
-
-        // Cannot pass if you can fulfill the wish.
-        if let Some(wish_rank) = self.mah_jong_wish {
-            if can_fulfill_wish(&self.hands[seat], wish_rank, self.current_trick.as_ref()) {
+        if self.wish_pending || self.dragon_giveaway_by.is_some() || self.trick_countdown.is_some() {
+            return Err(GameError::Blocked);
+        }
+        if let Some(w) = self.wish {
+            if can_fulfill_wish(&self.players[seat].hand, w, self.current_trick.as_ref()) {
                 return Err(GameError::MustFulfillWish);
             }
         }
-
+        self.log.push(Action::PassTurn { seat });
         self.pass_count += 1;
-
-        // Check if all active players (except trick winner) have passed.
-        let active_count = (0..4).filter(|&s| !self.is_out(s)).count();
-        // Trick is won when pass_count == active_count - 1
-        // (everyone except the last player who played has passed).
-        if self.pass_count >= active_count - 1 {
-            self.award_trick();
-            return Ok(());
+        // Won once every active player other than the last to play has passed
+        // (the last player may have gone out on that play).
+        let needed = (0..4).filter(|&s| !self.players[s].is_out() && Some(s) != self.last_played_by).count();
+        if self.pass_count >= needed {
+            self.trick_countdown = self.last_played_by;
+        } else {
+            self.turn = self.next_active(seat);
         }
-
-        self.current_player = self.get_next_active_seat(seat);
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Bombs (can be played out of turn)
-    // -----------------------------------------------------------------------
+    /// End the trick countdown: the last player to play wins the trick.
+    pub fn resolve_trick(&mut self) -> Result<(), GameError> {
+        if self.trick_countdown.is_none() {
+            return Err(GameError::WrongPhase);
+        }
+        self.log.push(Action::ResolveTrick);
+        self.trick_countdown = None;
+        self.win_trick();
+        Ok(())
+    }
 
-    /// Play a bomb (can be played out of turn by any active player).
-    pub fn play_bomb(
-        &mut self,
-        seat: Seat,
-        cards: &[Card],
-    ) -> Result<(), GameError> {
+    fn win_trick(&mut self) {
+        let winner = self.last_played_by.expect("trick without a player");
+        if self.current_trick.as_ref().is_some_and(|t| t.contains(SpecialKind::Dragon)) {
+            self.dragon_giveaway_by = Some(winner);
+            self.pass_count = 0;
+            return;
+        }
+        let cards = self.take_trick_cards();
+        self.players[winner].tricks_won.push(cards);
+        self.turn = if self.players[winner].is_out() { self.next_active(winner) } else { winner };
+        self.clear_trick();
+    }
+
+    pub fn give_dragon(&mut self, seat: Seat, to: Seat) -> Result<(), GameError> {
+        check_seat(seat)?;
+        check_seat(to)?;
+        if self.dragon_giveaway_by != Some(seat) {
+            return Err(GameError::WrongPhase);
+        }
+        if team_for_seat(seat) == team_for_seat(to) {
+            return Err(GameError::InvalidDragonTarget);
+        }
+        self.log.push(Action::GiveDragon { seat, to });
+        let cards = self.take_trick_cards();
+        self.players[to].tricks_won.push(cards);
+        self.turn = if self.players[seat].is_out() { self.next_active(seat) } else { seat };
+        self.clear_trick();
+        self.dragon_giveaway_by = None;
+        if self.should_round_end() {
+            self.end_round();
+        }
+        Ok(())
+    }
+
+    pub fn set_wish(&mut self, seat: Seat, rank: Option<Rank>) -> Result<(), GameError> {
+        check_seat(seat)?;
+        if !self.wish_pending {
+            return Err(GameError::WrongPhase);
+        }
+        if self.turn != seat {
+            return Err(GameError::NotYourTurn);
+        }
+        if rank.is_some_and(|r| !(2..=14).contains(&r)) {
+            return Err(GameError::InvalidWish);
+        }
+        self.log.push(Action::Wish { seat, rank });
+        self.wish = rank;
+        self.wish_pending = false;
+        self.turn = self.next_active(seat);
+        Ok(())
+    }
+
+    /// Throw a bomb, on turn or not. Allowed on any trick (and during the
+    /// trick countdown); on an empty table only by the player to lead.
+    pub fn bomb(&mut self, seat: Seat, cards: &[Card]) -> Result<(), GameError> {
+        check_seat(seat)?;
         if self.phase != Phase::Playing {
             return Err(GameError::WrongPhase);
         }
-        if self.is_out(seat) {
+        if self.wish_pending || self.dragon_giveaway_by.is_some() {
+            return Err(GameError::Blocked);
+        }
+        if self.players[seat].is_out() {
             return Err(GameError::NotYourTurn);
         }
-
-        // Validate cards in hand.
-        let mut hand_copy = self.hands[seat].clone();
-        for c in cards {
-            if let Some(pos) = hand_copy.iter().position(|h| h == c) {
-                hand_copy.remove(pos);
-            } else {
-                return Err(GameError::CardNotInHand);
-            }
+        if !holds_distinct(&self.players[seat].hand, cards) {
+            return Err(GameError::InvalidCards);
         }
-
+        if self.current_trick.is_none() && self.turn != seat {
+            return Err(GameError::NotYourTurn);
+        }
         let combo = identify_combo(cards, None).ok_or(GameError::InvalidCombo)?;
-        if !is_bomb_combo(&combo) {
-            return Err(GameError::InvalidCombo);
+        if !combo.is_bomb() {
+            return Err(GameError::NotABomb);
         }
-
-        // Must beat current trick (if it's also a bomb).
-        if let Some(ref current) = self.current_trick {
-            if !can_beat(current, &combo) {
+        if let Some(cur) = &self.current_trick {
+            if !can_beat(cur, &combo) {
                 return Err(GameError::CannotBeatCurrentTrick);
             }
         }
 
-        // Remove cards from hand.
+        self.log.push(Action::Bomb { seat, cards: cards.to_vec() });
+        let p = &mut self.players[seat];
         for c in cards {
-            if let Some(pos) = self.hands[seat].iter().position(|h| h == c) {
-                self.hands[seat].remove(pos);
+            remove_card(&mut p.hand, *c);
+        }
+        p.has_played_first_card = true;
+        self.mark_out_if_empty(seat);
+        if let Some(w) = self.wish {
+            if cards.iter().any(|c| c.rank() == Some(w)) {
+                self.wish = None;
             }
         }
-
-        self.current_trick_cards.extend_from_slice(cards);
+        self.trick_plays.push(TrickPlay { seat, combo: combo.clone() });
         self.current_trick = Some(combo);
+        self.pass_count = 0;
         self.last_played_by = Some(seat);
-        self.pass_count = 0;
-        self.first_card_played = true;
-
-        // Check if player went out.
-        if self.hands[seat].is_empty() {
-            self.out_order.push(seat);
-            self.check_wish_fulfillment();
-        }
-
+        self.turn = self.next_active(seat);
+        self.played_cards.extend_from_slice(cards);
+        self.trick_countdown = None;
         if self.should_round_end() {
             self.end_round();
-            return Ok(());
         }
-
-        // Turn advances to next player after bomber.
-        self.current_player = self.get_next_active_seat(seat);
         Ok(())
     }
 
     // -----------------------------------------------------------------------
-    // Dragon giveaway
+    // Legal moves
     // -----------------------------------------------------------------------
 
-    /// After winning a trick with Dragon, the winner must give it to an opponent.
-    pub fn give_dragon_trick(&mut self, seat: Seat, target: Seat) -> Result<(), GameError> {
-        if !self.dragon_giveaway {
-            return Err(GameError::WrongPhase);
+    /// Every play `seat` may make on their turn right now (empty if it isn't
+    /// their turn). Includes the Dog when leading and bombs; applies the wish.
+    pub fn legal_plays(&self, seat: Seat) -> Vec<Combo> {
+        if !self.is_turn_of(seat) {
+            return vec![];
         }
-        if self.dragon_giveaway_seat != Some(seat) {
-            return Err(GameError::NotYourTurn);
+        let hand = &self.players[seat].hand;
+        let mut plays = playable_combos(hand, self.current_trick.as_ref());
+        if let Some(w) = self.wish {
+            if can_fulfill_wish(hand, w, self.current_trick.as_ref()) {
+                plays.retain(|c| c.is_bomb() || c.contains_rank(w));
+            }
         }
-        // Target must be on opposing team.
-        if team_for_seat(target) == team_for_seat(seat) {
-            return Err(GameError::InvalidDragonTarget);
-        }
-
-        // Give trick cards to target.
-        let trick_cards = std::mem::take(&mut self.current_trick_cards);
-        self.tricks_won[target].push(trick_cards);
-
-        self.dragon_giveaway = false;
-        self.dragon_giveaway_seat = None;
-        self.current_trick = None;
-
-        // Next player leads.
-        if self.is_out(seat) {
-            self.current_player = self.get_next_active_seat(seat);
-        } else {
-            self.current_player = seat; // Winner leads.
-        }
-
-        if self.should_round_end() {
-            self.end_round();
-        }
-
-        Ok(())
+        plays
     }
 
-    // -----------------------------------------------------------------------
-    // Trick resolution
-    // -----------------------------------------------------------------------
-
-    fn award_trick(&mut self) {
-        let winner = self.last_played_by.unwrap();
-
-        // Check if dragon is in the trick.
-        let has_dragon = self
-            .current_trick_cards
-            .iter()
-            .any(|c| matches!(c, Card::Special(SpecialKind::Dragon)));
-
-        if has_dragon {
-            // Dragon winner must give trick to an opponent.
-            self.dragon_giveaway = true;
-            self.dragon_giveaway_seat = Some(winner);
-            // Don't clear trick yet - it will be given away.
-            // But clear the combo so no one needs to beat it.
-            self.current_trick = None;
-            self.pass_count = 0;
-            return;
+    /// May `seat` pass on their turn right now?
+    pub fn can_pass(&self, seat: Seat) -> bool {
+        if !self.is_turn_of(seat) || self.current_trick.is_none() {
+            return false;
         }
-
-        // Normal trick: cards go to winner.
-        let trick_cards = std::mem::take(&mut self.current_trick_cards);
-        self.tricks_won[winner].push(trick_cards);
-        self.current_trick = None;
-        self.pass_count = 0;
-
-        // Winner leads next (or next active if winner is out).
-        if self.is_out(winner) {
-            self.current_player = self.get_next_active_seat(winner);
-        } else {
-            self.current_player = winner;
+        match self.wish {
+            Some(w) => !can_fulfill_wish(&self.players[seat].hand, w, self.current_trick.as_ref()),
+            None => true,
         }
+    }
+
+    /// Bombs `seat` could throw right now, in or out of turn.
+    pub fn legal_bombs(&self, seat: Seat) -> Vec<Combo> {
+        if self.phase != Phase::Playing || self.wish_pending || self.dragon_giveaway_by.is_some() {
+            return vec![];
+        }
+        let p = &self.players[seat];
+        if p.is_out() || p.hand.len() < 4 {
+            return vec![];
+        }
+        if self.current_trick.is_none() && self.turn != seat {
+            return vec![];
+        }
+        let mut bombs = playable_combos(&p.hand, self.current_trick.as_ref());
+        bombs.retain(|c| c.is_bomb());
+        bombs
+    }
+
+    /// Would playing `cards` satisfy the wish rule for `seat`?
+    fn wish_compliant(&self, seat: Seat, cards: &[Card]) -> bool {
+        let Some(w) = self.wish else { return true };
+        let hand = &self.players[seat].hand;
+        if !hand.iter().any(|c| c.rank() == Some(w)) || cards.iter().any(|c| c.rank() == Some(w)) {
+            return true;
+        }
+        !can_fulfill_wish(hand, w, self.current_trick.as_ref())
     }
 
     // -----------------------------------------------------------------------
@@ -639,55 +720,62 @@ impl GameState {
     // -----------------------------------------------------------------------
 
     fn should_round_end(&self) -> bool {
-        let out_count = self.out_order.len();
-        if out_count >= 3 {
+        if self.out_count >= 3 {
             return true;
         }
-        // Double victory: first two out are same team.
-        if out_count >= 2 && team_for_seat(self.out_order[0]) == team_for_seat(self.out_order[1]) {
-            return true;
+        if self.out_count == 2 {
+            let out: Vec<Seat> = (0..4).filter(|&s| self.players[s].is_out()).collect();
+            return team_for_seat(out[0]) == team_for_seat(out[1]);
         }
         false
     }
 
-    fn end_round(&mut self) {
-        // If a trick is in progress (not dragon giveaway), award it.
-        if !self.dragon_giveaway && self.last_played_by.is_some() && !self.current_trick_cards.is_empty() {
-            let winner = self.last_played_by.unwrap();
-            let trick_cards = std::mem::take(&mut self.current_trick_cards);
-            self.tricks_won[winner].push(trick_cards);
+    /// End the round, unless the play that ended it left the Dragon on top:
+    /// then the giveaway comes first (give_dragon ends the round).
+    fn end_round_or_await_dragon(&mut self) {
+        let dragon_on_top = self.current_trick.as_ref().is_some_and(|t| t.contains(SpecialKind::Dragon));
+        if dragon_on_top && self.last_played_by.is_some() && self.out_count >= 3 {
+            self.dragon_giveaway_by = self.last_played_by;
+            self.pass_count = 0;
+            return;
         }
-
-        // Fill remaining out_order slots.
-        for seat in 0..4 {
-            if !self.out_order.contains(&seat) {
-                self.out_order.push(seat);
-            }
-        }
-
-        let (t0, t1) = score_round(
-            &self.out_order,
-            &self.tricks_won,
-            &self.hands,
-            &self.tichu_calls,
-        );
-
-        self.scores[0] += t0;
-        self.scores[1] += t1;
-        self.round_history.push((t0, t1));
-
-        // Check game end.
-        if self.is_game_over() {
-            self.phase = Phase::GameEnd;
-        } else {
-            self.phase = Phase::RoundEnd;
-        }
+        self.end_round();
     }
 
-    fn is_game_over(&self) -> bool {
-        let s0 = self.scores[0];
-        let s1 = self.scores[1];
-        (s0 >= self.target_score || s1 >= self.target_score) && s0 != s1
+    fn end_round(&mut self) {
+        // A trick still on the table goes to whoever played last (to an
+        // opponent if the Dragon is on top).
+        if !self.trick_plays.is_empty() {
+            if let Some(last) = self.last_played_by {
+                let dragon_on_top = self.current_trick.as_ref().is_some_and(|t| t.contains(SpecialKind::Dragon));
+                let to = if dragon_on_top { right_seat(last) } else { last };
+                let cards = self.take_trick_cards();
+                self.players[to].tricks_won.push(cards);
+                self.current_trick = None;
+            }
+        }
+        let out_order = [0, 1, 2, 3].map(|s| self.players[s].out_order);
+        let tricks = [0, 1, 2, 3].map(|s| self.players[s].tricks_won.clone());
+        let hands = [0, 1, 2, 3].map(|s| self.players[s].hand.clone());
+        let calls = [0, 1, 2, 3].map(|s| self.players[s].tichu);
+        let result = score_round(&out_order, &tricks, &hands, &calls);
+        self.scores[0] += result.total(0);
+        self.scores[1] += result.total(1);
+        self.round_results.push(result);
+        self.phase =
+            if is_game_over(self.scores, self.settings.target_score) { Phase::GameEnd } else { Phase::RoundEnd };
+    }
+
+    pub fn last_result(&self) -> Option<&RoundResult> {
+        self.round_results.last()
+    }
+
+    /// The winning team once the game is over.
+    pub fn winner(&self) -> Option<Team> {
+        if self.phase != Phase::GameEnd {
+            return None;
+        }
+        Some(if self.scores[0] > self.scores[1] { 0 } else { 1 })
     }
 
     // -----------------------------------------------------------------------
@@ -695,134 +783,72 @@ impl GameState {
     // -----------------------------------------------------------------------
 
     pub fn is_out(&self, seat: Seat) -> bool {
-        self.out_order.contains(&seat)
+        self.players[seat].is_out()
     }
 
-    fn get_next_active_seat(&self, from: Seat) -> Seat {
-        let step = match self.direction {
-            Direction::Clockwise => 1,
-            Direction::CounterClockwise => 3,
-        };
-        let mut next = (from + step) % 4;
+    /// The seat after `seat` in play order (ignoring who is out).
+    pub fn next_seat(&self, seat: Seat) -> Seat {
+        if self.settings.clockwise { left_seat(seat) } else { right_seat(seat) }
+    }
+
+    /// The next seat after `from`, in play order, that still holds cards.
+    pub fn next_active(&self, from: Seat) -> Seat {
+        let mut next = self.next_seat(from);
         for _ in 0..4 {
-            if !self.is_out(next) {
+            if !self.players[next].is_out() {
                 return next;
             }
-            next = (next + step) % 4;
+            next = self.next_seat(next);
         }
-        from // shouldn't happen
+        next
     }
 
-    fn check_wish_fulfillment(&mut self) {
-        if let Some(wish_rank) = self.mah_jong_wish {
-            // Wish is fulfilled when no active player holds a card of that rank.
-            let anyone_has_it = (0..4)
-                .filter(|&s| !self.is_out(s))
-                .any(|s| {
-                    self.hands[s].iter().any(|c| match c {
-                        Card::Normal { rank, .. } => *rank == wish_rank,
-                        _ => false,
-                    })
-                });
-            if !anyone_has_it {
-                self.mah_jong_wish = None;
-            }
+    fn mark_out_if_empty(&mut self, seat: Seat) {
+        if self.players[seat].hand.is_empty() && !self.players[seat].is_out() {
+            self.out_count += 1;
+            self.players[seat].out_order = self.out_count;
         }
     }
 
-    /// Get all legal actions for the current player.
-    pub fn legal_actions(&self) -> Vec<Action> {
-        if self.phase != Phase::Playing {
-            return vec![];
-        }
-
-        if self.dragon_giveaway {
-            if let Some(seat) = self.dragon_giveaway_seat {
-                let mut actions = vec![];
-                let left = left_seat(seat);
-                let right = right_seat(seat);
-                if team_for_seat(left) != team_for_seat(seat) {
-                    actions.push(Action::GiveDragonTrick(left));
-                }
-                if team_for_seat(right) != team_for_seat(seat) {
-                    actions.push(Action::GiveDragonTrick(right));
-                }
-                return actions;
-            }
-            return vec![];
-        }
-
-        let seat = self.current_player;
-        let hand = &self.hands[seat];
-        let mut actions = Vec::new();
-
-        // Pass (if not leading).
-        if self.current_trick.is_some() {
-            // Can pass unless wish enforcement prevents it.
-            if let Some(wish_rank) = self.mah_jong_wish {
-                if !can_fulfill_wish(hand, wish_rank, self.current_trick.as_ref()) {
-                    actions.push(Action::Pass);
-                }
-            } else {
-                actions.push(Action::Pass);
-            }
-        }
-
-        // Playable combos.
-        let combos = find_playable_combos(hand, self.current_trick.as_ref());
-        for combo in combos {
-            // Filter by wish if active.
-            if let Some(wish_rank) = self.mah_jong_wish {
-                let has_wished = hand.iter().any(|c| match c {
-                    Card::Normal { rank, .. } => *rank == wish_rank,
-                    _ => false,
-                });
-                if has_wished && can_fulfill_wish(hand, wish_rank, self.current_trick.as_ref()) {
-                    // Must include wished rank (unless bomb).
-                    let plays_wish = combo.cards.iter().any(|c| match c {
-                        Card::Normal { rank, .. } => *rank == wish_rank,
-                        _ => false,
-                    });
-                    if !plays_wish && !is_bomb_combo(&combo) {
-                        continue;
-                    }
-                }
-            }
-            actions.push(Action::Play(combo));
-        }
-
-        actions
+    fn take_trick_cards(&mut self) -> Vec<Card> {
+        self.trick_plays.iter().flat_map(|p| p.combo.cards.iter().copied()).collect()
     }
 
-    /// Get the winning team (if game is over).
-    pub fn winner(&self) -> Option<Team> {
-        if self.phase != Phase::GameEnd {
-            return None;
-        }
-        if self.scores[0] > self.scores[1] {
-            Some(0)
-        } else if self.scores[1] > self.scores[0] {
-            Some(1)
-        } else {
-            None
-        }
+    fn clear_trick(&mut self) {
+        self.current_trick = None;
+        self.trick_plays.clear();
+        self.pass_count = 0;
+        self.last_played_by = None;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Actions
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Action {
-    Pass,
-    Play(Combo),
-    GiveDragonTrick(Seat),
+fn check_seat(seat: Seat) -> Result<(), GameError> {
+    if seat < 4 { Ok(()) } else { Err(GameError::InvalidSeat) }
 }
 
-fn is_bomb_combo(combo: &Combo) -> bool {
-    matches!(
-        combo.kind,
-        ComboKind::FourOfAKindBomb | ComboKind::StraightFlushBomb
-    )
+/// Every card is in `hand` and none is listed twice.
+fn holds_distinct(hand: &[Card], cards: &[Card]) -> bool {
+    let set = CardSet::from_cards(cards);
+    set.len() == cards.len() && cards.iter().all(|c| hand.contains(c))
+}
+
+/// Cards worth exactly `points` (a multiple of 5), for `from_view`.
+fn placeholder_pile(points: i32) -> Vec<Card> {
+    let five = Card::Normal { suit: Suit::Jade, rank: 5 };
+    let mut pile = vec![];
+    let mut p = points;
+    if p < 0 {
+        pile.push(PHOENIX);
+        p += 25;
+    }
+    for _ in 0..(p.max(0) / 5) {
+        pile.push(five);
+    }
+    pile
+}
+
+fn remove_card(hand: &mut Vec<Card>, card: Card) {
+    if let Some(i) = hand.iter().position(|c| *c == card) {
+        hand.remove(i);
+    }
 }
