@@ -1,11 +1,12 @@
+use serde::{Deserialize, Serialize};
+
 use crate::types::*;
 
 /// Point value of a single card.
 pub fn card_points(card: &Card) -> i32 {
     match card {
         Card::Normal { rank: 5, .. } => 5,
-        Card::Normal { rank: 10, .. } => 10,
-        Card::Normal { rank: 13, .. } => 10, // Kings
+        Card::Normal { rank: 10, .. } | Card::Normal { rank: 13, .. } => 10,
         Card::Special(SpecialKind::Dragon) => 25,
         Card::Special(SpecialKind::Phoenix) => -25,
         _ => 0,
@@ -14,84 +15,74 @@ pub fn card_points(card: &Card) -> i32 {
 
 /// Total points in a collection of cards.
 pub fn total_points(cards: &[Card]) -> i32 {
-    cards.iter().map(|c| card_points(c)).sum()
+    cards.iter().map(card_points).sum()
 }
 
-/// Score a completed round. Returns (team0_points, team1_points) including
-/// card points and tichu bonuses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundResult {
+    /// Card points (or 200/0 for a 1-2 finish), per team.
+    pub card_points: [i32; 2],
+    pub tichu_bonuses: [i32; 2],
+    pub double_victory: Option<Team>,
+    /// Seats in finishing order; seats that never went out come last, in seat order.
+    pub out_order: [Seat; 4],
+    pub tichu_calls: [TichuCall; 4],
+}
+
+impl RoundResult {
+    pub fn total(&self, team: Team) -> i32 {
+        self.card_points[team] + self.tichu_bonuses[team]
+    }
+    /// Team 0's total minus team 1's.
+    pub fn diff(&self) -> i32 {
+        self.total(0) - self.total(1)
+    }
+}
+
+/// Score a finished round (mirrors TS `scoreRound`). `out_order[seat]` is
+/// 1-based finishing position, 0 for a seat that never went out.
 pub fn score_round(
-    out_order: &[Seat],           // seats in order they went out
-    tricks_won: &[Vec<Vec<Card>>; 4], // tricks_won[seat] = list of tricks (each a vec of cards)
-    hands: &[Vec<Card>; 4],       // remaining cards in hand (empty for players who went out)
-    tichu_calls: &[Option<TichuCall>; 4],
-) -> (i32, i32) {
-    let mut team_points = [0i32; 2];
+    out_order: &[u8; 4],
+    tricks_won: &[Vec<Vec<Card>>; 4],
+    hands: &[Vec<Card>; 4],
+    tichu_calls: &[TichuCall; 4],
+) -> RoundResult {
+    let mut order: Vec<Seat> = (0..4).collect();
+    order.sort_by_key(|&s| if out_order[s] == 0 { u8::MAX } else { out_order[s] });
+    let order: [Seat; 4] = [order[0], order[1], order[2], order[3]];
+    let (first, second, last) = (order[0], order[1], order[3]);
 
-    let first_out = out_order[0];
-    let first_team = team_for_seat(first_out);
-
-    // Check for double victory: first two out are on the same team.
-    let double_victory = out_order.len() >= 2 && team_for_seat(out_order[1]) == first_team;
-
-    if double_victory {
-        team_points[first_team] = 200;
-        // Opposing team gets 0 card points.
+    let mut card_points = [0i32; 2];
+    let double_victory = if team_for_seat(first) == team_for_seat(second) {
+        card_points[team_for_seat(first)] = 200;
+        Some(team_for_seat(first))
     } else {
-        // Last player out (or still holding cards).
-        let last_seat = if out_order.len() == 4 {
-            out_order[3]
-        } else {
-            // Find the seat not in out_order (or last remaining).
-            (0..4).find(|s| !out_order.contains(s)).unwrap_or(out_order[3])
-        };
-
-        let last_team = team_for_seat(last_seat);
-        let opposing_team = 1 - last_team;
-
-        // Each player's trick points go to their own team.
         for seat in 0..4 {
-            let trick_pts: i32 = tricks_won[seat]
-                .iter()
-                .flat_map(|trick| trick.iter())
-                .map(|c| card_points(c))
-                .sum();
-
-            if seat == last_seat {
-                // Last player's tricks go to the first-out player's team.
-                team_points[first_team] += trick_pts;
-            } else {
-                team_points[team_for_seat(seat)] += trick_pts;
-            }
+            let pts: i32 = tricks_won[seat].iter().map(|t| total_points(t)).sum();
+            // The last player's tricks go to whoever went out first.
+            let team = if seat == last { team_for_seat(first) } else { team_for_seat(seat) };
+            card_points[team] += pts;
+            // Cards left in hand go to the last player's opponents.
+            card_points[1 - team_for_seat(last)] += total_points(&hands[seat]);
         }
+        None
+    };
 
-        // Last player's remaining hand cards go to opposing team.
-        let hand_pts: i32 = hands[last_seat].iter().map(|c| card_points(c)).sum();
-        team_points[opposing_team] += hand_pts;
-    }
-
-    // Tichu bonuses.
+    let mut tichu_bonuses = [0i32; 2];
     for seat in 0..4 {
-        if let Some(call) = tichu_calls[seat] {
-            let succeeded = out_order.first() == Some(&seat);
-            let bonus = match call {
-                TichuCall::Grand => {
-                    if succeeded {
-                        200
-                    } else {
-                        -200
-                    }
-                }
-                TichuCall::Small => {
-                    if succeeded {
-                        100
-                    } else {
-                        -100
-                    }
-                }
-            };
-            team_points[team_for_seat(seat)] += bonus;
-        }
+        let made = out_order[seat] == 1;
+        let bonus = match tichu_calls[seat] {
+            TichuCall::Grand => 200,
+            TichuCall::Small => 100,
+            TichuCall::None => 0,
+        };
+        tichu_bonuses[team_for_seat(seat)] += if made { bonus } else { -bonus };
     }
 
-    (team_points[0], team_points[1])
+    RoundResult { card_points, tichu_bonuses, double_victory, out_order: order, tichu_calls: *tichu_calls }
+}
+
+/// A team has reached the target and the scores aren't tied.
+pub fn is_game_over(scores: [i32; 2], target: i32) -> bool {
+    (scores[0] >= target || scores[1] >= target) && scores[0] != scores[1]
 }
