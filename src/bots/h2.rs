@@ -15,6 +15,11 @@
 //!   trick goes to an opponent who called Tichu, is nearly out, or is chasing
 //!   a 1-2; push for our own 1-2 when the partner went out first; feed a
 //!   partner who is nearly out.
+//! - **Dave's rules.** Lead the Mah Jong first; wish for an Ace when the next
+//!   player called, else for a card I passed an opponent; play over a
+//!   partner's low single or pair unless they called (as the caller, play
+//!   over them with any loser); give the Dragon to an opponent who didn't
+//!   call.
 
 use crate::bot::Bot;
 use crate::bots::calls;
@@ -44,6 +49,17 @@ pub struct Params {
     pub partner_single: f32,
     /// Lead bonus per card shed.
     pub shed: f32,
+    /// Lead the Mah Jong (alone or in a run) as soon as I have the lead (0/1).
+    pub mj_first: f32,
+    /// Wish: 1 = an Ace if the next player called, else a card I passed an
+    /// opponent; 0 = the heuristic's (the highest card I passed an opponent).
+    pub wish_mode: f32,
+    /// Play over a partner's low single (below 10) or low pair (below 8s)
+    /// unless they called; as the caller, play over them with any loser (0/1).
+    pub overtake: f32,
+    /// Dragon gift: 1 = an opponent without a call first, then more cards;
+    /// 0 = more cards.
+    pub dragon_mode: f32,
 }
 
 impl Default for Params {
@@ -56,6 +72,10 @@ impl Default for Params {
             bomb_mode: 1.0,
             partner_single: 3.0,
             shed: 1.5,
+            mj_first: 1.0,
+            wish_mode: 1.0,
+            overtake: 1.0,
+            dragon_mode: 1.0,
         }
     }
 }
@@ -74,6 +94,10 @@ impl Params {
                 "bomb_mode" => p.bomb_mode = v,
                 "partner_single" => p.partner_single = v,
                 "shed" => p.shed = v,
+                "mj_first" => p.mj_first = v,
+                "wish_mode" => p.wish_mode = v,
+                "overtake" => p.overtake = v,
+                "dragon_mode" => p.dragon_mode = v,
                 _ => return None,
             }
         }
@@ -474,11 +498,33 @@ impl Bot for H2Bot {
     }
 
     fn wish(&mut self, view: &PlayerView) -> Option<Rank> {
-        self.base.wish(view)
+        if self.p.wish_mode == 0.0 {
+            return self.base.wish(view);
+        }
+        // The next player (always an opponent) called: make them give up an Ace.
+        let next = view.next_seat(view.seat);
+        if view.players[next].tichu != TichuCall::None && !view.players[next].is_out() {
+            return Some(14);
+        }
+        // Otherwise a card I passed an opponent, the highest, and not a rank
+        // I'd be forced to play myself if I can help it.
+        let mine = Counts::of(view.hand.iter().copied());
+        let passed: Vec<Rank> = view
+            .known_holdings()
+            .iter()
+            .filter(|(_, s)| !view.is_teammate(*s))
+            .filter_map(|(c, _)| c.rank())
+            .collect();
+        passed.iter().copied().filter(|&r| mine.n[r as usize] == 0).max().or(passed.iter().copied().max())
     }
 
     fn dragon_recipient(&mut self, view: &PlayerView) -> Seat {
-        self.base.dragon_recipient(view)
+        if self.p.dragon_mode == 0.0 {
+            return self.base.dragon_recipient(view);
+        }
+        let [a, b] = view.opponents();
+        let key = |s: Seat| (view.players[s].tichu == TichuCall::None, view.players[s].card_count);
+        if key(a) >= key(b) { a } else { b }
     }
 }
 
@@ -488,6 +534,15 @@ impl H2Bot {
         let partner = view.partner();
         let partner_in = !view.players[partner].is_out();
         let partner_cards = view.players[partner].card_count;
+
+        // Lead the Mah Jong first, to get the wish in early.
+        if self.p.mj_first > 0.0 && mine.n[1] > 0 {
+            let mj: Vec<usize> = (0..plays.len()).filter(|&i| plays[i].cards.contains(&MAH_JONG)).collect();
+            if !mj.is_empty() {
+                // The one that leaves the rest of the hand in the best shape.
+                return *mj.iter().min_by_key(|&&i| (cost_after(hand, &plays[i]), std::cmp::Reverse(plays[i].cards.len()))).unwrap();
+            }
+        }
 
         // Hand the lead to a partner who's going for it.
         if let Some(i) = plays.iter().position(|c| c.cards == [DOG]) {
@@ -567,7 +622,7 @@ impl H2Bot {
         let by = view.last_played_by.unwrap();
         let partner_winning = by == partner;
         if partner_winning && can_pass {
-            return None;
+            return self.overtake(view, plays, sit, base_cost);
         }
         let points = view.trick_points();
         let opp = &view.players[by];
@@ -630,6 +685,45 @@ impl H2Bot {
             None if can_pass => None,
             None => Some(0),
         }
+    }
+}
+
+impl H2Bot {
+    /// My partner is winning the trick. Usually pass, but take over a low
+    /// single or pair to shed a card cheaply (unless they called), and as the
+    /// Tichu caller take over to shed any loser or to run out.
+    fn overtake(&self, view: &PlayerView, plays: &[Combo], sit: &Situation, base_cost: usize) -> Option<usize> {
+        if self.p.overtake == 0.0 {
+            return None;
+        }
+        let trick = view.current_trick.as_ref()?;
+        let hand = &view.hand;
+        let partner_called = view.players[view.partner()].tichu != TichuCall::None;
+        let p = plan(&Counts::of(hand.iter().copied()), &sit.unseen, base_cost);
+        let running = p.losers <= p.regain + 1;
+        let low = (trick.kind == ComboKind::Single && trick.rank < 10.0)
+            || (trick.kind == ComboKind::Pair && trick.rank < 8.0);
+        let mut best: Option<(f32, usize)> = None;
+        for (i, c) in plays.iter().enumerate() {
+            if c.is_bomb() || c.contains(SpecialKind::Dragon) || c.contains(SpecialKind::Phoenix) {
+                continue;
+            }
+            let damage = cost_after(hand, c) as f32 - (base_cost as f32 - 1.0);
+            let boss = !could_beat(&rcombo(c), &sit.unseen);
+            let ok = if sit.my_live_tichu {
+                running || (!boss && damage <= 0.0)
+            } else {
+                low && !partner_called && !boss && damage <= 0.0
+            };
+            if !ok {
+                continue;
+            }
+            let s = -c.rank - 6.0 * damage.max(0.0);
+            if best.is_none_or(|(b, _)| s > b) {
+                best = Some((s, i));
+            }
+        }
+        best.map(|(_, i)| i)
     }
 }
 

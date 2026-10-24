@@ -46,6 +46,7 @@ Results (duplicate deals):
 | oracle10@0.1/h vs pimc10@0.1/h (value of knowing the hands) | +61.3 ± 8.7 | 600 |
 | pimc10@0.1/hi vs pimc10@0.1/h (inference) | −0.5 ± 8.9 | 600 |
 | pimc10@0.1/hbs vs pimc10@0.1/h (searched bombs, wish, Dragon) | +3.6 ± 9.1 | 600 |
+| h2 vs h2 before Dave's play rules (Mah Jong first, wish, overtake partner, Dragon) | +18.1 ± 2.1 | 8000 |
 
 Findings:
 - Bots finish 1-2 in ~33% of rounds, likely far above humans: weak defense.
@@ -65,6 +66,13 @@ Findings:
   6), but bots make 50%. The gap is in play, not in hand evaluation.
 
 Findings from the Oct 2026 play work:
+- Dave's play rules in h2, each measured by switching it off (`h2` vs
+  `h2~knob=0`, 8000 deals): lead the Mah Jong first +10.0 ± 1.9; play over
+  a partner's low single (<10) or pair (<8s) unless they called, and as the
+  caller play over them with any loser or to run out, +6.6 ± 1.1; wish for
+  an Ace when the next player called, else a card I passed an opponent,
+  +2.7 ± 1.1; Dragon to the opponent without a call 0.0 (it only moves
+  points between opponents, which matters only if that one finishes last).
 - Most of h2's gain came from card tracking plus the hand split. One rule
   backfired badly: steering leads away from lengths a near-out opponent can
   follow cost ~24/deal (`h2~danger=4` vs `h2`), so it's off. Other knobs
