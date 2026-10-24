@@ -55,10 +55,19 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
                 PimcBot::new(head.strip_prefix("pimc")?.parse().ok()?, seed)
             };
             let mut bot = bot.with_noise(noise);
-            for f in flags.chars() {
+            let mut chars = flags.chars().peekable();
+            while let Some(f) = chars.next() {
                 match f {
                     'h' => bot.h2_rollouts = true,
-                    'i' => bot.infer = Some(crate::infer::InferConfig::default()),
+                    'i' => {
+                        // Optional digit: eps_play = 0.d (i7 = 0.7).
+                        let mut cfg = crate::infer::InferConfig::default();
+                        if let Some(d) = chars.peek().and_then(|c| c.to_digit(10)) {
+                            chars.next();
+                            cfg.eps_play = d as f64 / 10.0;
+                        }
+                        bot.infer = Some(cfg);
+                    }
                     'b' => bot.search_bombs = true,
                     's' => bot.search_specials = true,
                     _ => return None,

@@ -155,8 +155,11 @@ impl Bot for PimcBot {
         if self.h2_rollouts {
             flags.push('h');
         }
-        if self.infer.is_some() {
+        if let Some(cfg) = &self.infer {
             flags.push('i');
+            if cfg.eps_play != InferConfig::default().eps_play {
+                flags.push_str(&format!("{}", (cfg.eps_play * 10.0).round()));
+            }
         }
         if self.search_bombs {
             flags.push('b');
