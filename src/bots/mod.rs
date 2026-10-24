@@ -1,12 +1,14 @@
 //! Bundled bots. Register new ones in `by_name` to make them available to
 //! the `tichu` CLI.
 
+pub mod endgame;
 pub mod heuristic;
 pub mod pimc;
 pub mod random;
 
 use crate::bot::Bot;
 
+pub use endgame::EndgameBot;
 pub use heuristic::HeuristicBot;
 pub use pimc::PimcBot;
 pub use random::RandomBot;
@@ -17,6 +19,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("heuristic", "simple rule-based baseline: dump low combos, don't overtake partner, save the Dragon"),
     ("pimcN[@x]", "example search bot: N sampled deals x heuristic rollouts per candidate play; @x = rollout noise (pimc20, pimc20@0.1)"),
     ("oracleN[@x]", "CHEATS (diagnostic): pimc that searches the real hands (oracle1, oracle20@0.1)"),
+    ("eg:BOT", "BOT, but two-player endgames are solved exactly (e.g. eg:heuristic, eg:pimc20)"),
     ("nocalls:BOT", "BOT, but never calls Tichu or Grand Tichu (e.g. nocalls:pimc20)"),
 ];
 
@@ -26,6 +29,7 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
         "random" => Some(Box::new(RandomBot::new(seed))),
         "heuristic" => Some(Box::new(HeuristicBot::new())),
         _ if name.starts_with("nocalls:") => Some(Box::new(NoCalls(by_name(&name[8..], seed)?))),
+        _ if name.starts_with("eg:") => Some(Box::new(EndgameBot::new(by_name(&name[3..], seed)?))),
         _ => {
             // pimcN / oracleN, optionally @noise.
             let (head, noise) = match name.split_once('@') {
@@ -63,6 +67,9 @@ impl Bot for NoCalls {
     }
     fn dragon_recipient(&mut self, view: &crate::view::PlayerView) -> crate::types::Seat {
         self.0.dragon_recipient(view)
+    }
+    fn round_over(&mut self, view: &crate::view::PlayerView, result: &crate::scoring::RoundResult) {
+        self.0.round_over(view, result)
     }
     fn cheats(&self) -> bool {
         self.0.cheats()

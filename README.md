@@ -42,7 +42,8 @@ heuristic vs random  (2000 deals)
 | `src/bot.rs` | the `Bot` trait |
 | `src/sim.rs` | plays a round or game between four bots |
 | `src/arena.rs` | seeded, duplicate, multithreaded head-to-head evaluation |
-| `src/bots/` | `random`, `heuristic` (a simple rule-based baseline) and `pimcN` (an example search bot) |
+| `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `pimcN` (an example search bot), and `eg:BOT` (any bot plus the exact endgame solver) |
+| `src/endgame.rs` | exact alpha-beta solver for two-player endgames (see below) |
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
 
 ## Writing a bot
@@ -69,6 +70,21 @@ Search bots: `view.sample_hands(rng)` guesses the hidden hands,
 `GameState::from_view(&view, hands)` rebuilds a full state from that guess,
 and `sim::play_from` plays it out. `src/bots/pimc.rs` is a small worked
 example of this.
+
+### Two-player endgames
+
+Once only two players hold cards, each knows the other's hand exactly: it's
+every card that isn't in their own hand and hasn't been played. From there
+the round is a perfect-information game. `endgame::solve(&state, budget)`
+solves it exactly with alpha-beta search and a transposition table, and
+returns the round margin under best play plus the best decision. The search
+follows the simulator's decision points, bomb offers included, so solved
+values are exactly what the arena realizes.
+
+`eg:BOT` (e.g. `eg:pimc20`) wraps any bot and switches to the solver in
+those positions. `cargo run --release --example endgame_stats` shows how
+often they come up and how hard they are: about two thirds of heuristic
+rounds reach one, and the median solve takes 0.3 ms.
 
 ### How the simulator schedules decisions
 
