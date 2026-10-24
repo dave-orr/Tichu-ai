@@ -6,6 +6,7 @@
 //! - `sim`: plays rounds/games between four bots
 //! - `arena`: seeded, duplicate, multithreaded head-to-head evaluation
 //! - `endgame`: exact solver for two-player endgames
+//! - `features`, `selfplay`: inputs for learned bots and training-data export
 //! - `trace`: JSON round traces (used to diff against the TS engine)
 
 pub mod arena;
@@ -15,8 +16,10 @@ pub mod combinations;
 pub mod deck;
 pub mod endgame;
 pub mod engine;
+pub mod features;
 pub mod hand;
 pub mod scoring;
+pub mod selfplay;
 pub mod sim;
 pub mod trace;
 pub mod types;

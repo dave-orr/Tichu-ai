@@ -4,6 +4,7 @@
 pub mod calls;
 pub mod endgame;
 pub mod heuristic;
+pub mod net;
 pub mod pimc;
 pub mod random;
 
@@ -24,6 +25,8 @@ pub const NAMES: &[(&str, &str)] = &[
     ("eg:BOT", "BOT, but two-player endgames are solved exactly (e.g. eg:heuristic, eg:pimc20)"),
     ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, g = v2 Grand only (calls:1:pimc20)"),
     ("nocalls:BOT", "same as calls:none:BOT"),
+    ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; heuristic for calls, passes, bombs out of turn"),
+    ("vpimcN:PATH", "pimcN whose rollouts stop at my next turn and are scored by the model's value head"),
 ];
 
 /// Construct a bundled bot by name.
@@ -36,6 +39,7 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
             let (policy, inner) = name[6..].split_once(':')?;
             Some(Box::new(CallsBot::new(CallPolicy::parse(policy)?, by_name(inner, seed)?)))
         }
+        _ if name.starts_with("net:") || name.starts_with("vpimc") => net::by_name(name, seed),
         _ if name.starts_with("eg:") => Some(Box::new(EndgameBot::new(by_name(&name[3..], seed)?))),
         _ => {
             // pimcN / oracleN, optionally @noise.
