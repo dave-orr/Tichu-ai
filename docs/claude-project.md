@@ -22,8 +22,11 @@ We're building a strong Tichu-playing bot.
 
 ## Where things stand (Oct 2026)
 
-Bots: `random`, `heuristic` (rule-based), `pimcN` (search: N guessed
-deals × heuristic rollouts per play), `oracleN` (pimc on the real hands),
+Bots: `random`, `heuristic` (rule-based baseline), `h2` (stronger rules:
+card tracking, hand structure, lead planning, Tichu/1-2 defense), `pimcN`
+(search: N guessed deals × rollouts per play; flags `/h` h2 rollouts, `/i`
+hand inference, `/b` searched bombs, `/s` searched wish and Dragon gift),
+`oracleN` (pimc on the real hands),
 wrappers `eg:` (exact two-player endgame solver), `calls:P:` (swap call
 policy), `nocalls:`.
 
@@ -37,6 +40,12 @@ Results (duplicate deals):
 | eg:heuristic vs heuristic | +3.4 ± 0.5 | 2000 |
 | eg:pimc10 vs pimc10 | +12 ± 10 | 300 |
 | nocalls:heuristic vs heuristic (value of v1 calls) | −2.9 ± 0.9 | 4000 |
+| h2 vs heuristic | +40.0 ± 3.4 | 4000 |
+| pimc10/h vs pimc10 (h2 rollouts) | +23.8 ± 11.4 | 400 |
+| pimc10@0.1/h vs pimc10/h (rollout noise) | −0.1 ± 8.9 | 600 |
+| oracle10@0.1/h vs pimc10@0.1/h (value of knowing the hands) | +61.3 ± 8.7 | 600 |
+| pimc10@0.1/hi vs pimc10@0.1/h (inference) | −0.5 ± 8.9 | 600 |
+| pimc10@0.1/hbs vs pimc10@0.1/h (searched bombs, wish, Dragon) | +3.6 ± 9.1 | 600 |
 
 Findings:
 - Bots finish 1-2 in ~33% of rounds, likely far above humans: weak defense.
@@ -55,14 +64,30 @@ Findings:
   hands. Humans called Grand on all 7 hands that met the 3-tops rule (made
   6), but bots make 50%. The gap is in play, not in hand evaluation.
 
+Findings from the Oct 2026 play work:
+- Most of h2's gain came from card tracking plus the hand split. One rule
+  backfired badly: steering leads away from lengths a near-out opponent can
+  follow cost ~24/deal (`h2~danger=4` vs `h2`), so it's off. Other knobs
+  (`h2~fight_pts=...` etc.) moved results by under 3/deal.
+- With exact rollouts (no noise) the oracle is *worse* than pimc
+  (oracle10/h vs pimc10/h −12.8 ± 13.9, 300 deals): searching one fixed
+  deal against a deterministic model overfits. Inference has to keep the
+  guesses varied, so it now draws distinct guesses (no duplicates).
+- Inference (`infer.rs`) replays the round from each guessed deal and
+  down-weights guesses whose h2 model disagrees with what players did.
+  Hidden cards placed right (`examples/infer_check`): vs h2 players 56% →
+  64%, vs heuristic 52% → 59%, but vs pimc players only 48.5% → 50.7%. The
+  model doesn't predict search players well, which is why it doesn't help
+  pimc yet. The oracle gap (+61) says it's still the biggest lever.
+
 ## Next steps
 
-1. Hand inference: weight `sample_hands` by passes, plays, declined
-   beats and calls; measure against the oracle gap.
-2. Defense: stop opponents' 1-2s and Tichus (heuristic and rollout
-   policy); track the 1-2 rate as a realism check.
-3. Better rollout policy (hand decomposition, trick counting), then
-   deeper search; endgame solver inside rollouts with a shared cache.
+1. Hand inference that works against search players: a better opponent
+   model (or one learned from pimc / human play), and use passes received;
+   measure against the oracle gap.
+2. Keep improving h2, since it is the rollout policy: every gain there
+   also lifts pimc.
+3. Deeper search; endgame solver inside rollouts with a shared cache.
 4. Real-game data: compare against human 1-2 / call rates; replay human
    positions as tests.
 5. Later: self-play learning, live-server bridge (`docs/AI_API.md` in tichu).

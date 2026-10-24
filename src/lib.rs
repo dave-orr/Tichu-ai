@@ -18,6 +18,7 @@ pub mod endgame;
 pub mod engine;
 pub mod features;
 pub mod hand;
+pub mod infer;
 pub mod scoring;
 pub mod selfplay;
 pub mod sim;

@@ -42,7 +42,8 @@ heuristic vs random  (2000 deals)
 | `src/bot.rs` | the `Bot` trait |
 | `src/sim.rs` | plays a round or game between four bots |
 | `src/arena.rs` | seeded, duplicate, multithreaded head-to-head evaluation |
-| `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `pimcN` (an example search bot), and `eg:BOT` (any bot plus the exact endgame solver) |
+| `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `h2` (stronger rules: card tracking, hand structure, lead planning, defense), `pimcN` (search bot; `/h` h2 rollouts, `/i` inference, `/b` searched bombs, `/s` searched wish and Dragon), and `eg:BOT` (any bot plus the exact endgame solver) |
+| `src/infer.rs` | hand inference: weight guessed deals by how well a model player explains the play so far |
 | `src/endgame.rs` | exact alpha-beta solver for two-player endgames (see below) |
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
 
