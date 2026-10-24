@@ -175,6 +175,10 @@ pub struct PassConfig {
 
 impl PassConfig {
     pub const ALL: PassConfig = PassConfig { opp: true, mj: true, partner: true, dog: false, no_dog_partner: false };
+    /// All rules, but the Dog always goes to an opponent (`pass2~ompdx`):
+    /// what `h2` passes. Against v1 passing: +10.3 ± 2.5 per deal with h2,
+    /// +2.3 ± 2.5 with heuristic (10000 deals each).
+    pub const TUNED: PassConfig = PassConfig { dog: true, no_dog_partner: true, ..PassConfig::ALL };
 
     /// "" = all rules (o, m, p), else the letters of the rules to use (o, m,
     /// p, d, x).
