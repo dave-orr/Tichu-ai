@@ -4,9 +4,10 @@
 //!
 //! The label comes from one of two sources:
 //! - the bot in every seat (`--bot NAME`): its chosen play;
-//! - a built-in PIMC labeler (`--q N`): N guessed deals × heuristic rollouts
-//!   for every candidate. Its mean margins are written as Q-values and it
-//!   plays the best one, so the round is a pimcN self-play game.
+//! - a built-in PIMC labeler (`--q N`): N guessed deals × rollouts for every
+//!   candidate, with the heuristic (or `--rollout NAME`, e.g. a learned net)
+//!   in all four seats. Its mean margins are written as Q-values and it plays
+//!   the best one, so the round is a pimcN self-play game.
 //!
 //! The bot still makes every other decision (calls, passing, out-of-turn
 //! bombs, wishes, the Dragon). Decisions with a single option are skipped.
@@ -30,7 +31,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::bot::Bot;
-use crate::bots::{self, HeuristicBot};
+use crate::bots;
 use crate::deck::shuffled_deck;
 use crate::engine::{Action, GameState};
 use crate::features::*;
@@ -50,6 +51,8 @@ pub struct SelfplayConfig {
     pub threads: usize,
     /// PIMC labeler samples per decision (0 = label with the bot's choice).
     pub q_samples: usize,
+    /// Rollout policy for the PIMC labeler (by `bots::by_name`).
+    pub rollout: String,
     /// Chance of playing a uniformly random option instead of the label
     /// (the label is still recorded), for more varied positions.
     pub explore: f64,
@@ -64,8 +67,15 @@ struct Rec {
 }
 
 /// Mean round margin for `view.seat`'s team after each option, over
-/// `samples` guessed deals, with heuristic rollouts.
-pub fn pimc_q(view: &PlayerView, plays: &[Combo], cands: &Candidates, samples: usize, rng: &mut StdRng) -> Vec<f32> {
+/// `samples` guessed deals, with `rollout` playing all four seats.
+pub fn pimc_q(
+    view: &PlayerView,
+    plays: &[Combo],
+    cands: &Candidates,
+    samples: usize,
+    rollout: &mut [Box<dyn Bot>; 4],
+    rng: &mut StdRng,
+) -> Vec<f32> {
     let team = view.my_team();
     let mut totals = vec![0.0f64; cands.len()];
     for _ in 0..samples {
@@ -77,8 +87,7 @@ pub fn pimc_q(view: &PlayerView, plays: &[Combo], cands: &Candidates, samples: u
                 None => Action::PassTurn { seat: view.seat },
             };
             g.apply(&action).expect("candidate rejected by engine");
-            let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| Box::new(HeuristicBot::new()) as Box<dyn Bot>);
-            if let Ok(r) = play_from(&mut g, &mut bots, None, false) {
+            if let Ok(r) = play_from(&mut g, rollout, None, false) {
                 totals[k] += (r.total(team) - r.total(1 - team)) as f64;
             }
         }
@@ -90,6 +99,7 @@ struct Recorder {
     inner: Box<dyn Bot>,
     rng: StdRng,
     q_samples: usize,
+    rollout: [Box<dyn Bot>; 4],
     explore: f64,
     recs: Vec<Rec>,
     out: Rc<RefCell<Vec<(Rec, f32)>>>,
@@ -124,7 +134,7 @@ impl Bot for Recorder {
             return self.inner.play(view, plays, can_pass);
         }
         let (label, q) = if self.q_samples > 0 {
-            let q = pimc_q(view, plays, &cands, self.q_samples, &mut self.rng);
+            let q = pimc_q(view, plays, &cands, self.q_samples, &mut self.rollout, &mut self.rng);
             let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
             (best, Some(q))
         } else {
@@ -196,6 +206,7 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                             inner: bots::by_name(&cfg.bot, sd).expect("unknown bot"),
                             rng: StdRng::seed_from_u64(sd ^ 0xABCD),
                             q_samples: cfg.q_samples,
+                            rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
                             recs: vec![],
                             out: out.clone(),

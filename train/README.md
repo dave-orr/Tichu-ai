@@ -14,6 +14,7 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 | `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options |
 | `train/tichu_data.py` | reads record files into numpy arrays |
 | `train/train.py` | trains the net, writes `.tnet` (and a `.pt` checkpoint beside it) |
+| `train/iterate.py` | the expert-iteration loop: label → train → arena, generation after generation |
 | `src/bots/net.rs` | loads `.tnet` (no dependencies), the `net:` and `vpimcN:` bots |
 
 ## The model
@@ -44,6 +45,11 @@ different `FEATURE_VERSION`.
   softmax(Q / `--tau`), which carries far more signal per position than the
   single best move. It plays at about pimcN's strength and speed (`--q 10`
   ran 4.5 rounds/s on 4 cores; expect 2–3× that on 16 threads).
+- `--rollout NAME` sets the rollout policy for `--q` (default heuristic).
+  With a learned net (`--rollout net:models/gen0.tnet`) the search sees
+  better continuations, so its labels improve with the net: that's the
+  expert-iteration loop below. Net rollouts are ~2× slower (`--q 10` ran
+  2.4 rounds/s on 4 cores).
 - `--explore P` plays a random option with probability P (the label is still
   the bot's / search's choice), for more varied positions.
 
@@ -82,6 +88,36 @@ Next steps this pipeline is built for:
 3. **RL self-play**: generate with `--bot net:models/current.tnet --explore
    0.05`, train with `--init models/current.pt`, keep a model only if it
    beats a fixed pool (heuristic, pimc10, earlier nets) in the arena.
+
+## Results so far (CPU-sized runs, Oct 2026)
+
+| match | margin/deal | deals |
+|---|---|---|
+| net, imitating heuristic (20k rounds, 97% label accuracy) vs heuristic | +0.6 ± 3.0 | 2000 |
+| gen0: distils `--q 10` with heuristic rollouts (2k rounds) vs heuristic | +85.6 ± 4.9 | 2000 |
+| gen0 vs pimc10 | +46.8 ± 10.9 | 400 |
+| gen1: `--q 10` with gen0 rollouts (1.5k rounds) vs gen0 | +11.6 ± 4.0 | 2000 |
+| gen1 vs heuristic | +90.1 ± 5.0 | 2000 |
+| gen1 vs pimc10 | +68.4 ± 10.7 | 400 |
+| vpimc10 (value head from the 20k heuristic rounds, R² 0.25) vs pimc10 | −37.1 ± 13.0 | 300 |
+
+The distilled policy beats the search that labelled it, and a second
+generation beats the first. The value head isn't good enough to stop
+rollouts after one orbit yet: a single position's value is noisy (hidden
+cards, the rest of the round), and R² stayed near 0.25.
+
+## Running the loop
+
+```sh
+python train/iterate.py --dir runs/a --gens 6 --rounds 20000
+```
+
+Each generation runs `selfplay --q 10 --rollout net:<previous>`, trains on
+the last two generations' records, and plays the new net against the
+heuristic and the previous generation (4000 deals each); everything is
+logged to `runs/a/log.txt`. Stop it any time; re-running resumes. At ~6
+rounds/s on 16 threads (estimated), 20k rounds is about an hour of self-play
+per generation; training is minutes on the GPU.
 
 ## Setting up the desktop (RTX 2070 Super, Ryzen 7 3700X)
 

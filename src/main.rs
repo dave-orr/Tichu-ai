@@ -27,6 +27,7 @@ usage:
       --bot NAME      bot in all four seats, and the label unless --q (default heuristic)
       --rounds N      rounds to play (default 10000)
       --q N           label with an N-sample PIMC search instead, and write its Q-values
+      --rollout NAME  rollout policy for --q (default heuristic; e.g. net:models/q10.tnet)
       --explore P     play a random option with probability P (the label is still recorded)
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
@@ -133,12 +134,16 @@ fn main() {
             };
             let bot = flag("bot").unwrap_or_else(|| "heuristic".into());
             let _ = factory(&bot); // exits on an unknown name
+            if let Some(r) = flag("rollout") {
+                let _ = factory(&r);
+            }
             let cfg = tichu_engine::selfplay::SelfplayConfig {
                 bot,
                 rounds: args.num("rounds").unwrap_or(10000),
                 seed,
                 threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
                 q_samples: args.num("q").unwrap_or(0),
+                rollout: flag("rollout").unwrap_or_else(|| "heuristic".into()),
                 explore: args.num("explore").unwrap_or(0.0),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
