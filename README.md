@@ -42,9 +42,12 @@ heuristic vs random  (2000 deals)
 | `src/bot.rs` | the `Bot` trait |
 | `src/sim.rs` | plays a round or game between four bots |
 | `src/arena.rs` | seeded, duplicate, multithreaded head-to-head evaluation |
-| `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `pimcN` (an example search bot), and `eg:BOT` (any bot plus the exact endgame solver) |
+| `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `h2` (stronger rules: card tracking, hand structure, lead planning, defense), `pimcN` (search bot; `/h` h2 rollouts, `/i` inference, `/b` searched bombs, `/s` searched wish and Dragon), and `eg:BOT` (any bot plus the exact endgame solver) |
+| `src/infer.rs` | hand inference: weight guessed deals by how well a model player explains the play so far |
 | `src/endgame.rs` | exact alpha-beta solver for two-player endgames (see below) |
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
+| `src/replay.rs`, `viewer/` | game logs and the visual replay viewer (see below) |
+| `src/llm/`, `examples/llm_match.rs` | Claude as a player (via `claude -p` on a subscription) and a resumable Claude-vs-bot match; see [docs/LLM_MATCH.md](docs/LLM_MATCH.md) |
 
 ## Writing a bot
 
@@ -117,6 +120,36 @@ points:
 
 Rough speed on 4 cores: ~4,000 heuristic-vs-heuristic rounds/s;
 `pimc20` vs `heuristic` is about 2 deals/s (it wins by +62 ± 8 per deal over 400 deals).
+
+## Watching a game
+
+`tichu replay LOG.json [more logs] --out replay.html` builds one
+self-contained HTML page: a card table with all four hands, the trick in
+the middle, points and calls per seat, and a play log. Step through it
+(← → by play, ↑ ↓ by trick, or the scrubber) or press Play to watch it run.
+Where Claude played, its reasoning for each decision sits beside the table,
+with the options it was offered and the full prompt.
+
+Game logs come from:
+
+- `tichu arena A B --log DIR [--log-deals N]` (round mode): the first N
+  deals (default 20), both seatings, in `DIR/deal-NNNN.json`.
+- `examples/llm_match.rs`: `games/deal-NNNN.json` in the match directory
+  (Claude's games and the baseline bot's).
+
+A log (`replay::game_log`, `version: 1`) is the deck, the seat names, the
+settings, the result, and `events`: every action in order, with each LLM
+question and reply (`{"type": "llm", ...}`) just before the action it led
+to. `tichu replay` finds every game log inside a file, re-runs each through
+the engine and embeds per-step snapshots (hands, table, points, calls), so
+the page needs no game logic of its own. The page's **Open game logs…**
+button takes raw logs too (several at once, JSON or JSONL): it runs the same
+builder compiled to WebAssembly (`viewer/wasm`, embedded from
+`viewer/replay.wasm`; rebuild with `scripts/build-viewer-wasm.sh` after
+changing `src/replay.rs` or the rules). `--json` prints the replay data
+instead of the page. The card art is the production
+client's (`client/public/cards/` in the tichu repo), copied to
+`viewer/cards/`.
 
 ## Checking against the TS engine
 

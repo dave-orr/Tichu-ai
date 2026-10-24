@@ -8,6 +8,8 @@
 //! - `endgame`: exact solver for two-player endgames
 //! - `features`, `selfplay`: inputs for learned bots and training-data export
 //! - `trace`: JSON round traces (used to diff against the TS engine)
+//! - `llm`: language-model players and a resumable match runner
+//! - `replay`: game logs and the visual replay viewer
 
 pub mod arena;
 pub mod bot;
@@ -18,6 +20,9 @@ pub mod endgame;
 pub mod engine;
 pub mod features;
 pub mod hand;
+pub mod infer;
+pub mod llm;
+pub mod replay;
 pub mod scoring;
 pub mod selfplay;
 pub mod sim;

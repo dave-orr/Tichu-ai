@@ -60,6 +60,16 @@ pub struct PlayerView {
 
 impl GameState {
     pub fn view(&self, seat: Seat) -> PlayerView {
+        self.view_impl(seat, true)
+    }
+
+    /// `view` without the action log, which is the costly part to copy. For
+    /// model players inside search that don't read the log.
+    pub fn view_without_log(&self, seat: Seat) -> PlayerView {
+        self.view_impl(seat, false)
+    }
+
+    fn view_impl(&self, seat: Seat, with_log: bool) -> PlayerView {
         let players = [0, 1, 2, 3].map(|s| {
             let p = &self.players[s];
             PublicPlayer {
@@ -73,12 +83,15 @@ impl GameState {
                 captured_points: p.captured_points(),
             }
         });
-        let log = self
-            .log
-            .iter()
-            .filter(|a| !matches!(a, Action::PassCards { seat: s, .. } if *s != seat))
-            .cloned()
-            .collect();
+        let log = if with_log {
+            self.log
+                .iter()
+                .filter(|a| !matches!(a, Action::PassCards { seat: s, .. } if *s != seat))
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        };
         PlayerView {
             seat,
             phase: self.phase,

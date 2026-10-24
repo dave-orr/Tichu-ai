@@ -1,0 +1,28 @@
+[package]
+name = "tichu_replay_wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Builds the replay builder (`tichu_engine::replay`) for the browser, so the
+# viewer page can open raw game logs. Plain C ABI, no wasm-bindgen:
+# scripts/build-viewer-wasm.sh builds it and copies it to viewer/replay.wasm.
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+tichu_engine = { path = "../.." }
+serde_json = "1"
+# Nothing here draws entropy; this only satisfies rand on wasm32.
+getrandom = { version = "0.2", features = ["custom"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]
