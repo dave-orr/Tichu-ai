@@ -22,7 +22,7 @@ ROOT = os.path.dirname(HERE)
 
 def run(cmd, log):
     print("+ " + " ".join(cmd), flush=True)
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=ROOT)
+    out = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", cwd=ROOT)
     log.write(out.stdout)
     log.flush()
     return out.stdout
