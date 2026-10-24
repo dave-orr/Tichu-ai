@@ -3,3 +3,5 @@
 /data
 /models
 __pycache__/
+/runs
+/viewer/wasm/target
