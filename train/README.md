@@ -124,6 +124,14 @@ Next steps this pipeline is built for:
 | gen1 vs pimc10 | +68.4 ± 10.7 | 400 |
 | gen0 labelled with h2 rollouts (2k rounds) vs gen0 with heuristic rollouts | −14.2 ± 4.2 | 2000 |
 | vpimc10 (value head from the 20k heuristic rounds, R² 0.25) vs pimc10 | −37.1 ± 13.0 | 300 |
+| features v2, gen0 (3k `--q 10` rounds, no GRU) vs heuristic | +102.8 ± 5.7 | 2000 |
+| features v2, gen0, no GRU vs h2 | +6.6 ± 4.8 | 2000 |
+| features v2, gen0 with GRU vs h2 | +4.3 ± 4.8 | 2000 |
+| features v2, gen0 with GRU vs without (same data) | −1.4 ± 3.7 | 2000 |
+
+For comparison, the overnight v1 gen0 (20k rounds) scored −4.3 ± 3.4 against
+h2 over 4000 deals. So the v2 features help even with less data, but on 3k
+rounds the GRU adds nothing measurable.
 
 The distilled policy beats the search that labelled it, and a second
 generation beats the first. The value head isn't good enough to stop
