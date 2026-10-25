@@ -473,7 +473,7 @@ impl Bot for H2Bot {
     }
 
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
-        self.base.pass_cards(view)
+        crate::bots::passing::pass_with(view, crate::bots::passing::PassConfig::TUNED)
     }
 
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {

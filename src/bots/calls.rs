@@ -120,6 +120,19 @@ fn score_adjustment(view: &PlayerView) -> f32 {
     }
 }
 
+/// The v2 Small Tichu threshold adjustment: score situation plus opponent calls.
+pub fn call_adjustment(view: &PlayerView) -> f32 {
+    let mut adj = score_adjustment(view);
+    for o in view.opponents() {
+        adj += match view.players[o].tichu {
+            TichuCall::Small => 1.0,
+            TichuCall::Grand => 0.5,
+            TichuCall::None => 0.0,
+        };
+    }
+    adj
+}
+
 /// v2 Small Tichu. None = not deciding yet (ask again next turn).
 pub fn small_tichu_v2(view: &PlayerView, threshold: f32) -> Option<bool> {
     let me = view.seat;
@@ -137,15 +150,7 @@ pub fn small_tichu_v2(view: &PlayerView, threshold: f32) -> Option<bool> {
             return None;
         }
     }
-    let mut need = threshold + score_adjustment(view);
-    for o in view.opponents() {
-        need += match view.players[o].tichu {
-            TichuCall::Small => 1.0,
-            TichuCall::Grand => 0.5,
-            TichuCall::None => 0.0,
-        };
-    }
-    Some(eval.margin() >= need)
+    Some(eval.margin() >= threshold + call_adjustment(view))
 }
 
 /// Which v2 Grand Tichu rule (if any) an 8-card hand meets. 0 = none.
