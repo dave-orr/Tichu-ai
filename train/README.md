@@ -10,8 +10,9 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 
 | | |
 |---|---|
-| `src/features.rs` | fixed-size byte features of a `PlayerView` (560) and of each candidate play (40). Seats are relative, in play order |
-| `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options |
+| `src/features.rs` | fixed-size byte features of a `PlayerView` (640) and of each candidate play (48). Seats are relative, in play order |
+| `src/history.rs` | the round so far as one 48-byte token per event (plays, passes, bombs, calls, wish, passed cards, tricks won), for the GRU; plus summaries the features use |
+| `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options, each seat's history tokens, and who held every unseen card |
 | `train/tichu_data.py` | reads record files into numpy arrays |
 | `train/train.py` | trains the net, writes `.tnet` (and a `.pt` checkpoint beside it) |
 | `train/iterate.py` | the expert-iteration loop: label → train → arena, generation after generation |
@@ -19,7 +20,10 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 
 ## The model
 
-A shared trunk over the state (560 → 256 → 256, ReLU) with two heads:
+A one-layer GRU (64 units, `--seq`; 0 turns it off) reads the round's
+history tokens up to the decision. Its last state joins the state features
+at the input of a shared trunk (640 + 64 → 256 → 256, ReLU), which feeds
+three heads:
 
 - **value**: expected round margin for my team (my team's points − theirs),
   trained by MSE against the final margin of the round the position came
@@ -27,8 +31,25 @@ A shared trunk over the state (560 → 256 → 256, ReLU) with two heads:
 - **policy**: one logit per candidate from `trunk ⊕ action features`, so a
   turn can have any number of legal plays. Softmax over the candidates.
   Plays that differ only in suits have identical features and are merged.
+- **belief** (training only): for each card I can't see, which of the other
+  three seats holds it, by cross-entropy against the hindsight owners in
+  the record file (`--belief-weight`, default 0.5). It isn't exported; it's
+  there to make the trunk track hands.
 
-Rust runs it with a hand-written dense forward pass. The net is tiny, inputs
+The state features (version 2) cover: my hand, cards played by each seat,
+cards whose holder I know, rank counts, specials, per-seat calls, counts and
+finishing order, the trick, wish and score; plus, from the history, the
+lowest rank each seat declined to beat per combo kind while an opponent held
+the trick, bombs thrown, late Tichu calls, the Dragon's recipient and the
+wish; the cards I received, by sender, and whether I still hold them; h2's
+plan for my hand (combos to go out, how many are unbeatable by unseen cards,
+whether the table is); and each opponent's odds of holding a four-of-a-kind
+bomb given card tracking. Each candidate also says whether it's unbeatable
+and how it changes the hand plan.
+
+Rust runs it with a hand-written dense forward pass (and GRU step, caching
+the hidden state per history prefix, so a seat's later decisions and the
+rollouts from one position only run the new tokens). The net is tiny, inputs
 are mostly zeros, and it gets called inside search, so this beats an ONNX
 runtime on latency and needs no native libraries. Every `.tnet` carries one
 worked example from the trainer; the loader recomputes it and refuses the
@@ -53,8 +74,10 @@ different `FEATURE_VERSION`.
 - `--explore P` plays a random option with probability P (the label is still
   the bot's / search's choice), for more varied positions.
 
-Record size is about 0.8 KB, roughly 30 KB per heuristic round and 40 KB per
-PIMC round.
+Record size is about 1 KB, plus about 4 KB of history tokens per seat per
+round: roughly 45 KB per heuristic round and 55 KB per PIMC round. Format 2
+files (with history) replace format 1; `train.py` refuses the old ones, so
+start a fresh `iterate.py --dir` after upgrading.
 
 ## Workflow
 

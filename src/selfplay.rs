@@ -12,15 +12,25 @@
 //! The bot still makes every other decision (calls, passing, out-of-turn
 //! bombs, wishes, the Dragon). Decisions with a single option are skipped.
 //!
-//! File layout (little endian): a 20-byte header — `b"TCHR"`, format
-//! version, `FEATURE_VERSION`, `STATE_DIM`, `ACTION_DIM` (u32 each) — then
-//! records:
+//! File layout (little endian): a 24-byte header — `b"TCHR"`, format
+//! version, `FEATURE_VERSION`, `STATE_DIM`, `ACTION_DIM`, `TOKEN_DIM` (u32
+//! each) — then blocks, each starting with a tag byte. Per round, every seat
+//! that made a recorded decision gets one sequence block (its whole-round
+//! history tokens, `history::replay` of its final view) before its records:
 //!
 //! ```text
-//! u32 round id | u8 seat | u8 flags (1 = has Q) | u16 n options | u16 label
-//! f32 margin (my team − theirs, round points)
-//! STATE_DIM bytes | n × ACTION_DIM bytes | (has Q) n × f32 Q
+//! tag 1: u32 round id | u8 seat | u16 n tokens | n × TOKEN_DIM bytes
+//! tag 0: u32 round id | u8 seat | u8 flags (1 = has Q) | u16 n options | u16 label
+//!        f32 margin (my team − theirs, round points)
+//!        u16 history length (a prefix of the seat's sequence)
+//!        56 × u8 owner of each card (relative seat 1..3, or 255 if the
+//!        card wasn't unseen by me at the decision)
+//!        STATE_DIM bytes | n × ACTION_DIM bytes | (has Q) n × f32 Q
 //! ```
+//!
+//! The owners come from the finished round (who later played each card, or
+//! still held it), never from the bots' views, so the belief labels are
+//! hindsight only.
 
 use std::cell::RefCell;
 use std::io::Write;
@@ -35,12 +45,13 @@ use crate::bots;
 use crate::deck::shuffled_deck;
 use crate::engine::{Action, GameState};
 use crate::features::*;
+use crate::history::{self, TOKEN_DIM};
 use crate::scoring::RoundResult;
 use crate::sim::{play_dealt_round, play_from};
 use crate::types::*;
 use crate::view::PlayerView;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SelfplayConfig {
@@ -60,6 +71,11 @@ pub struct SelfplayConfig {
 
 struct Rec {
     seat: u8,
+    /// History tokens seen at the decision.
+    seq_len: u16,
+    unseen: CardSet,
+    /// Relative seat of each absolute seat, from the decider's view.
+    rel_of: [u8; 4],
     state: Vec<u8>,
     cands: Candidates,
     label: usize,
@@ -103,6 +119,7 @@ struct Recorder {
     explore: f64,
     recs: Vec<Rec>,
     out: Rc<RefCell<Vec<(Rec, f32)>>>,
+    seqs: Rc<RefCell<Vec<(u8, Vec<u8>)>>>,
 }
 
 impl Bot for Recorder {
@@ -147,9 +164,19 @@ impl Bot for Recorder {
             label
         };
         let choice = cands.options[act];
+        let hist = history::replay(view);
         let mut state = Vec::with_capacity(STATE_DIM);
-        encode_state(view, &mut state);
-        self.recs.push(Rec { seat: view.seat as u8, state, cands, label, q });
+        encode_state_with(view, &hist.summary, &mut state);
+        self.recs.push(Rec {
+            seat: view.seat as u8,
+            seq_len: hist.len() as u16,
+            unseen: view.unseen(),
+            rel_of: [0, 1, 2, 3].map(|s| rel(view, s) as u8),
+            state,
+            cands,
+            label,
+            q,
+        });
         choice
     }
 
@@ -157,25 +184,63 @@ impl Bot for Recorder {
         self.inner.round_over(view, result);
         let team = view.my_team();
         let margin = (result.total(team) - result.total(1 - team)) as f32;
+        if !self.recs.is_empty() {
+            self.seqs.borrow_mut().push((view.seat as u8, history::replay(view).tokens));
+        }
         self.out.borrow_mut().extend(self.recs.drain(..).map(|r| (r, margin)));
     }
 }
 
 fn write_header(w: &mut impl Write) -> std::io::Result<()> {
     w.write_all(b"TCHR")?;
-    for x in [FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32] {
+    for x in [FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32, TOKEN_DIM as u32] {
         w.write_all(&x.to_le_bytes())?;
     }
     Ok(())
 }
 
-fn write_rec(buf: &mut Vec<u8>, round: u32, rec: &Rec, margin: f32) {
+fn write_seq(buf: &mut Vec<u8>, round: u32, seat: u8, tokens: &[u8]) {
+    buf.push(1);
+    buf.extend_from_slice(&round.to_le_bytes());
+    buf.push(seat);
+    buf.extend_from_slice(&((tokens.len() / TOKEN_DIM) as u16).to_le_bytes());
+    buf.extend_from_slice(tokens);
+}
+
+/// Who held each card once play began: whoever played it, else whoever
+/// still holds it at the end.
+fn owners(state: &GameState) -> [Option<Seat>; 56] {
+    let mut own = [None; 56];
+    for a in &state.log {
+        if let Action::Play { seat, cards, .. } | Action::Bomb { seat, cards } = a {
+            for c in cards {
+                own[c.index()] = Some(*seat);
+            }
+        }
+    }
+    for (s, p) in state.players.iter().enumerate() {
+        for c in &p.hand {
+            own[c.index()] = Some(s);
+        }
+    }
+    own
+}
+
+fn write_rec(buf: &mut Vec<u8>, round: u32, rec: &Rec, margin: f32, own: &[Option<Seat>; 56]) {
+    buf.push(0);
     buf.extend_from_slice(&round.to_le_bytes());
     buf.push(rec.seat);
     buf.push(rec.q.is_some() as u8);
     buf.extend_from_slice(&(rec.cands.len() as u16).to_le_bytes());
     buf.extend_from_slice(&(rec.label as u16).to_le_bytes());
     buf.extend_from_slice(&margin.to_le_bytes());
+    buf.extend_from_slice(&rec.seq_len.to_le_bytes());
+    for (i, o) in own.iter().enumerate() {
+        buf.push(match o {
+            Some(s) if rec.unseen.contains(Card::from_index(i)) => rec.rel_of[*s],
+            _ => 255,
+        });
+    }
     buf.extend_from_slice(&rec.state);
     buf.extend_from_slice(&rec.cands.features);
     if let Some(q) = &rec.q {
@@ -200,6 +265,7 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                 for i in (t..cfg.rounds).step_by(threads) {
                     let seed = cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64);
                     let out = Rc::new(RefCell::new(vec![]));
+                    let seqs = Rc::new(RefCell::new(vec![]));
                     let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|s| -> Box<dyn Bot> {
                         let sd = seed.wrapping_mul(31).wrapping_add(s);
                         Box::new(Recorder {
@@ -210,6 +276,7 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                             explore: cfg.explore,
                             recs: vec![],
                             out: out.clone(),
+                            seqs: seqs.clone(),
                         })
                     });
                     let mut rng = StdRng::seed_from_u64(seed);
@@ -217,8 +284,12 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                     state.start_round(shuffled_deck(&mut rng));
                     let mut buf = vec![];
                     if play_dealt_round(&mut state, &mut bots, None).is_ok() {
-                        for (rec, margin) in out.borrow().iter() {
-                            write_rec(&mut buf, i as u32, rec, *margin);
+                        let own = owners(&state);
+                        for (seat, tokens) in seqs.borrow().iter() {
+                            write_seq(&mut buf, i as u32, *seat, tokens);
+                            for (rec, margin) in out.borrow().iter().filter(|(r, _)| r.seat == *seat) {
+                                write_rec(&mut buf, i as u32, rec, *margin, &own);
+                            }
                         }
                     }
                     let n = out.borrow().len();
@@ -244,4 +315,34 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
     })?;
     w.flush()?;
     Ok(written)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bots::H2Bot;
+
+    /// The hindsight owners match the hands as play begins.
+    #[test]
+    fn owners_match_hands_after_passing() {
+        let mut rng = StdRng::seed_from_u64(5);
+        for _ in 0..20 {
+            let deck = shuffled_deck(&mut rng);
+            let mut g = GameState::new(Settings::default());
+            g.start_round(deck.clone());
+            let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| Box::new(H2Bot::new()) as Box<dyn Bot>);
+            play_dealt_round(&mut g, &mut bots, None).unwrap();
+            let own = owners(&g);
+            let mut r = GameState::new(Settings::default());
+            r.start_round(deck);
+            for a in g.log.iter().take_while(|a| !matches!(a, Action::Play { .. })) {
+                r.apply(a).unwrap();
+            }
+            for (s, p) in r.players.iter().enumerate() {
+                for c in &p.hand {
+                    assert_eq!(own[c.index()], Some(s), "{c:?}");
+                }
+            }
+        }
+    }
 }

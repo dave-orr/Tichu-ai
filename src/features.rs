@@ -14,14 +14,16 @@
 //! partner, 3 = the player before me. That makes the features independent of
 //! the seat number and of the play direction.
 
+use crate::bots::h2::{cost, could_beat, shape, Counts, RCombo};
 use crate::engine::Action;
+use crate::history::{self, Summary};
 use crate::scoring::total_points;
 use crate::types::*;
 use crate::view::PlayerView;
 
-pub const FEATURE_VERSION: u32 = 1;
-pub const STATE_DIM: usize = 560;
-pub const ACTION_DIM: usize = 40;
+pub const FEATURE_VERSION: u32 = 2;
+pub const STATE_DIM: usize = 640;
+pub const ACTION_DIM: usize = 48;
 
 const ON: u8 = 255;
 
@@ -106,8 +108,61 @@ fn bomb_count(s: CardSet) -> usize {
     n
 }
 
+/// Rank-level combo, for h2's card tracking.
+fn rcombo(c: &Combo) -> RCombo {
+    RCombo { kind: c.kind, top: c.rank, len: c.length }
+}
+
+/// `C(u - k, m - k) / C(u, m)`: the chance a seat with `m` unknown cards,
+/// dealt uniformly from `u` unseen ones, holds `k` particular cards.
+fn holds_all(u: usize, m: usize, k: usize) -> f32 {
+    if k > m || k > u {
+        return 0.0;
+    }
+    (0..k).map(|i| (m - i) as f32 / (u - i) as f32).product()
+}
+
+/// Per relative seat 1..=3: (expected four-of-a-kinds held, P(at least one)),
+/// from card tracking plus a uniform deal of the unseen cards.
+fn quad_odds(view: &PlayerView) -> [(f32, f32); 3] {
+    let mut known = [CardSet::EMPTY; 4];
+    for (c, seat) in view.known_holdings() {
+        known[seat].insert(c);
+    }
+    let all_known = known.iter().fold(CardSet::EMPTY, |a, k| a.union(*k));
+    let free = view.unseen().minus(all_known);
+    let mut out = [(0.0, 0.0); 3];
+    let mut s = view.seat;
+    for slot in out.iter_mut() {
+        s = view.next_seat(s);
+        let p = &view.players[s];
+        if p.is_out() {
+            continue;
+        }
+        let m = p.card_count.saturating_sub(known[s].len());
+        let (mut exp, mut none) = (0.0f32, 1.0f32);
+        for r in 2..=14u8 {
+            let cards = Suit::ALL.map(|suit| Card::normal(suit, r));
+            if !cards.iter().all(|c| free.contains(*c) || known[s].contains(*c)) {
+                continue;
+            }
+            let k = cards.iter().filter(|c| free.contains(**c)).count();
+            let q = holds_all(free.len(), m, k);
+            exp += q;
+            none *= 1.0 - q;
+        }
+        *slot = (exp, 1.0 - none);
+    }
+    out
+}
+
 /// Encode what `view.seat` sees at one of its play decisions.
 pub fn encode_state(view: &PlayerView, out: &mut Vec<u8>) {
+    encode_state_with(view, &history::replay(view).summary, out)
+}
+
+/// `encode_state` with the history already replayed.
+pub fn encode_state_with(view: &PlayerView, hist: &Summary, out: &mut Vec<u8>) {
     let start = out.len();
     let mut e = Enc(out);
     let hand = CardSet::from_cards(&view.hand);
@@ -185,6 +240,47 @@ pub fn encode_state(view: &PlayerView, out: &mut Vec<u8>) {
     e.range(view.scores[1 - team] as f32, -500.0, 1500.0);
     e.frac(bomb_count(hand) as f32, 3.0);
 
+    // --- v2 ---
+    // Declined beats: the lowest rank each seat passed on, per kind, while
+    // an opponent of theirs held the trick (lower = stronger evidence).
+    for r in 0..4 {
+        for k in 0..6 {
+            let v = hist.declined[r][k];
+            e.frac(if v == 0.0 { 0.0 } else { 17.0 - v }, 16.0);
+        }
+        e.frac(hist.declines[r] as f32, 10.0);
+        e.frac(hist.bombs[r] as f32, 2.0);
+        e.bit(hist.late_tichu[r]);
+    }
+    // What I received, by sender.
+    for k in 1..4 {
+        let got = view.received.iter().find(|(_, from)| rel(view, *from) == k).map(|(c, _)| *c);
+        e.bit(got.is_some());
+        e.frac(got.and_then(|c| c.rank()).unwrap_or(0) as f32, 14.0);
+        for sp in [MAH_JONG, DOG, PHOENIX, DRAGON] {
+            e.bit(got == Some(sp));
+        }
+        e.bit(got.is_some_and(|c| hand.contains(c)));
+    }
+    // Hand plan (h2): combos to go out, and how many of them are bosses.
+    let unseen_k = Counts::of(unseen.cards());
+    let mine_k = Counts::of(view.hand.iter().copied());
+    let sh = shape(&mine_k);
+    let bosses = sh.combos.iter().filter(|c| !could_beat(c, &unseen_k)).count();
+    e.frac(cost(&mine_k) as f32, 14.0);
+    e.frac(bosses as f32, 7.0);
+    e.frac((sh.combos.len() - bosses) as f32, 14.0);
+    e.bit(view.current_trick.as_ref().is_some_and(|t| !could_beat(&rcombo(t), &unseen_k)));
+    // Bomb odds (four of a kind) per other seat.
+    for (exp, any) in quad_odds(view) {
+        e.frac(exp, 2.0);
+        e.frac(any, 1.0);
+    }
+    e.one_hot(hist.dragon_to, 4);
+    e.bit(hist.wished.is_some());
+    e.frac(hist.wished.unwrap_or(0) as f32, 14.0);
+    e.bit(hist.wished.is_some() && view.wish.is_none());
+
     let n = out.len() - start;
     assert!(n <= STATE_DIM, "state features overflow: {n}");
     out.resize(start + STATE_DIM, 0);
@@ -221,6 +317,16 @@ pub fn encode_action(view: &PlayerView, play: Option<&Combo>, out: &mut Vec<u8>)
     e.bit(play.is_some_and(|c| view.wish.is_some_and(|w| c.contains_rank(w))));
     e.bit(play.is_some() && view.last_played_by == Some(view.partner()));
     e.bit(play.is_some_and(|c| c.is_bomb()));
+
+    // --- v2 ---
+    let unseen_k = Counts::of(view.unseen().cards());
+    let after_k = Counts::of(after.cards());
+    let before = cost(&Counts::of(view.hand.iter().copied())) as f32;
+    let left = cost(&after_k) as f32;
+    e.bit(play.is_some_and(|c| !could_beat(&rcombo(c), &unseen_k)));
+    e.frac(left, 14.0);
+    e.range(before - left, -3.0, 3.0);
+    e.frac(shape(&after_k).combos.iter().filter(|c| !could_beat(c, &unseen_k)).count() as f32, 7.0);
 
     let n = out.len() - start;
     assert!(n <= ACTION_DIM, "action features overflow: {n}");

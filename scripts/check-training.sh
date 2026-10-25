@@ -23,7 +23,7 @@ from tichu_data import Records
 
 label, q = sys.argv[1:3]
 r = Records([label, q])
-assert (r.state_dim, r.action_dim) == (560, 40), (r.state_dim, r.action_dim)
+assert (r.state_dim, r.action_dim, r.token_dim) == (640, 48, 48), (r.state_dim, r.action_dim, r.token_dim)
 assert len(r) > 400, len(r)
 assert (r.n_opts >= 2).all() and (r.label < r.n_opts).all() and (r.label >= 0).all()
 assert r.act_off[-1] + r.n_opts[-1] == len(r.actions)
