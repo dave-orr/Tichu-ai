@@ -342,4 +342,44 @@ mod tests {
         }
         assert!(any_decline);
     }
+
+    /// A search rebuild keeps my history, so a learned rollout policy sees
+    /// what it would in the real game.
+    #[test]
+    fn rollouts_keep_the_history() {
+        let mut rng = StdRng::seed_from_u64(12);
+        for _ in 0..10 {
+            let mut state = GameState::new(Settings::default());
+            state.start_round(shuffled_deck(&mut rng));
+            let seen: Vec<_> = (0..4).map(|_| Rc::new(RefCell::new(vec![]))).collect();
+            let fin: Vec<_> = (0..4).map(|_| Rc::new(RefCell::new(None))).collect();
+            let views = Rc::new(RefCell::new(vec![]));
+            struct Grab(Watch, Rc<RefCell<Vec<PlayerView>>>);
+            impl Bot for Grab {
+                fn name(&self) -> String {
+                    "grab".into()
+                }
+                fn pass_cards(&mut self, v: &PlayerView) -> PassInfo {
+                    self.0.pass_cards(v)
+                }
+                fn play(&mut self, v: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+                    self.1.borrow_mut().push(v.clone());
+                    self.0.play(v, plays, can_pass)
+                }
+                fn dragon_recipient(&mut self, v: &PlayerView) -> Seat {
+                    self.0.dragon_recipient(v)
+                }
+            }
+            let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|s| -> Box<dyn Bot> {
+                Box::new(Grab(Watch(Box::new(H2Bot::new()), seen[s].clone(), fin[s].clone()), views.clone()))
+            });
+            play_dealt_round(&mut state, &mut bots, None).unwrap();
+            for v in views.borrow().iter().step_by(7) {
+                let g = GameState::from_view_with_history(v, v.sample_hands(&mut rng));
+                let w = g.view(v.seat);
+                assert_eq!(replay(&w).tokens, replay(v).tokens);
+                assert_eq!(w.known_holdings(), v.known_holdings());
+            }
+        }
+    }
 }

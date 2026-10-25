@@ -230,6 +230,17 @@ impl GameState {
         s
     }
 
+    /// `from_view` that also keeps the view's log and my pass, so bots that
+    /// read the history (the learned ones) see the same features in a
+    /// rollout as in the real game. Rule bots read the log too, so this
+    /// changes their rollouts; plain `from_view` keeps pimc as it was.
+    pub fn from_view_with_history(view: &crate::view::PlayerView, hands: [Vec<Card>; 4]) -> Self {
+        let mut s = Self::from_view(view, hands);
+        s.log = view.log.clone();
+        s.players[view.seat].pass = view.my_pass;
+        s
+    }
+
     // -----------------------------------------------------------------------
     // Round setup
     // -----------------------------------------------------------------------
