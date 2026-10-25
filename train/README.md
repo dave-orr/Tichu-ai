@@ -10,8 +10,8 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 
 | | |
 |---|---|
-| `src/features.rs` | fixed-size byte features of a `PlayerView` (560) and of each candidate play (40). Seats are relative, in play order |
-| `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options |
+| `src/features.rs` | fixed-size byte features of a `PlayerView` (704) and of each candidate play (48), and the round's history as tokens (48 bytes each). Seats are relative, in play order |
+| `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options (plus each seat's history tokens once per round) |
 | `train/tichu_data.py` | reads record files into numpy arrays |
 | `train/train.py` | trains the net, writes `.tnet` (and a `.pt` checkpoint beside it) |
 | `train/iterate.py` | the expert-iteration loop: label → train → arena, generation after generation |
@@ -19,7 +19,7 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 
 ## The model
 
-A shared trunk over the state (560 → 256 → 256, ReLU) with two heads:
+A shared trunk over the state (704 + 64 → 256 → 256, ReLU) with two heads:
 
 - **value**: expected round margin for my team (my team's points − theirs),
   trained by MSE against the final margin of the round the position came
@@ -27,6 +27,27 @@ A shared trunk over the state (560 → 256 → 256, ReLU) with two heads:
 - **policy**: one logit per candidate from `trunk ⊕ action features`, so a
   turn can have any number of legal plays. Softmax over the candidates.
   Plays that differ only in suits have identical features and are merged.
+
+The extra 64 inputs are a **sequence encoder**: a one-layer GRU over the
+round's history, one token per action (who led or followed with what, who
+passed on what and against whom, who won each trick and its points, Dragon
+gifts, Tichu calls, the wish). `--seq-hidden 0` trains without it, for
+comparison. Rust keeps each bot's walk of the log and GRU states between
+decisions, so a growing history (or rollouts from one position) only runs
+the new tokens.
+
+What the state features hold beyond the cards (feature version 2): the card
+each seat passed me; per seat and combo kind, the lowest rank they passed on
+while an opponent held the trick; leads by kind; bomb threats per seat (four
+of a kinds expected, P(any bomb), strongest bomb possible) from card tracking
+with the unknown cards dealt at random; h2's plan of my hand (combos to go
+out, bosses, losers, a clear path); and whether the trick on the table can
+still be beaten. Each candidate also gets whether it can be beaten (for a
+bomb: by a stronger bomb an opponent might hold), how many unseen ranks beat
+it, and h2's plan of the hand that's left. The random-deal bomb odds rank
+seats well but run about 3× low (`cargo test --release bomb_threats --
+--ignored --nocapture`): passing makes bombs far more common (5% of hands
+before the pass, 13% after), and the net learns the scale.
 
 Rust runs it with a hand-written dense forward pass. The net is tiny, inputs
 are mostly zeros, and it gets called inside search, so this beats an ONNX
@@ -54,7 +75,11 @@ different `FEATURE_VERSION`.
   the bot's / search's choice), for more varied positions.
 
 Record size is about 0.8 KB, roughly 30 KB per heuristic round and 40 KB per
-PIMC round.
+PIMC round, plus about 4.5 KB of history tokens per seat per round.
+
+Speed on the desktop (16 threads, `--q 10`, h2 playing): heuristic rollouts
+about 5.6 rounds/s; rollouts by a feature-v2 net 2.6 rounds/s without the
+GRU and 1.8 with it (a v1 net ran 3.6).
 
 ## Workflow
 

@@ -158,6 +158,7 @@ impl Bot for FirstChoice {
         encode_state(v, &mut bytes);
         let c = Candidates::new(v, plays, can_pass);
         bytes.extend_from_slice(&c.features);
+        encode_history(v, &mut bytes);
         let h = self.hash.get();
         self.hash.set(fnv1a(&bytes) ^ h.rotate_left(5));
         let choice = if plays.is_empty() || (can_pass && v.played_cards.len() % 3 != 0) { None } else { Some(v.played_cards.len() % plays.len()) };
@@ -204,7 +205,7 @@ fn feature_encoding_is_pinned_to_its_version() {
     );
 }
 
-const FEATURE_HASH: u64 = 0x4f80_3057_2d4c_5ccc;
+const FEATURE_HASH: u64 = 0x0e14_a191_eb00_72d8;
 
 // ---------------------------------------------------------------------------
 // Self-play records
@@ -220,32 +221,44 @@ struct Rec {
     bytes: Vec<u8>,
 }
 
-/// Parses a record file the way train/tichu_data.py does.
+/// Parses a record file the way train/tichu_data.py does. Each record's
+/// `bytes` are its own plus the history tokens it saw.
 fn parse_records(buf: &[u8]) -> Vec<Rec> {
     let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+    let u16_at = |p: usize| u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
     assert_eq!(&buf[0..4], b"TCHR");
     assert_eq!(
-        [u32_at(4), u32_at(8), u32_at(12), u32_at(16)],
-        [selfplay::FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32]
+        [u32_at(4), u32_at(8), u32_at(12), u32_at(16), u32_at(20)],
+        [selfplay::FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32, TOKEN_DIM as u32]
     );
     let mut out = vec![];
-    let mut p = 20;
+    let mut p = 24;
     while p < buf.len() {
-        let start = p;
         let round = u32_at(p);
         let seat = buf[p + 4];
-        let flags = buf[p + 5];
-        let n = u16::from_le_bytes([buf[p + 6], buf[p + 7]]) as usize;
-        let label = u16::from_le_bytes([buf[p + 8], buf[p + 9]]) as usize;
-        let margin = f32::from_le_bytes(buf[p + 10..p + 14].try_into().unwrap());
-        p += 14 + STATE_DIM + n * ACTION_DIM;
-        let q = (flags & 1 == 1).then(|| {
-            let q = (0..n).map(|k| f32::from_le_bytes(buf[p + 4 * k..p + 4 * k + 4].try_into().unwrap())).collect();
-            p += 4 * n;
-            q
-        });
-        assert!(p <= buf.len(), "truncated record");
-        out.push(Rec { round, seat, n, label, margin, q, bytes: buf[start..p].to_vec() });
+        let n_tokens = u16_at(p + 5);
+        let n_recs = u32_at(p + 7) as usize;
+        let tokens = &buf[p + 11..p + 11 + n_tokens * TOKEN_DIM];
+        p += 11 + n_tokens * TOKEN_DIM;
+        for _ in 0..n_recs {
+            let start = p;
+            let flags = buf[p];
+            let n = u16_at(p + 1);
+            let label = u16_at(p + 3);
+            let prefix = u16_at(p + 5);
+            let margin = f32::from_le_bytes(buf[p + 7..p + 11].try_into().unwrap());
+            assert!(prefix <= n_tokens, "record saw {prefix} of {n_tokens} tokens");
+            p += 11 + STATE_DIM + n * ACTION_DIM;
+            let q = (flags & 1 == 1).then(|| {
+                let q = (0..n).map(|k| f32::from_le_bytes(buf[p + 4 * k..p + 4 * k + 4].try_into().unwrap())).collect();
+                p += 4 * n;
+                q
+            });
+            assert!(p <= buf.len(), "truncated record");
+            let mut bytes = buf[start..p].to_vec();
+            bytes.extend_from_slice(&tokens[..prefix * TOKEN_DIM]);
+            out.push(Rec { round, seat, n, label, margin, q, bytes });
+        }
     }
     out
 }

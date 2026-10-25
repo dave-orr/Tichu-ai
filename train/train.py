@@ -26,16 +26,30 @@ from tichu_data import Records  # noqa: E402
 
 
 class TichuNet(nn.Module):
-    """Shared trunk over the state; value head; per-candidate policy head on
+    """Shared trunk over the state (and, with `seq_hidden`, a GRU over the
+    round's history tokens); value head; per-candidate policy head on
     trunk ⊕ action. Mirrors `Net` in src/bots/net.rs (ReLU after every layer
     but the last of each head, and after the trunk)."""
 
-    def __init__(self, state_dim, action_dim, hidden=256, depth=2, head=128):
+    def __init__(self, state_dim, action_dim, hidden=256, depth=2, head=128, token_dim=0, seq_hidden=0):
         super().__init__()
-        dims = [state_dim] + [hidden] * depth
+        self.seq_hidden = seq_hidden
+        self.gru = nn.GRU(token_dim, seq_hidden, batch_first=True) if seq_hidden else None
+        dims = [state_dim + seq_hidden] + [hidden] * depth
         self.trunk = nn.ModuleList(nn.Linear(a, b) for a, b in zip(dims, dims[1:]))
         self.value = nn.ModuleList([nn.Linear(hidden, head // 2), nn.Linear(head // 2, 1)])
         self.policy = nn.ModuleList([nn.Linear(hidden + action_dim, head), nn.Linear(head, 1)])
+
+    def encode_seq(self, toks, lens):
+        """toks [B, L, D] (zero-padded), lens [B] -> the GRU state after each
+        sequence's last token, zeros for an empty one [B, H]."""
+        if self.gru is None:
+            return toks.new_zeros(toks.shape[0], 0)
+        if toks.shape[1] == 0:
+            return toks.new_zeros(toks.shape[0], self.seq_hidden)
+        out, _ = self.gru(toks)
+        last = out[torch.arange(len(lens), device=toks.device), (lens - 1).clamp(min=0)]
+        return last * (lens > 0).unsqueeze(-1).to(last.dtype)
 
     @staticmethod
     def _head(layers, x):
@@ -45,14 +59,15 @@ class TichuNet(nn.Module):
                 x = F.relu(x)
         return x
 
-    def forward_trunk(self, s):
+    def forward_trunk(self, s, seq):
+        s = torch.cat([s, seq], dim=-1)
         for l in self.trunk:
             s = F.relu(l(s))
         return s
 
-    def forward(self, s, a):
-        """s [B, S], a [B, K, A] -> value [B], logits [B, K]."""
-        h = self.forward_trunk(s)
+    def forward(self, s, a, toks, lens):
+        """s [B, S], a [B, K, A], toks [B, L, D], lens [B] -> value [B], logits [B, K]."""
+        h = self.forward_trunk(s, self.encode_seq(toks, lens))
         v = self._head(self.value, h).squeeze(-1)
         hk = h.unsqueeze(1).expand(-1, a.shape[1], -1)
         logits = self._head(self.policy, torch.cat([hk, a], dim=-1)).squeeze(-1)
@@ -65,6 +80,7 @@ def write_tnet(model, path, args, data, check):
         format=1, feature_version=int(data.feature_version),
         state_dim=int(data.state_dim), action_dim=int(data.action_dim),
         trunk=layers(model.trunk), value=layers(model.value), policy=layers(model.policy),
+        seq=dict(token_dim=int(data.token_dim), hidden=model.seq_hidden) if model.gru is not None else None,
         value_scale=args.value_scale, check=check,
         trained=dict(data=args.data, policy=args.policy, records=len(data), epochs=args.epochs),
     )
@@ -75,6 +91,9 @@ def write_tnet(model, path, args, data, check):
             for l in ml:
                 f.write(l.weight.detach().cpu().float().numpy().astype("<f4").tobytes())
                 f.write(l.bias.detach().cpu().float().numpy().astype("<f4").tobytes())
+        if model.gru is not None:
+            for name in ("weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"):
+                f.write(getattr(model.gru, name).detach().cpu().float().numpy().astype("<f4").tobytes())
 
 
 def main():
@@ -89,6 +108,7 @@ def main():
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--head", type=int, default=128)
+    ap.add_argument("--seq-hidden", type=int, default=64, help="GRU size over the history tokens (0 = no GRU)")
     ap.add_argument("--epochs", type=float, default=10)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -117,7 +137,8 @@ def main():
 
     # Everything lives on the device as uint8; batches are gathered there.
     T = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)  # noqa: E731
-    states, actions = T(data.states), T(data.actions)
+    states, actions, tokens = T(data.states), T(data.actions), T(data.tokens)
+    tok_off, tok_len = T(data.tok_off), T(data.tok_len)
     act_off, n_opts, label = T(data.act_off), T(data.n_opts), T(data.label)
     margin = T(data.margin / args.value_scale)
     q = T(np.nan_to_num(data.q, nan=0.0))
@@ -132,9 +153,16 @@ def main():
         rows = torch.where(mask, act_off[idx][:, None] + ar[None, :], 0)
         s = states[idx].float() / 255.0
         a = actions[rows].float() / 255.0
-        return idx, s, a, mask, rows
+        lens = tok_len[idx]
+        L = int(lens.max()) if args.seq_hidden else 0
+        tr = torch.arange(L, device=dev)
+        tmask = tr[None, :] < lens[:, None]
+        trows = torch.where(tmask, tok_off[idx][:, None] + tr[None, :], 0)
+        toks = tokens[trows].float() / 255.0 * tmask[..., None]
+        return idx, s, a, mask, rows, toks, lens
 
-    model = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head).to(dev)
+    model = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head,
+                     data.token_dim, args.seq_hidden).to(dev)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location=dev))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
@@ -142,8 +170,8 @@ def main():
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
 
     def losses(idx):
-        idx, s, a, mask, rows = batch(idx)
-        v, logits = model(s, a)
+        idx, s, a, mask, rows, toks, lens = batch(idx)
+        v, logits = model(s, a, toks, lens)
         logits = logits.masked_fill(~mask, -1e9)
         logp = F.log_softmax(logits, dim=-1)
         if args.policy == "q":
@@ -193,13 +221,18 @@ def main():
     # A worked example in the header: the Rust loader recomputes it and
     # refuses the model if the two implementations disagree.
     model.eval().cpu()
-    i = int(val_idx[0])
+    # A record with some history, so the check covers the GRU too.
+    i = int(next((j for j in val_idx if data.tok_len[j] >= 5), val_idx[0]))
     o, n = int(data.act_off[i]), int(data.n_opts[i])
+    t0, tl = int(data.tok_off[i]), (int(data.tok_len[i]) if args.seq_hidden else 0)
+    tk = data.tokens[t0:t0 + tl]
     with torch.no_grad():
         s = torch.from_numpy(data.states[i:i + 1]).float() / 255.0
         a = torch.from_numpy(data.actions[o:o + n][None]).float() / 255.0
-        v, lg = model(s, a)
+        toks = torch.from_numpy(tk[None]).float() / 255.0
+        v, lg = model(s, a, toks, torch.tensor([tl]))
     check = dict(state=data.states[i].tolist(), actions=data.actions[o:o + n].reshape(-1).tolist(),
+                 tokens=tk.reshape(-1).tolist(),
                  value=float(v[0]) * args.value_scale, logits=[float(x) for x in lg[0]])
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     write_tnet(model, args.out, args, data, check)

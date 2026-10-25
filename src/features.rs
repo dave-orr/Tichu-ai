@@ -1,7 +1,7 @@
 //! Fixed-size features of a `PlayerView` and of each candidate play, for
 //! learned bots (`bots::net`) and the self-play exporter (`selfplay`).
 //!
-//! Policy nets score each candidate separately (`state ÃƒÂ¢Ã…Â Ã¢â‚¬Â¢ action ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ logit`),
+//! Policy nets score each candidate separately (`state ⊕ action → logit`),
 //! since the number of legal plays varies from turn to turn.
 //!
 //! Every feature is a byte; the value the net sees is `byte / 255`, so
@@ -108,7 +108,7 @@ fn bomb_count(s: CardSet) -> usize {
     n
 }
 
-/// A card's rank class: 2..=14 ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ 0..=12, then Mah Jong, Dog, Phoenix, Dragon.
+/// A card's rank class: 2..=14 → 0..=12, then Mah Jong, Dog, Phoenix, Dragon.
 fn rank_class(c: Card) -> usize {
     match c {
         Card::Normal { rank, .. } => rank as usize - 2,
@@ -219,8 +219,9 @@ fn bomb_threats(view: &PlayerView) -> [Threat; 4] {
 
 /// What the action log says about each seat beyond the cards it played
 /// (indexed by relative seat).
+#[derive(Clone, Copy)]
 struct History {
-    /// Per combo kind (single ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ consecutive pairs): the lowest rank the seat
+    /// Per combo kind (single … consecutive pairs): the lowest rank the seat
     /// passed on while an opponent of theirs held the trick (0 = never).
     passed_on: [[f32; 6]; 4],
     /// Leads per combo kind (bombs aside), and the Dog at index 6.
@@ -229,60 +230,243 @@ struct History {
     tricks: usize,
 }
 
-fn history(view: &PlayerView) -> History {
-    let mut h = History { passed_on: [[0.0; 6]; 4], leads: [[0; 7]; 4], tricks: 0 };
-    let mut cur: Option<(Combo, Seat)> = None;
-    for a in &view.log {
-        match a {
-            Action::Play { seat, cards, phoenix_as } => {
-                let r = rel(view, *seat);
-                if cards.as_slice() == [DOG] {
-                    h.leads[r][6] = h.leads[r][6].saturating_add(1);
-                    cur = None;
-                    continue;
-                }
-                let Some(mut c) = identify_combo(cards, *phoenix_as) else { continue };
-                match &cur {
-                    None => {
-                        let k = kind_index(c.kind);
-                        if k < 6 {
-                            h.leads[r][k] = h.leads[r][k].saturating_add(1);
-                        }
-                    }
-                    Some((t, _)) => {
-                        if c.kind == ComboKind::Single && cards[0] == PHOENIX {
-                            c.rank = t.rank + 0.5;
-                        }
-                    }
-                }
-                cur = Some((c, *seat));
-            }
-            Action::Bomb { seat, cards } => {
-                cur = identify_combo(cards, None).map(|c| (c, *seat));
-            }
-            Action::PassTurn { seat } => {
-                if let Some((t, holder)) = &cur {
-                    let k = kind_index(t.kind);
-                    if k < 6 && team_for_seat(*holder) != team_for_seat(*seat) {
-                        let v = &mut h.passed_on[rel(view, *seat)][k];
-                        if *v == 0.0 || t.rank < *v {
-                            *v = t.rank;
-                        }
-                    }
-                }
-            }
-            Action::ResolveTrick => {
-                cur = None;
-                h.tricks += 1;
-            }
-            _ => {}
+/// The trick on the table, as far as the history walk needs it.
+#[derive(Clone, Copy)]
+struct Top {
+    kind: ComboKind,
+    rank: f32,
+    length: usize,
+    seat: Seat,
+}
+
+/// The walk's state after some prefix of the log.
+#[derive(Clone, Copy)]
+struct WalkState {
+    top: Option<Top>,
+    trick_points: i32,
+    left: [usize; 4],
+    hist: History,
+    n_tokens: usize,
+}
+
+impl WalkState {
+    fn start() -> WalkState {
+        WalkState {
+            top: None,
+            trick_points: 0,
+            left: [14; 4],
+            hist: History { passed_on: [[0.0; 6]; 4], leads: [[0; 7]; 4], tricks: 0 },
+            n_tokens: 0,
         }
     }
-    h
+}
+
+/// Bytes per history token (see `HistoryWalk`).
+pub const TOKEN_DIM: usize = 48;
+
+/// Walks a seat's action log into history tokens (for a sequence encoder)
+/// and the `History` summary (for the state features). It keeps its state
+/// after every action, so a log that grew, or shares a prefix with the last
+/// one (as in rollouts from one position), only walks the new actions.
+///
+/// One token per action (calls and card passes aside, which the state
+/// features cover), `TOKEN_DIM` bytes each:
+///
+/// ```text
+///  0..8   type: lead, follow, bomb, pass, trick won, Dragon given, Tichu, wish
+///  8..12  acting seat (relative)
+/// 12..16  other seat: who held the trick (pass, trick won), who got the Dragon
+/// 16..24  combo kind: of the play, or of the trick passed on
+/// 24      rank (of the play / trick passed on / wish), 25 length, 26 points
+///         (of the play, or of the whole trick when won)
+/// 27..40  cards played by rank, 40..44 Mah Jong, Dog, Phoenix, Dragon
+/// 44      the actor went out, 45 the actor's cards left
+/// ```
+///
+/// A seat's tokens at any decision are a prefix of its tokens at the end of
+/// the round, so self-play stores each seat's sequence once per round.
+#[derive(Default)]
+pub struct HistoryWalk {
+    /// Whose view, and the play direction (relative seats depend on both).
+    key: Option<(Seat, bool)>,
+    log: Vec<Action>,
+    /// The state after each action of `log`.
+    states: Vec<WalkState>,
+    tokens: Vec<u8>,
+}
+
+impl HistoryWalk {
+    pub fn of(view: &PlayerView) -> HistoryWalk {
+        let mut w = HistoryWalk::default();
+        w.update(view);
+        w
+    }
+
+    /// Catch up with `view.log`.
+    pub fn update(&mut self, view: &PlayerView) {
+        let key = (view.seat, view.settings.clockwise);
+        if self.key != Some(key) {
+            *self = HistoryWalk { key: Some(key), ..Default::default() };
+        }
+        let common = self.log.iter().zip(&view.log).take_while(|(a, b)| a == b).count();
+        self.log.truncate(common);
+        self.states.truncate(common);
+        let mut st = self.states.last().copied().unwrap_or_else(WalkState::start);
+        self.tokens.truncate(st.n_tokens * TOKEN_DIM);
+        for a in &view.log[common..] {
+            walk_step(view, a, &mut st, &mut self.tokens);
+            self.log.push(a.clone());
+            self.states.push(st);
+        }
+    }
+
+    /// The history tokens, `TOKEN_DIM` bytes each.
+    pub fn tokens(&self) -> &[u8] {
+        &self.tokens
+    }
+
+    pub fn n_tokens(&self) -> usize {
+        self.tokens.len() / TOKEN_DIM
+    }
+
+    fn history(&self) -> History {
+        self.states.last().copied().unwrap_or_else(WalkState::start).hist
+    }
+}
+
+/// The round so far as history tokens (see `HistoryWalk`), appended to
+/// `out`; returns how many.
+pub fn encode_history(view: &PlayerView, out: &mut Vec<u8>) -> usize {
+    let w = HistoryWalk::of(view);
+    out.extend_from_slice(w.tokens());
+    w.n_tokens()
+}
+
+/// Walk one action: update `st` and append its token (if it has one).
+fn walk_step(view: &PlayerView, a: &Action, st: &mut WalkState, out: &mut Vec<u8>) {
+    let start = out.len();
+    let mut e = Enc(out);
+    let h = &mut st.hist;
+    match a {
+        Action::Play { seat, cards, phoenix_as } => {
+            let r = rel(view, *seat);
+            let is_dog = cards.as_slice() == [DOG];
+            let mut combo = if is_dog {
+                None
+            } else {
+                let Some(c) = identify_combo(cards, *phoenix_as) else { return };
+                Some(c)
+            };
+            if let (Some(c), Some(t)) = (combo.as_mut(), &st.top) {
+                if c.kind == ComboKind::Single && cards[0] == PHOENIX {
+                    c.rank = t.rank + 0.5;
+                }
+            }
+            if st.top.is_none() {
+                // Kinds 0..6; the Dog at 6; bomb leads aren't counted.
+                let k = combo.as_ref().map_or(6, |c| kind_index(c.kind).min(7));
+                if k < 7 && (k < 6 || is_dog) {
+                    h.leads[r][k] = h.leads[r][k].saturating_add(1);
+                }
+            }
+            e.one_hot(Some(if st.top.is_none() { 0 } else { 1 }), 8);
+            st.left[*seat] = st.left[*seat].saturating_sub(cards.len());
+            token_play(&mut e, view, *seat, combo.as_ref(), cards, st.left[*seat]);
+            match combo {
+                Some(c) => {
+                    st.trick_points += total_points(cards);
+                    st.top = Some(Top { kind: c.kind, rank: c.rank, length: c.length, seat: *seat });
+                }
+                None => {
+                    st.top = None;
+                    st.trick_points = 0;
+                }
+            }
+        }
+        Action::Bomb { seat, cards } => {
+            let Some(c) = identify_combo(cards, None) else { return };
+            e.one_hot(Some(2), 8);
+            st.left[*seat] = st.left[*seat].saturating_sub(cards.len());
+            token_play(&mut e, view, *seat, Some(&c), cards, st.left[*seat]);
+            st.trick_points += total_points(cards);
+            st.top = Some(Top { kind: c.kind, rank: c.rank, length: c.length, seat: *seat });
+        }
+        Action::PassTurn { seat } => {
+            if let Some(t) = &st.top {
+                let k = kind_index(t.kind);
+                if k < 6 && team_for_seat(t.seat) != team_for_seat(*seat) {
+                    let v = &mut h.passed_on[rel(view, *seat)][k];
+                    if *v == 0.0 || t.rank < *v {
+                        *v = t.rank;
+                    }
+                }
+            }
+            e.one_hot(Some(3), 8);
+            e.one_hot(Some(rel(view, *seat)), 4);
+            e.one_hot(st.top.map(|t| rel(view, t.seat)), 4);
+            e.one_hot(st.top.map(|t| kind_index(t.kind)), 8);
+            e.frac(st.top.map_or(0.0, |t| t.rank), 16.0);
+            e.frac(st.top.map_or(0.0, |t| t.length as f32), 14.0);
+        }
+        Action::ResolveTrick => {
+            h.tricks += 1;
+            e.one_hot(Some(4), 8);
+            e.one_hot(None, 4);
+            e.one_hot(st.top.map(|t| rel(view, t.seat)), 4);
+            e.one_hot(None, 8 + 2);
+            e.range(st.trick_points as f32, -25.0, 100.0);
+            st.top = None;
+            st.trick_points = 0;
+        }
+        Action::GiveDragon { seat, to } => {
+            e.one_hot(Some(5), 8);
+            e.one_hot(Some(rel(view, *seat)), 4);
+            e.one_hot(Some(rel(view, *to)), 4);
+        }
+        Action::SmallTichu { seat } => {
+            e.one_hot(Some(6), 8);
+            e.one_hot(Some(rel(view, *seat)), 4);
+        }
+        Action::Wish { seat, rank } => {
+            e.one_hot(Some(7), 8);
+            e.one_hot(Some(rel(view, *seat)), 4);
+            e.one_hot(None, 4 + 8);
+            e.frac(rank.map_or(0.0, |r| r as f32), 16.0);
+        }
+        Action::GrandTichu { .. } | Action::PassCards { .. } => return,
+    }
+    out.resize(start + TOKEN_DIM, 0);
+    st.n_tokens += 1;
+}
+
+/// The part of a play or bomb token after its type.
+fn token_play(e: &mut Enc, view: &PlayerView, seat: Seat, combo: Option<&Combo>, cards: &[Card], left: usize) {
+    e.one_hot(Some(rel(view, seat)), 4);
+    e.one_hot(None, 4);
+    e.one_hot(combo.map(|c| kind_index(c.kind)), 8);
+    e.frac(combo.map_or(0.0, |c| c.rank), 16.0);
+    e.frac(cards.len() as f32, 14.0);
+    e.range(total_points(cards) as f32, -25.0, 100.0);
+    let set = CardSet::from_cards(cards);
+    let counts = rank_counts(set);
+    for r in 2..=14 {
+        e.frac(counts[r] as f32, 4.0);
+    }
+    for c in [MAH_JONG, DOG, PHOENIX, DRAGON] {
+        e.bit(set.contains(c));
+    }
+    e.bit(left == 0);
+    e.frac(left as f32, 14.0);
 }
 
 /// Encode what `view.seat` sees at one of its play decisions.
 pub fn encode_state(view: &PlayerView, out: &mut Vec<u8>) {
+    encode_state_with(view, &HistoryWalk::of(view), out)
+}
+
+/// `encode_state` with the log already walked (`walk` must be up to date
+/// with `view`).
+pub fn encode_state_with(view: &PlayerView, walk: &HistoryWalk, out: &mut Vec<u8>) {
     let start = out.len();
     let mut e = Enc(out);
     let hand = CardSet::from_cards(&view.hand);
@@ -369,7 +553,7 @@ pub fn encode_state(view: &PlayerView, out: &mut Vec<u8>) {
     }
 
     // What the others passed on, and what everyone led.
-    let h = history(view);
+    let h = walk.history();
     for r in 1..4 {
         for &rank in &h.passed_on[r] {
             e.bit(rank > 0.0);
@@ -684,12 +868,33 @@ mod tests {
             Action::ResolveTrick,
             Action::Play { seat: b, cards: vec![DOG], phoenix_as: None },
         ];
-        let h = history(&v);
+        let h = HistoryWalk::of(&v).history();
         assert_eq!(h.tricks, 1);
         assert_eq!(h.leads[rel(&v, a)][kind_index(ComboKind::Pair)], 1);
         assert_eq!(h.leads[rel(&v, b)][6], 1);
         assert_eq!(h.passed_on[rel(&v, b)][kind_index(ComboKind::Pair)], 5.0);
         assert_eq!(h.passed_on[rel(&v, p)], [0.0; 6]);
+
+        // Resuming a walk gives what a fresh one does, as the log grows,
+        // branches, or belongs to another seat.
+        let full = v.log.clone();
+        let mut w = HistoryWalk::default();
+        let check = |v: &PlayerView, w: &mut HistoryWalk| {
+            w.update(v);
+            let fresh = HistoryWalk::of(v);
+            assert_eq!(w.tokens(), fresh.tokens());
+            assert_eq!(w.history().passed_on, fresh.history().passed_on);
+            assert_eq!(w.history().leads, fresh.history().leads);
+        };
+        for cut in [2, 5, 1, 4] {
+            v.log = full[..cut].to_vec();
+            check(&v, &mut w);
+        }
+        v.log = full[..3].to_vec();
+        v.log.push(Action::Play { seat: p, cards: vec![c(Suit::Jade, 9), c(Suit::Star, 9)], phoenix_as: None });
+        check(&v, &mut w);
+        v.seat = 2;
+        check(&v, &mut w);
     }
 
     /// Predicted P(seat holds a bomb) against what the seat really holds, over
@@ -772,6 +977,46 @@ mod tests {
                 let a = b.iter().filter(|s| s.1).count() as f64 / b.len() as f64;
                 println!("  [{lo:.1}, {hi:.1}): {:>7} samples, predicted {p:.3}, actual {a:.3}", b.len());
             }
+        }
+    }
+
+    /// Each seat's history tokens at every decision are a prefix of its
+    /// tokens at the end of the round (self-play stores them that way).
+    #[test]
+    fn history_tokens_only_grow() {
+        struct Check(HeuristicBot, Vec<Vec<u8>>, usize);
+        impl Bot for Check {
+            fn name(&self) -> String {
+                "check".into()
+            }
+            fn pass_cards(&mut self, v: &PlayerView) -> PassInfo {
+                self.0.pass_cards(v)
+            }
+            fn dragon_recipient(&mut self, v: &PlayerView) -> Seat {
+                self.0.dragon_recipient(v)
+            }
+            fn play(&mut self, v: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+                let mut t = vec![];
+                let n = encode_history(v, &mut t);
+                assert_eq!(t.len(), n * TOKEN_DIM);
+                self.1.push(t);
+                self.0.play(v, plays, can_pass)
+            }
+            fn round_over(&mut self, v: &PlayerView, _: &crate::scoring::RoundResult) {
+                let mut all = vec![];
+                encode_history(v, &mut all);
+                for t in self.1.drain(..) {
+                    assert_eq!(&all[..t.len()], &t[..]);
+                    self.2 += 1;
+                }
+            }
+        }
+        let mut rng = StdRng::seed_from_u64(9);
+        for i in 0..30 {
+            let mut state = GameState::new(Settings { clockwise: i % 2 == 0, ..Settings::default() });
+            state.start_round(shuffled_deck(&mut rng));
+            let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| Box::new(Check(HeuristicBot::new(), vec![], 0)) as Box<dyn Bot>);
+            play_dealt_round(&mut state, &mut bots, None).unwrap();
         }
     }
 

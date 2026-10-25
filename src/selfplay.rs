@@ -12,14 +12,18 @@
 //! The bot still makes every other decision (calls, passing, out-of-turn
 //! bombs, wishes, the Dragon). Decisions with a single option are skipped.
 //!
-//! File layout (little endian): a 20-byte header — `b"TCHR"`, format
-//! version, `FEATURE_VERSION`, `STATE_DIM`, `ACTION_DIM` (u32 each) — then
-//! records:
+//! File layout (little endian): a 24-byte header — `b"TCHR"`, format
+//! version, `FEATURE_VERSION`, `STATE_DIM`, `ACTION_DIM`, `TOKEN_DIM` (u32
+//! each) — then one block per seat per round that has records: the seat's
+//! history tokens for the whole round (`features::encode_history`), then its
+//! records, each of which saw the first `prefix` tokens.
 //!
 //! ```text
-//! u32 round id | u8 seat | u8 flags (1 = has Q) | u16 n options | u16 label
-//! f32 margin (my team − theirs, round points)
-//! STATE_DIM bytes | n × ACTION_DIM bytes | (has Q) n × f32 Q
+//! block:  u32 round id | u8 seat | u16 n tokens | u32 n records
+//!         n tokens × TOKEN_DIM bytes | records
+//! record: u8 flags (1 = has Q) | u16 n options | u16 label | u16 prefix
+//!         f32 margin (my team − theirs, round points)
+//!         STATE_DIM bytes | n × ACTION_DIM bytes | (has Q) n × f32 Q
 //! ```
 
 use std::cell::RefCell;
@@ -40,7 +44,7 @@ use crate::sim::{play_dealt_round, play_from};
 use crate::types::*;
 use crate::view::PlayerView;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SelfplayConfig {
@@ -59,11 +63,21 @@ pub struct SelfplayConfig {
 }
 
 struct Rec {
-    seat: u8,
     state: Vec<u8>,
     cands: Candidates,
     label: usize,
     q: Option<Vec<f32>>,
+    /// History tokens seen at this decision.
+    prefix: usize,
+}
+
+/// One seat's records from a round, with its history tokens.
+struct Block {
+    seat: u8,
+    tokens: Vec<u8>,
+    n_tokens: usize,
+    recs: Vec<Rec>,
+    margin: f32,
 }
 
 /// Mean round margin for `view.seat`'s team after each option, over
@@ -102,7 +116,7 @@ struct Recorder {
     rollout: [Box<dyn Bot>; 4],
     explore: f64,
     recs: Vec<Rec>,
-    out: Rc<RefCell<Vec<(Rec, f32)>>>,
+    out: Rc<RefCell<Vec<Block>>>,
 }
 
 impl Bot for Recorder {
@@ -149,38 +163,52 @@ impl Bot for Recorder {
         let choice = cands.options[act];
         let mut state = Vec::with_capacity(STATE_DIM);
         encode_state(view, &mut state);
-        self.recs.push(Rec { seat: view.seat as u8, state, cands, label, q });
+        let prefix = encode_history(view, &mut vec![]);
+        self.recs.push(Rec { state, cands, label, q, prefix });
         choice
     }
 
     fn round_over(&mut self, view: &PlayerView, result: &RoundResult) {
         self.inner.round_over(view, result);
+        if self.recs.is_empty() {
+            return;
+        }
         let team = view.my_team();
         let margin = (result.total(team) - result.total(1 - team)) as f32;
-        self.out.borrow_mut().extend(self.recs.drain(..).map(|r| (r, margin)));
+        let mut tokens = vec![];
+        let n_tokens = encode_history(view, &mut tokens);
+        assert!(self.recs.iter().all(|r| r.prefix <= n_tokens), "history isn't a prefix of the round's");
+        let recs = std::mem::take(&mut self.recs);
+        self.out.borrow_mut().push(Block { seat: view.seat as u8, tokens, n_tokens, recs, margin });
     }
 }
 
 fn write_header(w: &mut impl Write) -> std::io::Result<()> {
     w.write_all(b"TCHR")?;
-    for x in [FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32] {
+    for x in [FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32, TOKEN_DIM as u32] {
         w.write_all(&x.to_le_bytes())?;
     }
     Ok(())
 }
 
-fn write_rec(buf: &mut Vec<u8>, round: u32, rec: &Rec, margin: f32) {
+fn write_block(buf: &mut Vec<u8>, round: u32, b: &Block) {
     buf.extend_from_slice(&round.to_le_bytes());
-    buf.push(rec.seat);
-    buf.push(rec.q.is_some() as u8);
-    buf.extend_from_slice(&(rec.cands.len() as u16).to_le_bytes());
-    buf.extend_from_slice(&(rec.label as u16).to_le_bytes());
-    buf.extend_from_slice(&margin.to_le_bytes());
-    buf.extend_from_slice(&rec.state);
-    buf.extend_from_slice(&rec.cands.features);
-    if let Some(q) = &rec.q {
-        for x in q {
-            buf.extend_from_slice(&x.to_le_bytes());
+    buf.push(b.seat);
+    buf.extend_from_slice(&(b.n_tokens as u16).to_le_bytes());
+    buf.extend_from_slice(&(b.recs.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&b.tokens);
+    for rec in &b.recs {
+        buf.push(rec.q.is_some() as u8);
+        buf.extend_from_slice(&(rec.cands.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&(rec.label as u16).to_le_bytes());
+        buf.extend_from_slice(&(rec.prefix as u16).to_le_bytes());
+        buf.extend_from_slice(&b.margin.to_le_bytes());
+        buf.extend_from_slice(&rec.state);
+        buf.extend_from_slice(&rec.cands.features);
+        if let Some(q) = &rec.q {
+            for x in q {
+                buf.extend_from_slice(&x.to_le_bytes());
+            }
         }
     }
 }
@@ -215,13 +243,13 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                     let mut rng = StdRng::seed_from_u64(seed);
                     let mut state = GameState::new(Settings { clockwise: rng.gen_bool(0.5), ..Settings::default() });
                     state.start_round(shuffled_deck(&mut rng));
-                    let mut buf = vec![];
+                    let (mut buf, mut n) = (vec![], 0);
                     if play_dealt_round(&mut state, &mut bots, None).is_ok() {
-                        for (rec, margin) in out.borrow().iter() {
-                            write_rec(&mut buf, i as u32, rec, *margin);
+                        for b in out.borrow().iter() {
+                            write_block(&mut buf, i as u32, b);
+                            n += b.recs.len();
                         }
                     }
-                    let n = out.borrow().len();
                     if tx.send((n, buf)).is_err() {
                         return;
                     }
