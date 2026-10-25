@@ -16,3 +16,8 @@ Rust Tichu engine + bot harness. See README.md for layout and usage.
   (`oracle`); never use it in a bot meant to play.
 - Evaluate with `tichu arena A B` (duplicate, round mode). Quote the ± and
   the number of deals with any result.
+- CI (`.github/workflows/ci.yml`) runs `cargo test --release`, the
+  `scripts/check-*.sh` pipeline checks and the TS diff on every PR. New bots
+  go in `bot_specs()` in `tests/common/mod.rs`. After changing
+  `src/replay.rs` or the rules, rebuild `viewer/replay.wasm`
+  (`scripts/build-viewer-wasm.sh`) or `check-viewer-wasm.sh` fails.

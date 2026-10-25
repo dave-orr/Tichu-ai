@@ -174,3 +174,34 @@ when you touch `engine.rs` / `combinations.rs`.
 Known, deliberate difference: TS lets a client claim any `phoenixAs` for a
 Phoenix pair or triple (`[3, Phoenix]` as a pair of Aces). Rust always gives
 the Phoenix the other card's rank.
+
+## Tests and CI
+
+`cargo test --release` runs the unit tests and the integration tests in
+`tests/`:
+
+| | |
+|---|---|
+| `rules.rs`, `endgame.rs` | rule cases mirrored from the TS tests; the endgame solver |
+| `invariants.rs` | at every decision of whole random/heuristic/h2 rounds: cards conserved, every offered play and bomb accepted, views hide exactly the other hands, `sample_hands` and `from_view` consistent with the real state |
+| `bots.rs` | every bundled bot spec (`tests/common/mod.rs`) plays legal rounds and is deterministic given its seed; bot names parse or are rejected; bad `.tnet` files are refused |
+| `arena.rs` | results independent of the thread count, duplicate mirror matches exactly even, swapping sides negates |
+| `formats.rs` | game logs round-trip through JSON and the engine (including an old LLM-match log in `tests/fixtures/`), card/action JSON, feature bytes pinned to `FEATURE_VERSION`, self-play records |
+| `replay.rs`, `cli.rs` | the replay builder; each `tichu` subcommand |
+
+Add a new bot to `bot_specs()` in `tests/common/mod.rs` so these cover it.
+If `feature_encoding_is_pinned_to_its_version` fails, the feature bytes
+changed: bump `FEATURE_VERSION` (so old models refuse to load) and update
+`FEATURE_HASH`.
+
+Pipeline checks, each a script:
+
+```sh
+scripts/check-viewer-wasm.sh    # viewer/replay.wasm builds the same replays as tichu replay (else run build-viewer-wasm.sh)
+scripts/check-llm-match.sh      # llm_match via scripts/fake-claude.sh: play, usage-limit exit, resume, report
+scripts/check-training.sh [PY]  # selfplay -> train/tichu_data.py -> train.py -> net: bot (train step needs PyTorch)
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs `cargo test`, these three,
+and `scripts/ts-diff.sh 200` against dave-orr/tichu on every PR and push to
+main.

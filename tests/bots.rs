@@ -39,7 +39,7 @@ fn advertised_names_parse() {
     let examples = [
         "random", "heuristic", "h2", "h2~shed=2", "pimc20", "pimc20@0.1", "pimc10/hibs", "pimc5/i7", "oracle1",
         "oracle20@0.1", "eg:heuristic", "eg:pimc20", "calls:1:pimc20", "calls:none:h2", "calls:v1:h2", "calls:s0:h2",
-        "calls:g:h2", "nocalls:h2", "eg:calls:v1:h2",
+        "calls:g:h2", "nocalls:h2", "eg:calls:v1:h2", "pass2:h2", "pass2~o:h2", "calls:v1:pass2:h2",
     ];
     for name in examples {
         assert!(bots::by_name(name, 0).is_some(), "by_name rejected advertised name '{name}'");
@@ -59,7 +59,7 @@ fn malformed_names_are_rejected() {
     let bad = [
         "", "nope", "pimc", "pimcx", "pimc2@", "pimc2@1.5", "pimc2/z", "pimc2/hz", "oracle1/q", "oraclex",
         "h2~", "h2~nope=1", "h2~shed", "h2~shed=x", "calls:h2", "calls:zz:h2", "calls:1:nope", "nocalls:nope",
-        "eg:", "eg:nope", "net:/no/such/model.tnet", "vpimc2:/no/such/model.tnet", "vpimcx:/x", "random2",
+        "eg:", "eg:nope", "net:/no/such/model.tnet", "vpimc2:/no/such/model.tnet", "vpimcx:/x", "random2", "pass2", "pass2:", "pass2:nope", "pass2~q:h2", "pass2z:h2",
     ];
     for name in bad {
         // "h2~" (empty params) is fine to accept; everything else must fail.

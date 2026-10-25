@@ -44,7 +44,11 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
         _ if name.starts_with("nocalls:") => Some(Box::new(CallsBot::new(CallPolicy::Never, by_name(&name[8..], seed)?))),
         _ if name.starts_with("pass2") => {
             let (head, inner) = name.split_once(':')?;
-            let cfg = passing::PassConfig::parse(head.strip_prefix("pass2")?.strip_prefix('~').unwrap_or(""))?;
+            let flags = match head.strip_prefix("pass2")? {
+                "" => "",
+                f => f.strip_prefix('~')?,
+            };
+            let cfg = passing::PassConfig::parse(flags)?;
             Some(Box::new(passing::PassBot::new(cfg, by_name(inner, seed)?)))
         }
         _ if name.starts_with("calls:") => {

@@ -83,6 +83,10 @@ pub fn bot_specs() -> Vec<String> {
         "calls:s-10:h2",
         "calls:g:random",
         "nocalls:random",
+        "pass2:h2",
+        "pass2~o:heuristic",
+        "pass2~mpdx:random",
+        "pass2:pimc2",
     ]
     .iter()
     .map(|s| s.to_string())
