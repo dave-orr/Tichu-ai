@@ -13,7 +13,7 @@ use crate::types::*;
 use crate::view::PlayerView;
 
 use super::client::Client;
-use super::render::{self, Question, SYSTEM_PROMPT};
+use super::render::{self, system_prompt, Question};
 
 /// Which decisions go to the model (the rest go to `inner`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -23,23 +23,26 @@ pub struct Decisions {
     pub pass: bool,
     pub wish: bool,
     pub dragon: bool,
+    /// Grand and Small Tichu calls (off by default: the fallback bot calls).
+    #[serde(default)]
+    pub calls: bool,
 }
 
 impl Default for Decisions {
     fn default() -> Self {
-        Decisions { play: true, bomb: true, pass: true, wish: true, dragon: true }
+        Decisions { play: true, bomb: true, pass: true, wish: true, dragon: true, calls: false }
     }
 }
 
 impl Decisions {
-    /// Comma-separated subset of `play,bomb,pass,wish,dragon`, or `all`.
+    /// Comma-separated subset of `play,bomb,pass,wish,dragon,calls`; `all`
+    /// is every playing decision (not calls), so `all,calls` is everything.
     pub fn parse(s: &str) -> Option<Self> {
-        if s == "all" {
-            return Some(Self::default());
-        }
-        let mut d = Decisions { play: false, bomb: false, pass: false, wish: false, dragon: false };
+        let mut d = Decisions { play: false, bomb: false, pass: false, wish: false, dragon: false, calls: false };
         for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             match part {
+                "all" => d = Decisions { calls: d.calls, ..Self::default() },
+                "calls" => d.calls = true,
                 "play" => d.play = true,
                 "bomb" => d.bomb = true,
                 "pass" => d.pass = true,
@@ -123,7 +126,7 @@ impl LlmBot {
         self.bump(|s| s.asked += 1);
         let mut prompt = q.prompt.clone();
         for attempt in 0..2 {
-            let (reply, cached) = match self.client.ask(SYSTEM_PROMPT, &prompt) {
+            let (reply, cached) = match self.client.ask(system_prompt(self.decisions.calls), &prompt) {
                 Ok(r) => r,
                 Err(e) => {
                     self.record(view, &q, &prompt, &format!("ERROR: {e}"), None, false);
@@ -181,10 +184,30 @@ impl Bot for LlmBot {
     }
 
     fn grand_tichu(&mut self, view: &PlayerView) -> bool {
+        if self.decisions.calls {
+            let pick = self.ask(view, render::grand_question(view), |a| match a {
+                [0] => Some(false),
+                [1] => Some(true),
+                _ => None,
+            });
+            if let Some(p) = pick {
+                return p;
+            }
+        }
         self.inner.grand_tichu(view)
     }
 
     fn small_tichu(&mut self, view: &PlayerView) -> bool {
+        if self.decisions.calls {
+            let pick = self.ask(view, render::tichu_question(view), |a| match a {
+                [0] => Some(false),
+                [1] => Some(true),
+                _ => None,
+            });
+            if let Some(p) = pick {
+                return p;
+            }
+        }
         self.inner.small_tichu(view)
     }
 

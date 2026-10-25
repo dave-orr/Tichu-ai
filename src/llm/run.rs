@@ -386,6 +386,19 @@ mod tests {
         }
     }
 
+    /// With calls on, the LLM seats are asked about Grand and Small Tichu.
+    #[test]
+    fn asks_calls_when_enabled() {
+        let mut c = cfg("heuristic", "random");
+        c.decisions.calls = true;
+        let client = Arc::new(Client::in_memory(Box::new(Stub::new(0))));
+        let r = play_deal(&c, &client, 0, false).unwrap();
+        let log = &r.games.unwrap()["llm"][0]["events"];
+        let kinds: Vec<&str> = log.as_array().unwrap().iter().filter_map(|e| e["kind"].as_str()).collect();
+        assert!(kinds.contains(&"grand") && kinds.contains(&"tichu"));
+        assert_eq!(r.llm.fallbacks, 0);
+    }
+
     /// An LLM whose answers are all unusable plays exactly like its fallback.
     #[test]
     fn garbage_answers_fall_back() {

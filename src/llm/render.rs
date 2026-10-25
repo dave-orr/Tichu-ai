@@ -13,7 +13,7 @@ use crate::types::*;
 use crate::view::PlayerView;
 
 /// The fixed system prompt: rules, notation and answer format.
-pub const SYSTEM_PROMPT: &str = r#"You are an expert Tichu player. You are one seat of a four-player game, partnered with the player opposite you, and you will be asked for one decision at a time. Each request is self-contained: it describes everything you can see.
+const SYSTEM_PROMPT: &str = r#"You are an expert Tichu player. You are one seat of a four-player game, partnered with the player opposite you, and you will be asked for one decision at a time. Each request is self-contained: it describes everything you can see.
 
 GOAL. Each deal is scored on its own, starting from 0-0: maximize your team's points minus the opponents' points for this round. Long-run game score doesn't matter.
 
@@ -35,6 +35,21 @@ NOTATION. A card is rank then suit: 2..9, T = 10, J, Q, K, A; suits j = Jade, s 
 ANSWER FORMAT. Think as much as you need, then end your reply with one final line of the form
 ANSWER: <your choice>
 exactly as the request specifies. Nothing after that line."#;
+
+const FIXED_CALLS: &str = "Calls are decided for you by a fixed policy; you only make playing decisions, but play to make your team's calls and break the opponents'.";
+const OWN_CALLS: &str = "You make your own calls: you'll be asked about Grand Tichu after your first 8 cards, and about Tichu before your first play. A failed call costs as much as a made one gains, and only one player can go out first, so weigh the call against your partner's chances too. Play to make your team's calls and break the opponents'.";
+
+/// The system prompt: rules, notation and answer format. `calls`: the model
+/// makes its own Tichu calls.
+pub fn system_prompt(calls: bool) -> &'static str {
+    use std::sync::OnceLock;
+    static WITH: OnceLock<String> = OnceLock::new();
+    if calls {
+        WITH.get_or_init(|| SYSTEM_PROMPT.replace(FIXED_CALLS, OWN_CALLS))
+    } else {
+        SYSTEM_PROMPT
+    }
+}
 
 /// Seat name relative to `view.seat`.
 pub fn who(view: &PlayerView, seat: Seat) -> &'static str {
@@ -365,6 +380,23 @@ pub fn bomb_question(view: &PlayerView, bombs: &[Combo]) -> Question {
     Question { kind: "bomb", prompt: ask(view, &t) }
 }
 
+/// Grand Tichu, on the first 8 cards. 0 = no, 1 = call.
+pub fn grand_question(view: &PlayerView) -> Question {
+    let t = "You have seen 8 of your 14 cards; the other 6 come after this decision, and then everyone passes 3 cards. \
+             Call Grand Tichu (+200 if you go out first, -200 if not)?\n0: Don't call\n1: Call Grand Tichu\n\n\
+             Reply with ANSWER: 0 or ANSWER: 1.";
+    Question { kind: "grand", prompt: ask(view, t) }
+}
+
+/// Small Tichu, before my first card. 0 = no, 1 = call.
+pub fn tichu_question(view: &PlayerView) -> Question {
+    let t = "You haven't played a card yet, so you may call Tichu now (+100 if you go out first, -100 if not). \
+             You can also wait: you'll be asked again before each of your turns until you play your first card.\n\
+             0: Don't call (now)\n1: Call Tichu\n\n\
+             Reply with ANSWER: 0 or ANSWER: 1.";
+    Question { kind: "tichu", prompt: ask(view, t) }
+}
+
 /// The Mah Jong wish. Answer 0 (no wish) or a rank 2..14.
 pub fn wish_question(view: &PlayerView) -> Question {
     let t = "You just played the Mah Jong. Name a wished rank, or none.\n\
@@ -460,6 +492,12 @@ mod tests {
             menu.iter().map(|&i| &plays[i]).filter(|c| c.kind == ComboKind::Single && c.rank == 7.0).collect();
         assert_eq!(sevens.len(), 1);
         assert_eq!(sevens[0].cards, vec![n(Suit::Sword, 7)]);
+    }
+
+    #[test]
+    fn call_prompt_swaps_the_calls_sentence() {
+        assert_eq!(system_prompt(false), SYSTEM_PROMPT);
+        assert!(system_prompt(true).contains(OWN_CALLS) && !system_prompt(true).contains(FIXED_CALLS));
     }
 
     #[test]
