@@ -5,7 +5,7 @@
 //! expected round margin for my team) and a policy head that scores each
 //! candidate from `trunk ⊕ action features`. Everything except card play
 //! (calls, passing, out-of-turn bombs, wishes, the Dragon) stays with the
-//! heuristic.
+//! h2 rule bot.
 //!
 //! - `net:PATH` plays the policy's top choice.
 //! - `vpimcN:PATH` is PIMC whose rollouts stop at my next turn and score
@@ -24,7 +24,7 @@ use rand::SeedableRng;
 use serde::Deserialize;
 
 use crate::bot::Bot;
-use crate::bots::HeuristicBot;
+use crate::bots::H2Bot;
 use crate::engine::{Action, GameState};
 use crate::features::*;
 use crate::sim::{play_from, SimError};
@@ -227,12 +227,12 @@ impl Net {
 /// Plays the policy's top choice.
 pub struct NetBot {
     net: Arc<Net>,
-    base: HeuristicBot,
+    base: H2Bot,
 }
 
 impl NetBot {
     pub fn new(net: Arc<Net>) -> Self {
-        NetBot { net, base: HeuristicBot::new() }
+        NetBot { net, base: H2Bot::new() }
     }
 
     pub fn choose(net: &Net, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
@@ -248,7 +248,7 @@ impl NetBot {
     }
 }
 
-macro_rules! heuristic_rest {
+macro_rules! rule_bot_rest {
     () => {
         fn grand_tichu(&mut self, v: &PlayerView) -> bool {
             self.base.grand_tichu(v)
@@ -275,24 +275,24 @@ impl Bot for NetBot {
     fn name(&self) -> String {
         "net".into()
     }
-    heuristic_rest!();
+    rule_bot_rest!();
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
         Self::choose(&self.net, view, plays, can_pass)
     }
 }
 
-/// Rollout stand-in for the searching seat: plays like the heuristic until
+/// Rollout stand-in for the searching seat: plays like h2 until
 /// its next turn, then aborts the rollout by returning an out-of-range play,
 /// which `play_from` rejects, leaving the state at that turn.
 struct StopAtMyTurn {
-    base: HeuristicBot,
+    base: H2Bot,
 }
 
 impl Bot for StopAtMyTurn {
     fn name(&self) -> String {
         "stop".into()
     }
-    heuristic_rest!();
+    rule_bot_rest!();
     fn play(&mut self, _view: &PlayerView, _plays: &[Combo], _can_pass: bool) -> Option<usize> {
         Some(usize::MAX)
     }
@@ -303,12 +303,12 @@ pub struct ValuePimcBot {
     net: Arc<Net>,
     samples: usize,
     rng: StdRng,
-    base: HeuristicBot,
+    base: H2Bot,
 }
 
 impl ValuePimcBot {
     pub fn new(net: Arc<Net>, samples: usize, seed: u64) -> Self {
-        ValuePimcBot { net, samples, rng: StdRng::seed_from_u64(seed), base: HeuristicBot::new() }
+        ValuePimcBot { net, samples, rng: StdRng::seed_from_u64(seed), base: H2Bot::new() }
     }
 }
 
@@ -316,7 +316,7 @@ impl Bot for ValuePimcBot {
     fn name(&self) -> String {
         format!("vpimc{}", self.samples)
     }
-    heuristic_rest!();
+    rule_bot_rest!();
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
         let cands = Candidates::new(view, plays, can_pass);
         if cands.len() == 1 {
@@ -333,8 +333,8 @@ impl Bot for ValuePimcBot {
                     None => Action::PassTurn { seat: view.seat },
                 };
                 g.apply(&action).expect("candidate rejected by engine");
-                let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| Box::new(HeuristicBot::new()) as Box<dyn Bot>);
-                bots[view.seat] = Box::new(StopAtMyTurn { base: HeuristicBot::new() });
+                let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| Box::new(H2Bot::new()) as Box<dyn Bot>);
+                bots[view.seat] = Box::new(StopAtMyTurn { base: H2Bot::new() });
                 let v = match play_from(&mut g, &mut bots, None, false) {
                     Ok(r) => (r.total(team) - r.total(1 - team)) as f32,
                     Err(SimError::BadChoice { seat, .. }) if seat == view.seat => {

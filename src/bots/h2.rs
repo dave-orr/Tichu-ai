@@ -15,6 +15,11 @@
 //!   trick goes to an opponent who called Tichu, is nearly out, or is chasing
 //!   a 1-2; push for our own 1-2 when the partner went out first; feed a
 //!   partner who is nearly out.
+//! - **Dave's rules.** Lead the Mah Jong first; wish for an Ace when the next
+//!   player called, else for the card I passed the next player; play over a
+//!   partner's low single or pair unless they called (as the caller, play
+//!   over them with any loser); give the Dragon to an opponent who didn't
+//!   call; lead the Dog by who called, and bomb then Dog.
 
 use crate::bot::Bot;
 use crate::bots::calls;
@@ -44,6 +49,21 @@ pub struct Params {
     pub partner_single: f32,
     /// Lead bonus per card shed.
     pub shed: f32,
+    /// Lead the Mah Jong (alone or in a run) as soon as I have the lead (0/1).
+    pub mj_first: f32,
+    /// Wish: 1 = an Ace if the next player called, else the card I passed
+    /// the next player; 0 = the heuristic's (the highest card I passed an opponent).
+    pub wish_mode: f32,
+    /// Play over a partner's low single (below 10) or low pair (below 8s)
+    /// unless they called; as the caller, play over them with any loser (0/1).
+    pub overtake: f32,
+    /// Dragon gift: 1 = an opponent without a call first, then more cards;
+    /// 0 = more cards.
+    pub dragon_mode: f32,
+    /// Dog rules: 1 = Dave's (by who called; bomb then Dog), 0.5 = his lead
+    /// rules without the bombs, 0 = the old rule (Dog to a partner who
+    /// called or holds fewer cards).
+    pub dog_mode: f32,
 }
 
 impl Default for Params {
@@ -56,6 +76,11 @@ impl Default for Params {
             bomb_mode: 1.0,
             partner_single: 3.0,
             shed: 1.5,
+            mj_first: 1.0,
+            wish_mode: 1.0,
+            overtake: 1.0,
+            dragon_mode: 1.0,
+            dog_mode: 1.0,
         }
     }
 }
@@ -74,6 +99,11 @@ impl Params {
                 "bomb_mode" => p.bomb_mode = v,
                 "partner_single" => p.partner_single = v,
                 "shed" => p.shed = v,
+                "mj_first" => p.mj_first = v,
+                "wish_mode" => p.wish_mode = v,
+                "overtake" => p.overtake = v,
+                "dragon_mode" => p.dragon_mode = v,
+                "dog_mode" => p.dog_mode = v,
                 _ => return None,
             }
         }
@@ -398,6 +428,27 @@ fn plan(mine: &Counts, unseen: &Counts, base_cost: usize) -> Plan {
     }
 }
 
+/// A clear path out: every combination but the Dog either wins the lead
+/// back or is a loser covered by its own winner of the same type (lead 44,
+/// win it back with AA). Then exit on the Dog.
+fn clear_path(mine: &Counts, unseen: &Counts) -> bool {
+    let sh = shape(mine);
+    let (mut bosses, losers): (Vec<RCombo>, Vec<RCombo>) = sh.combos.iter().partition(|c| !could_beat(c, unseen));
+    let mut dragon = mine.dragon;
+    for l in &losers {
+        if let Some(i) = bosses.iter().position(|b| b.kind == l.kind && b.len == l.len) {
+            bosses.swap_remove(i);
+        } else if let Some(i) = bosses.iter().position(|b| b.kind == ComboKind::FourOfAKindBomb) {
+            bosses.swap_remove(i);
+        } else if l.kind == ComboKind::Single && dragon {
+            dragon = false;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
 fn minus(hand: &[Card], play: &Combo) -> Counts {
     let used = play.card_set();
     Counts::of(hand.iter().copied().filter(|c| !used.contains(*c)))
@@ -422,7 +473,7 @@ impl Bot for H2Bot {
     }
 
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
-        self.base.pass_cards(view)
+        crate::bots::passing::pass_with(view, crate::bots::passing::PassConfig::TUNED)
     }
 
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
@@ -463,6 +514,11 @@ impl Bot for H2Bot {
         if view.trick_countdown.is_none() {
             return None;
         }
+        if self.p.dog_mode >= 1.0 {
+            if let Some(i) = self.dog_bomb(view, bombs, &sit, by) {
+                return Some(i);
+            }
+        }
         let opp = &view.players[by];
         let near_out = !opp.is_out() && opp.card_count <= 2;
         let caller = sit.live_opp_tichu[by] && opp.card_count <= 6;
@@ -474,11 +530,31 @@ impl Bot for H2Bot {
     }
 
     fn wish(&mut self, view: &PlayerView) -> Option<Rank> {
-        self.base.wish(view)
+        if self.p.wish_mode == 0.0 {
+            return self.base.wish(view);
+        }
+        // The next player (always an opponent) called: make them give up an Ace.
+        let next = view.next_seat(view.seat);
+        if view.players[next].tichu != TichuCall::None && !view.players[next].is_out() {
+            return Some(14);
+        }
+        // Otherwise the card I passed the next player: they must play it on
+        // the Mah Jong right away, so the wish never binds me. Failing that
+        // (they've played it already), the one I passed the other opponent.
+        let held = view.known_holdings();
+        let passed_to = |s: Seat| held.iter().find(|(_, t)| *t == s).and_then(|(c, _)| c.rank());
+        let [a, b] = view.opponents();
+        let other = if a == next { b } else { a };
+        passed_to(next).or(passed_to(other))
     }
 
     fn dragon_recipient(&mut self, view: &PlayerView) -> Seat {
-        self.base.dragon_recipient(view)
+        if self.p.dragon_mode == 0.0 {
+            return self.base.dragon_recipient(view);
+        }
+        let [a, b] = view.opponents();
+        let key = |s: Seat| (view.players[s].tichu == TichuCall::None, view.players[s].card_count);
+        if key(a) >= key(b) { a } else { b }
     }
 }
 
@@ -489,10 +565,26 @@ impl H2Bot {
         let partner_in = !view.players[partner].is_out();
         let partner_cards = view.players[partner].card_count;
 
-        // Hand the lead to a partner who's going for it.
-        if let Some(i) = plays.iter().position(|c| c.cards == [DOG]) {
-            if partner_in && (sit.partner_live_tichu || partner_cards < hand.len()) && !sit.my_live_tichu {
+        if self.p.dog_mode > 0.0 {
+            if let Some(i) = self.dog_lead(view, plays, sit, mine, base_cost) {
                 return i;
+            }
+        }
+        // Lead the Mah Jong first, to get the wish in early.
+        if self.p.mj_first > 0.0 && mine.n[1] > 0 {
+            let mj: Vec<usize> = (0..plays.len()).filter(|&i| plays[i].cards.contains(&MAH_JONG)).collect();
+            if !mj.is_empty() {
+                // The one that leaves the rest of the hand in the best shape.
+                return *mj.iter().min_by_key(|&&i| (cost_after(hand, &plays[i]), std::cmp::Reverse(plays[i].cards.len()))).unwrap();
+            }
+        }
+
+        if self.p.dog_mode == 0.0 {
+            // Hand the lead to a partner who's going for it.
+            if let Some(i) = plays.iter().position(|c| c.cards == [DOG]) {
+                if partner_in && (sit.partner_live_tichu || partner_cards < hand.len()) && !sit.my_live_tichu {
+                    return i;
+                }
             }
         }
 
@@ -567,7 +659,7 @@ impl H2Bot {
         let by = view.last_played_by.unwrap();
         let partner_winning = by == partner;
         if partner_winning && can_pass {
-            return None;
+            return self.overtake(view, plays, sit, base_cost);
         }
         let points = view.trick_points();
         let opp = &view.players[by];
@@ -588,7 +680,7 @@ impl H2Bot {
         let mine = Counts::of(hand.iter().copied());
         let p = plan(&mine, &sit.unseen, base_cost);
         // I can run out from the lead: spend controls freely.
-        let running = p.losers <= p.regain + 1;
+        let running = p.losers <= p.regain + 1 || (self.p.dog_mode > 0.0 && mine.dog && clear_path(&mine, &sit.unseen));
 
         let mut best: Option<(f32, usize)> = None;
         for (i, c) in plays.iter().enumerate() {
@@ -630,6 +722,97 @@ impl H2Bot {
             None if can_pass => None,
             None => Some(0),
         }
+    }
+}
+
+impl H2Bot {
+    /// Leading with the Dog. With partner's Tichu live: Dog, unless I hold
+    /// the Mah Jong and a winner, or a bomb plus another card (kept for bomb
+    /// then Dog). With my own Tichu live: Dog unless I have a clear path out.
+    /// No call on our side: the Mah Jong first, else the Dog unless I have a
+    /// clear path out and can exit on the Dog.
+    fn dog_lead(&self, view: &PlayerView, plays: &[Combo], sit: &Situation, mine: &Counts, base_cost: usize) -> Option<usize> {
+        let dog = plays.iter().position(|c| c.cards == [DOG])?;
+        if view.players[view.partner()].is_out() {
+            return None;
+        }
+        let p = plan(mine, &sit.unseen, base_cost);
+        let clear = clear_path(mine, &sit.unseen);
+        let has_mj = mine.n[1] > 0;
+        let lead_dog = if sit.my_live_tichu {
+            !clear
+        } else if sit.partner_live_tichu {
+            let wish_and_winner = has_mj && p.lead_bosses > 0;
+            let bomb_kept = plays.iter().any(|b| b.is_bomb() && view.hand.len() >= b.cards.len() + 2);
+            !wish_and_winner && !bomb_kept
+        } else {
+            !has_mj && !clear
+        };
+        lead_dog.then_some(dog)
+    }
+
+    /// Out-of-turn bomb with the Dog in hand, as an opponent takes a trick:
+    /// bomb an opponent on 5 cards or fewer, then lead the Dog to partner.
+    /// Without partner's Tichu, also bomb when it leaves a clear path out
+    /// that exits on the Dog.
+    fn dog_bomb(&self, view: &PlayerView, bombs: &[Combo], sit: &Situation, by: Seat) -> Option<usize> {
+        if !view.hand.contains(&DOG) {
+            return None;
+        }
+        let opp = &view.players[by];
+        let partner_in = !view.players[view.partner()].is_out();
+        let cheapest = || {
+            (0..bombs.len()).min_by(|&a, &b| {
+                (bombs[a].length, bombs[a].rank).partial_cmp(&(bombs[b].length, bombs[b].rank)).unwrap()
+            })
+        };
+        if partner_in && !opp.is_out() && opp.card_count <= 5 {
+            return cheapest();
+        }
+        if !sit.partner_live_tichu {
+            return (0..bombs.len()).find(|&i| {
+                let rest = minus(&view.hand, &bombs[i]);
+                clear_path(&rest, &sit.unseen)
+            });
+        }
+        None
+    }
+
+    /// My partner is winning the trick. Usually pass, but take over a low
+    /// single or pair to shed a card cheaply (unless they called), and as the
+    /// Tichu caller take over to shed any loser or to run out.
+    fn overtake(&self, view: &PlayerView, plays: &[Combo], sit: &Situation, base_cost: usize) -> Option<usize> {
+        if self.p.overtake == 0.0 {
+            return None;
+        }
+        let trick = view.current_trick.as_ref()?;
+        let hand = &view.hand;
+        let partner_called = view.players[view.partner()].tichu != TichuCall::None;
+        let p = plan(&Counts::of(hand.iter().copied()), &sit.unseen, base_cost);
+        let running = p.losers <= p.regain + 1;
+        let low = (trick.kind == ComboKind::Single && trick.rank < 10.0)
+            || (trick.kind == ComboKind::Pair && trick.rank < 8.0);
+        let mut best: Option<(f32, usize)> = None;
+        for (i, c) in plays.iter().enumerate() {
+            if c.is_bomb() || c.contains(SpecialKind::Dragon) || c.contains(SpecialKind::Phoenix) {
+                continue;
+            }
+            let damage = cost_after(hand, c) as f32 - (base_cost as f32 - 1.0);
+            let boss = !could_beat(&rcombo(c), &sit.unseen);
+            let ok = if sit.my_live_tichu {
+                running || (!boss && damage <= 0.0)
+            } else {
+                low && !partner_called && !boss && damage <= 0.0
+            };
+            if !ok {
+                continue;
+            }
+            let s = -c.rank - 6.0 * damage.max(0.0);
+            if best.is_none_or(|(b, _)| s > b) {
+                best = Some((s, i));
+            }
+        }
+        best.map(|(_, i)| i)
     }
 }
 
@@ -681,5 +864,15 @@ mod tests {
         assert!(!could_beat(&pair_k, &u));
         u.phoenix = true;
         assert!(could_beat(&ace, &u));
+    }
+
+    #[test]
+    fn clear_path_covers_losers() {
+        use Suit::*;
+        let u = Counts::of([n(Jade, 9), n(Star, 9), n(Sword, 12), n(Pagoda, 12), n(Jade, 13)]);
+        let mut h = vec![n(Jade, 4), n(Star, 4), n(Jade, 14), n(Star, 14), DOG];
+        assert!(clear_path(&Counts::of(h.iter().copied()), &u));
+        h.extend([n(Jade, 7), n(Star, 7)]);
+        assert!(!clear_path(&Counts::of(h.iter().copied()), &u));
     }
 }

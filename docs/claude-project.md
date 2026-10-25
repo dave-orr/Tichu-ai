@@ -46,6 +46,7 @@ Results (duplicate deals):
 | oracle10@0.1/h vs pimc10@0.1/h (value of knowing the hands) | +61.3 ± 8.7 | 600 |
 | pimc10@0.1/hi vs pimc10@0.1/h (inference) | −0.5 ± 8.9 | 600 |
 | pimc10@0.1/hbs vs pimc10@0.1/h (searched bombs, wish, Dragon) | +3.6 ± 9.1 | 600 |
+| h2 vs h2 before Dave's play rules (Mah Jong first, wish, overtake partner, Dragon) | +19.5 ± 2.2 | 8000 |
 
 Findings:
 - Bots finish 1-2 in ~33% of rounds, likely far above humans: weak defense.
@@ -65,6 +66,24 @@ Findings:
   6), but bots make 50%. The gap is in play, not in hand evaluation.
 
 Findings from the Oct 2026 play work:
+- Dave's play rules in h2, each measured by switching it off (`h2` vs
+  `h2~knob=0`, 8000 deals): lead the Mah Jong first +10.0 ± 1.9; play over
+  a partner's low single (<10) or pair (<8s) unless they called, and as the
+  caller play over them with any loser or to run out, +6.6 ± 1.1; wish for
+  an Ace when the next player called, else the card I passed the next
+  player (who must play it at once, so the wish never binds me), +4.2 ±
+  1.8; Dragon to the opponent without a call 0.0 (it only moves
+  points between opponents, which matters only if that one finishes last).
+- Dave's Dog rules (`h2~dog_mode`): lead the Dog to a calling partner
+  unless I hold the Mah Jong and a winner, or a bomb plus another card; as
+  the caller lead it unless I have a clear path out; with no call on our
+  side, Mah Jong first, else Dog unless I can cash out and exit on it; with
+  bomb + Dog, bomb an opponent on ≤5 cards taking a trick, then Dog. h2 vs
+  `dog_mode=0`: +6.6 ± 1.5 (8000 deals). Nearly all of it is the lead
+  rules: the bomb part alone is +0.1 ± 0.1 (bomb + Dog is rare). A clear
+  path counts a loser covered by its own winner of the same type (44 AA
+  Dog: lead 44, win it back with AA, exit on the Dog); that refinement
+  changed results by under 0.1/deal.
 - Most of h2's gain came from card tracking plus the hand split. One rule
   backfired badly: steering leads away from lengths a near-out opponent can
   follow cost ~24/deal (`h2~danger=4` vs `h2`), so it's off. Other knobs
