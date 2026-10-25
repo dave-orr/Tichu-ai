@@ -24,7 +24,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("random", "uniformly random legal moves (some Tichu calls and bombs, to exercise the rules)"),
     ("heuristic", "simple rule-based baseline: dump low combos, don't overtake partner, save the Dragon"),
     ("h2", "stronger rule-based player: card tracking (bosses), hand structure, lead planning, Tichu/1-2 defense, v2 passing (Dog to an opponent)"),
-    ("pimcN[@x][/F]", "search bot: N sampled deals x heuristic rollouts per candidate play; @x = rollout noise; flags F: h = h2 rollouts, i = hand inference, b = search bombs, s = search wish and Dragon gift (pimc20, pimc20@0.1, pimc10/hibs)"),
+    ("pimcN[@x][/F]", "search bot: N sampled deals x heuristic rollouts per candidate play; @x = rollout noise; flags F: h = h2 rollouts, i = hand inference, b = search bombs, s = search wish and Dragon gift (pimc20, pimc20@0.1, pimc10/hibs); passes with the v2 rules"),
     ("oracleN[@x]", "CHEATS (diagnostic): pimc that searches the real hands (oracle1, oracle20@0.1)"),
     ("eg:BOT", "BOT, but two-player endgames are solved exactly (e.g. eg:heuristic, eg:pimc20)"),
     ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, g = v2 Grand only (calls:1:pimc20)"),

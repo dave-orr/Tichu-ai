@@ -186,7 +186,9 @@ impl Bot for PimcBot {
         self.base.small_tichu(view)
     }
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
-        self.base.pass_cards(view)
+        // Dave's v2 rules as written: +22.3 ± 3.9 per deal over v1 passing
+        // for pimc10 (4000 deals); Dog always to an opponent was +14.7 ± 3.9.
+        crate::bots::passing::pass_v2(view)
     }
     fn bomb(&mut self, view: &PlayerView, bombs: &[Combo]) -> Option<usize> {
         if self.search_bombs {
