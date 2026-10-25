@@ -325,7 +325,7 @@ impl Bot for ValuePimcBot {
         let team = view.my_team();
         let mut totals = vec![0.0f64; cands.len()];
         for _ in 0..self.samples {
-            let base = GameState::from_view(view, view.sample_hands(&mut self.rng));
+            let base = GameState::from_view_with_history(view, view.sample_hands(&mut self.rng));
             for (k, opt) in cands.options.iter().enumerate() {
                 let mut g = base.clone();
                 let action = match opt {

@@ -187,7 +187,7 @@ impl Bot for FirstChoice {
 /// garbage) and update the hash below.
 #[test]
 fn feature_encoding_is_pinned_to_its_version() {
-    assert_eq!((FEATURE_VERSION, STATE_DIM, ACTION_DIM), (1, 560, 40), "dims changed: bump FEATURE_VERSION and update this test");
+    assert_eq!((FEATURE_VERSION, STATE_DIM, ACTION_DIM), (2, 704, 48), "dims changed: bump FEATURE_VERSION and update this test");
     let hash = std::rc::Rc::new(std::cell::Cell::new(0u64));
     let mut rng = StdRng::seed_from_u64(2024);
     for i in 0..60 {
@@ -204,7 +204,7 @@ fn feature_encoding_is_pinned_to_its_version() {
     );
 }
 
-const FEATURE_HASH: u64 = 0x4a80_bbc3_ed37_4195;
+const FEATURE_HASH: u64 = 0x4f80_3057_2d4c_5ccc;
 
 // ---------------------------------------------------------------------------
 // Self-play records
