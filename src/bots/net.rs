@@ -116,8 +116,8 @@ impl Net {
             return Err(format!("{path}: not a .tnet model"));
         }
         let hlen = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let header: Header =
-            serde_json::from_slice(&data[8..8 + hlen]).map_err(|e| format!("{path}: bad header: {e}"))?;
+        let header = data.get(8..8 + hlen).ok_or_else(|| format!("{path}: truncated header"))?;
+        let header: Header = serde_json::from_slice(header).map_err(|e| format!("{path}: bad header: {e}"))?;
         if header.feature_version != FEATURE_VERSION || header.state_dim != STATE_DIM || header.action_dim != ACTION_DIM {
             return Err(format!(
                 "{path}: trained on feature version {} ({}x{}), this build has {FEATURE_VERSION} ({STATE_DIM}x{ACTION_DIM})",
