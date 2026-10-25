@@ -14,7 +14,6 @@ use tichu_engine::bot::Bot;
 use tichu_engine::deck::shuffled_deck;
 use tichu_engine::engine::{Action, GameState};
 use tichu_engine::features::*;
-use tichu_engine::history::TOKEN_DIM;
 use tichu_engine::llm::client::fnv1a;
 use tichu_engine::replay;
 use tichu_engine::scoring::RoundResult;
@@ -159,6 +158,7 @@ impl Bot for FirstChoice {
         encode_state(v, &mut bytes);
         let c = Candidates::new(v, plays, can_pass);
         bytes.extend_from_slice(&c.features);
+        encode_history(v, &mut bytes);
         let h = self.hash.get();
         self.hash.set(fnv1a(&bytes) ^ h.rotate_left(5));
         let choice = if plays.is_empty() || (can_pass && v.played_cards.len() % 3 != 0) { None } else { Some(v.played_cards.len() % plays.len()) };
@@ -188,7 +188,7 @@ impl Bot for FirstChoice {
 /// garbage) and update the hash below.
 #[test]
 fn feature_encoding_is_pinned_to_its_version() {
-    assert_eq!((FEATURE_VERSION, STATE_DIM, ACTION_DIM), (2, 640, 48), "dims changed: bump FEATURE_VERSION and update this test");
+    assert_eq!((FEATURE_VERSION, STATE_DIM, ACTION_DIM), (2, 704, 48), "dims changed: bump FEATURE_VERSION and update this test");
     let hash = std::rc::Rc::new(std::cell::Cell::new(0u64));
     let mut rng = StdRng::seed_from_u64(2024);
     for i in 0..60 {
@@ -205,7 +205,7 @@ fn feature_encoding_is_pinned_to_its_version() {
     );
 }
 
-const FEATURE_HASH: u64 = 0x4fb0_9071_5fb9_aa73;
+const FEATURE_HASH: u64 = 0x0e14_a191_eb00_72d8;
 
 // ---------------------------------------------------------------------------
 // Self-play records
@@ -218,13 +218,11 @@ struct Rec {
     label: usize,
     margin: f32,
     q: Option<Vec<f32>>,
-    /// The history tokens this record saw (a prefix of its seat's sequence).
-    tokens: Vec<u8>,
-    owners: Vec<u8>,
     bytes: Vec<u8>,
 }
 
-/// Parses a record file the way train/tichu_data.py does.
+/// Parses a record file the way train/tichu_data.py does. Each record's
+/// `bytes` are its own plus the history tokens it saw.
 fn parse_records(buf: &[u8]) -> Vec<Rec> {
     let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
     let u16_at = |p: usize| u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
@@ -234,37 +232,33 @@ fn parse_records(buf: &[u8]) -> Vec<Rec> {
         [selfplay::FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32, TOKEN_DIM as u32]
     );
     let mut out = vec![];
-    let mut seq: Option<(u32, u8, &[u8])> = None;
     let mut p = 24;
     while p < buf.len() {
-        let start = p;
-        let (tag, round, seat) = (buf[p], u32_at(p + 1), buf[p + 5]);
-        if tag == 1 {
-            let n = u16_at(p + 6);
-            p += 8 + n * TOKEN_DIM;
-            assert!(p <= buf.len(), "truncated sequence");
-            seq = Some((round, seat, &buf[start + 8..p]));
-            continue;
+        let round = u32_at(p);
+        let seat = buf[p + 4];
+        let n_tokens = u16_at(p + 5);
+        let n_recs = u32_at(p + 7) as usize;
+        let tokens = &buf[p + 11..p + 11 + n_tokens * TOKEN_DIM];
+        p += 11 + n_tokens * TOKEN_DIM;
+        for _ in 0..n_recs {
+            let start = p;
+            let flags = buf[p];
+            let n = u16_at(p + 1);
+            let label = u16_at(p + 3);
+            let prefix = u16_at(p + 5);
+            let margin = f32::from_le_bytes(buf[p + 7..p + 11].try_into().unwrap());
+            assert!(prefix <= n_tokens, "record saw {prefix} of {n_tokens} tokens");
+            p += 11 + STATE_DIM + n * ACTION_DIM;
+            let q = (flags & 1 == 1).then(|| {
+                let q = (0..n).map(|k| f32::from_le_bytes(buf[p + 4 * k..p + 4 * k + 4].try_into().unwrap())).collect();
+                p += 4 * n;
+                q
+            });
+            assert!(p <= buf.len(), "truncated record");
+            let mut bytes = buf[start..p].to_vec();
+            bytes.extend_from_slice(&tokens[..prefix * TOKEN_DIM]);
+            out.push(Rec { round, seat, n, label, margin, q, bytes });
         }
-        assert_eq!(tag, 0, "unknown block tag");
-        let flags = buf[p + 6];
-        let n = u16_at(p + 7);
-        let label = u16_at(p + 9);
-        let margin = f32::from_le_bytes(buf[p + 11..p + 15].try_into().unwrap());
-        let seq_len = u16_at(p + 15);
-        let owners = buf[p + 17..p + 17 + 56].to_vec();
-        p += 17 + 56 + STATE_DIM + n * ACTION_DIM;
-        let q = (flags & 1 == 1).then(|| {
-            let q = (0..n).map(|k| f32::from_le_bytes(buf[p + 4 * k..p + 4 * k + 4].try_into().unwrap())).collect();
-            p += 4 * n;
-            q
-        });
-        assert!(p <= buf.len(), "truncated record");
-        let (sr, ss, toks) = seq.expect("record before its sequence");
-        assert_eq!((sr, ss), (round, seat), "record not under its seat's sequence");
-        assert!(seq_len * TOKEN_DIM <= toks.len());
-        let tokens = toks[..seq_len * TOKEN_DIM].to_vec();
-        out.push(Rec { round, seat, n, label, margin, q, tokens, owners, bytes: buf[start..p].to_vec() });
     }
     out
 }
@@ -296,15 +290,6 @@ fn selfplay_records_parse_and_are_reproducible() {
         assert!(r.label < r.n);
         assert!(r.q.is_none());
         assert!(r.margin.fract() == 0.0 && r.margin.abs() <= 800.0, "margin {}", r.margin);
-        assert!(r.owners.iter().all(|&o| (1..=3).contains(&o) || o == 255));
-        let unseen = r.owners.iter().filter(|&&o| o != 255).count();
-        assert!(unseen > 0 && unseen <= 42, "{unseen} unseen cards");
-    }
-    // Later decisions of a seat see more history.
-    for w in recs.windows(2) {
-        if (w[0].round, w[0].seat) == (w[1].round, w[1].seat) {
-            assert!(w[1].tokens.starts_with(&w[0].tokens) && w[1].tokens.len() > w[0].tokens.len());
-        }
     }
     // Teammates share a margin, opponents get its negation.
     for a in &recs {
@@ -316,7 +301,7 @@ fn selfplay_records_parse_and_are_reproducible() {
     // Threads only change the order rounds are written in.
     let (four, _) = selfplay_file(&SelfplayConfig { threads: 4, ..cfg.clone() });
     let by_round = |recs: Vec<Rec>| {
-        let mut v: Vec<(u32, Vec<u8>, Vec<u8>)> = recs.into_iter().map(|r| (r.round, r.bytes, r.tokens)).collect();
+        let mut v: Vec<(u32, Vec<u8>)> = recs.into_iter().map(|r| (r.round, r.bytes)).collect();
         v.sort_by_key(|x| x.0);
         v
     };

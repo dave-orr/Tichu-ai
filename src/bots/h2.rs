@@ -359,7 +359,7 @@ pub fn could_beat(c: &RCombo, u: &Counts) -> bool {
     }
 }
 
-fn rcombo(c: &Combo) -> RCombo {
+pub(crate) fn rcombo(c: &Combo) -> RCombo {
     RCombo { kind: c.kind, top: c.rank, len: c.length }
 }
 
@@ -405,17 +405,17 @@ fn situation(view: &PlayerView) -> Situation {
 }
 
 /// How a hand plays out from here.
-struct Plan {
+pub(crate) struct Plan {
     /// Combinations that win when led: bosses of my split, the Dragon, bombs.
-    lead_bosses: usize,
+    pub(crate) lead_bosses: usize,
     /// Ways to win back the lead when following: the Dragon, a loose
     /// Phoenix, bombs, boss singles.
-    regain: usize,
+    pub(crate) regain: usize,
     /// The other combinations, the Dog included.
-    losers: usize,
+    pub(crate) losers: usize,
 }
 
-fn plan(mine: &Counts, unseen: &Counts, base_cost: usize) -> Plan {
+pub(crate) fn plan(mine: &Counts, unseen: &Counts, base_cost: usize) -> Plan {
     let sh = shape(mine);
     let bosses: Vec<&RCombo> = sh.combos.iter().filter(|c| !could_beat(c, unseen)).collect();
     let regain = bosses.iter().filter(|c| c.kind == ComboKind::Single || c.kind == ComboKind::FourOfAKindBomb).count()
@@ -431,7 +431,7 @@ fn plan(mine: &Counts, unseen: &Counts, base_cost: usize) -> Plan {
 /// A clear path out: every combination but the Dog either wins the lead
 /// back or is a loser covered by its own winner of the same type (lead 44,
 /// win it back with AA). Then exit on the Dog.
-fn clear_path(mine: &Counts, unseen: &Counts) -> bool {
+pub(crate) fn clear_path(mine: &Counts, unseen: &Counts) -> bool {
     let sh = shape(mine);
     let (mut bosses, losers): (Vec<RCombo>, Vec<RCombo>) = sh.combos.iter().partition(|c| !could_beat(c, unseen));
     let mut dragon = mine.dragon;

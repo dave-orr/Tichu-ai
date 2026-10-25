@@ -10,9 +10,8 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 
 | | |
 |---|---|
-| `src/features.rs` | fixed-size byte features of a `PlayerView` (640) and of each candidate play (48). Seats are relative, in play order |
-| `src/history.rs` | the round so far as one 48-byte token per event (plays, passes, bombs, calls, wish, passed cards, tricks won), for the GRU; plus summaries the features use |
-| `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options, each seat's history tokens, and who held every unseen card |
+| `src/features.rs` | fixed-size byte features of a `PlayerView` (704) and of each candidate play (48), and the round's history as tokens (48 bytes each). Seats are relative, in play order |
+| `src/selfplay.rs` | `tichu selfplay`: plays rounds, writes one record per play decision with 2+ options (plus each seat's history tokens once per round) |
 | `train/tichu_data.py` | reads record files into numpy arrays |
 | `train/train.py` | trains the net, writes `.tnet` (and a `.pt` checkpoint beside it) |
 | `train/iterate.py` | the expert-iteration loop: label → train → arena, generation after generation |
@@ -20,10 +19,7 @@ tichu selfplay ──► records (.bin) ──► train.py ──► model (.tne
 
 ## The model
 
-A one-layer GRU (64 units, `--seq`; 0 turns it off) reads the round's
-history tokens up to the decision. Its last state joins the state features
-at the input of a shared trunk (640 + 64 → 256 → 256, ReLU), which feeds
-three heads:
+A shared trunk over the state (704 [+ 64] → 256 → 256, ReLU) with two heads:
 
 - **value**: expected round margin for my team (my team's points − theirs),
   trained by MSE against the final margin of the round the position came
@@ -31,25 +27,30 @@ three heads:
 - **policy**: one logit per candidate from `trunk ⊕ action features`, so a
   turn can have any number of legal plays. Softmax over the candidates.
   Plays that differ only in suits have identical features and are merged.
-- **belief** (training only): for each card I can't see, which of the other
-  three seats holds it, by cross-entropy against the hindsight owners in
-  the record file (`--belief-weight`, default 0.5). It isn't exported; it's
-  there to make the trunk track hands.
 
-The state features (version 2) cover: my hand, cards played by each seat,
-cards whose holder I know, rank counts, specials, per-seat calls, counts and
-finishing order, the trick, wish and score; plus, from the history, the
-lowest rank each seat declined to beat per combo kind while an opponent held
-the trick, bombs thrown, late Tichu calls, the Dragon's recipient and the
-wish; the cards I received, by sender, and whether I still hold them; h2's
-plan for my hand (combos to go out, how many are unbeatable by unseen cards,
-whether the table is); and each opponent's odds of holding a four-of-a-kind
-bomb given card tracking. Each candidate also says whether it's unbeatable
-and how it changes the hand plan.
+The extra 64 inputs are a **sequence encoder**: a one-layer GRU over the
+round's history, one token per action (who led or followed with what, who
+passed on what and against whom, who won each trick and its points, Dragon
+gifts, Tichu calls, the wish). It's off by default (`--seq-hidden 64` turns
+it on): at gen0 on 16k rounds it was even with the flat net (+0.3 ± 2.8 over
+4000 deals) and made net rollouts 30% slower. Rust keeps each bot's walk of the log and GRU states between
+decisions, so a growing history (or rollouts from one position) only runs
+the new tokens.
 
-Rust runs it with a hand-written dense forward pass (and GRU step, caching
-the hidden state per history prefix, so a seat's later decisions and the
-rollouts from one position only run the new tokens). The net is tiny, inputs
+What the state features hold beyond the cards (feature version 2): the card
+each seat passed me; per seat and combo kind, the lowest rank they passed on
+while an opponent held the trick; leads by kind; bomb threats per seat (four
+of a kinds expected, P(any bomb), strongest bomb possible) from card tracking
+with the unknown cards dealt at random; h2's plan of my hand (combos to go
+out, bosses, losers, a clear path); and whether the trick on the table can
+still be beaten. Each candidate also gets whether it can be beaten (for a
+bomb: by a stronger bomb an opponent might hold), how many unseen ranks beat
+it, and h2's plan of the hand that's left. The random-deal bomb odds rank
+seats well but run about 3× low (`cargo test --release bomb_threats --
+--ignored --nocapture`): passing makes bombs far more common (5% of hands
+before the pass, 13% after), and the net learns the scale.
+
+Rust runs it with a hand-written dense forward pass. The net is tiny, inputs
 are mostly zeros, and it gets called inside search, so this beats an ONNX
 runtime on latency and needs no native libraries. Every `.tnet` carries one
 worked example from the trainer; the loader recomputes it and refuses the
@@ -74,10 +75,12 @@ different `FEATURE_VERSION`.
 - `--explore P` plays a random option with probability P (the label is still
   the bot's / search's choice), for more varied positions.
 
-Record size is about 1 KB, plus about 4 KB of history tokens per seat per
-round: roughly 45 KB per heuristic round and 55 KB per PIMC round. Format 2
-files (with history) replace format 1; `train.py` refuses the old ones, so
-start a fresh `iterate.py --dir` after upgrading.
+Record size is about 0.8 KB, roughly 30 KB per heuristic round and 40 KB per
+PIMC round, plus about 4.5 KB of history tokens per seat per round.
+
+Speed on the desktop (16 threads, `--q 10`, h2 playing): heuristic rollouts
+about 5.6 rounds/s; rollouts by a feature-v2 net 2.6 rounds/s without the
+GRU and 1.8 with it (a v1 net ran 3.6).
 
 ## Workflow
 
@@ -124,14 +127,19 @@ Next steps this pipeline is built for:
 | gen1 vs pimc10 | +68.4 ± 10.7 | 400 |
 | gen0 labelled with h2 rollouts (2k rounds) vs gen0 with heuristic rollouts | −14.2 ± 4.2 | 2000 |
 | vpimc10 (value head from the 20k heuristic rounds, R² 0.25) vs pimc10 | −37.1 ± 13.0 | 300 |
-| features v2, gen0 (3k `--q 10` rounds, no GRU) vs heuristic | +102.8 ± 5.7 | 2000 |
-| features v2, gen0, no GRU vs h2 | +6.6 ± 4.8 | 2000 |
-| features v2, gen0 with GRU vs h2 | +4.3 ± 4.8 | 2000 |
-| features v2, gen0 with GRU vs without (same data) | −1.4 ± 3.7 | 2000 |
 
-For comparison, the overnight v1 gen0 (20k rounds) scored −4.3 ± 3.4 against
-h2 over 4000 deals. So the v2 features help even with less data, but on 3k
-rounds the GRU adds nothing measurable.
+Desktop, gen0 on 16k `--q 10` rounds (heuristic rollouts, seed 1000), 8 epochs, arena seed 77:
+
+| net | vs h2 | vs heuristic | deals |
+|---|---|---|---|
+| features v1 (overnight gen0) | −4.3 ± 3.4 | +96.4 ± 3.8 | 4000 |
+| features v1, overnight gen2 (best) | +18.4 ± 3.3 | +108.4 ± 3.8 | 4000 |
+| features v2, no GRU | +16.5 ± 3.3 | +113.2 ± 3.8 | 4000 |
+| features v2 + GRU | +14.4 ± 3.4 | +116.9 ± 3.8 | 4000 |
+
+v2 + GRU vs v2 flat: +0.3 ± 2.8 over 4000 deals. One v2 generation matches
+three v1 generations; the GRU adds nothing yet. The value head still
+overfits: R² peaks near 0.33 after ~1000 steps and ends near 0.05.
 
 The distilled policy beats the search that labelled it, and a second
 generation beats the first. The value head isn't good enough to stop
