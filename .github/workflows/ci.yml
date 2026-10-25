@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+      - name: Examples build
+        run: cargo build --release --examples
+
+  pipelines:
+    name: viewer, llm_match, training
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Viewer wasm is up to date
+        run: scripts/check-viewer-wasm.sh
+      - name: llm_match through the claude CLI path (fake claude)
+        run: scripts/check-llm-match.sh
+      - name: Install numpy and CPU PyTorch
+        run: pip install numpy torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+      - name: selfplay -> train.py -> net bot
+        run: scripts/check-training.sh python
+
+  ts-diff:
+    name: Rust vs TS engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: dave-orr/tichu
+          path: .ts-engine
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .ts-engine/.nvmrc
+      - name: Diff 200 random and 200 heuristic rounds
+        run: scripts/ts-diff.sh 200
+        env:
+          TICHU_REPO: ${{ github.workspace }}/.ts-engine
