@@ -30,7 +30,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, g = v2 Grand only (calls:1:pimc20)"),
     ("nocalls:BOT", "same as calls:none:BOT"),
     ("pass2[~F]:BOT", "BOT with v2 passing (F = only these rules: o opponents, m Mah Jong vs Grand, p partner; e.g. pass2~o:h2): low singletons odd left / even right, Mah Jong before a Grand, partner gets my best card unless a gift would make me a Tichu hand"),
-    ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; heuristic for calls, passes, bombs out of turn"),
+    ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; h2 for calls, passes, bombs out of turn"),
     ("vpimcN:PATH", "pimcN whose rollouts stop at my next turn and are scored by the model's value head"),
 ];
 

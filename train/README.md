@@ -99,6 +99,7 @@ Next steps this pipeline is built for:
 | gen1: `--q 10` with gen0 rollouts (1.5k rounds) vs gen0 | +11.6 ± 4.0 | 2000 |
 | gen1 vs heuristic | +90.1 ± 5.0 | 2000 |
 | gen1 vs pimc10 | +68.4 ± 10.7 | 400 |
+| gen0 labelled with h2 rollouts (2k rounds) vs gen0 with heuristic rollouts | −14.2 ± 4.2 | 2000 |
 | vpimc10 (value head from the 20k heuristic rounds, R² 0.25) vs pimc10 | −37.1 ± 13.0 | 300 |
 
 The distilled policy beats the search that labelled it, and a second
@@ -112,9 +113,12 @@ cards, the rest of the round), and R² stayed near 0.25.
 python train/iterate.py --dir runs/a --gens 6 --rounds 20000
 ```
 
+Generation 0's rollouts use the heuristic (`--rollout0`; h2 rollouts gave
+worse labels, above), and every non-play decision (calls, passing, bombs out
+of turn, wish, Dragon) is made by h2 (`--base`), here and in the `net:` bots.
 Each generation runs `selfplay --q 10 --rollout net:<previous>`, trains on
 the last two generations' records, and plays the new net against the
-heuristic and the previous generation (4000 deals each); everything is
+heuristic, h2 and the previous generation (4000 deals each); everything is
 logged to `runs/a/log.txt`. Stop it any time; re-running resumes. At ~6
 rounds/s on 16 threads (estimated), 20k rounds is about an hour of self-play
 per generation; training is minutes on the GPU.
