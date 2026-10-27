@@ -23,7 +23,14 @@ A shared trunk over the state (704 [+ 64] → 256 → 256, ReLU) with two heads:
 
 - **value**: expected round margin for my team (my team's points − theirs),
   trained by MSE against the final margin of the round the position came
-  from. Output is in units of `--value-scale` (100 points).
+  from. Output is in units of `--value-scale` (100 points). Positions of
+  one round share its margin, so a head on the trunk memorizes rounds
+  (validation R² falls from ~0.3 to ~0.1 as training goes on, while train
+  R² reaches 0.8). The exported value is a separate net over the state
+  (`--value-net 128`, dropout 0.3, weight decay 1e-2), kept at its best
+  validation MSE; the trunk's head is an auxiliary loss (`--value-weight
+  0.25`) that's not exported. On 3k rounds this took validation R² from
+  0.10 to 0.28, with the same policy loss.
 - **policy**: one logit per candidate from `trunk ⊕ action features`, so a
   turn can have any number of legal plays. Softmax over the candidates.
   Plays that differ only in suits have identical features and are merged.

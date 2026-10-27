@@ -7,6 +7,13 @@ The policy target is the recorded label by default (imitation). With
 `--policy q`, files that carry PIMC Q-values are distilled instead: the
 target is softmax(Q / --tau) over the candidates. The value head regresses
 the final round margin (in units of --value-scale points).
+
+Positions from one round share its margin, so a value head on the shared
+trunk memorizes rounds (train R² ~0.8, validation ~0.1 by the end). The
+exported value is therefore a separate small net over the state features
+(`--value-net` units, dropout, strong weight decay), kept at its best
+validation MSE. The trunk's own value head stays as an auxiliary loss
+(`--value-weight`), which helps the policy a little, and isn't exported.
 """
 
 import argparse
@@ -31,8 +38,13 @@ class TichuNet(nn.Module):
     trunk ⊕ action. Mirrors `Net` in src/bots/net.rs (ReLU after every layer
     but the last of each head, and after the trunk)."""
 
-    def __init__(self, state_dim, action_dim, hidden=256, depth=2, head=128, token_dim=0, seq_hidden=0):
+    def __init__(self, state_dim, action_dim, hidden=256, depth=2, head=128, token_dim=0, seq_hidden=0,
+                 value_net=0, value_dropout=0.3):
         super().__init__()
+        self.value_dropout = value_dropout
+        self.value_net = nn.ModuleList(
+            [nn.Linear(state_dim, value_net), nn.Linear(value_net, value_net), nn.Linear(value_net, 1)]
+        ) if value_net else None
         self.seq_hidden = seq_hidden
         self.gru = nn.GRU(token_dim, seq_hidden, batch_first=True) if seq_hidden else None
         dims = [state_dim + seq_hidden] + [hidden] * depth
@@ -65,13 +77,24 @@ class TichuNet(nn.Module):
             s = F.relu(l(s))
         return s
 
+    def forward_value_net(self, s):
+        x = s
+        for i, l in enumerate(self.value_net):
+            x = l(x)
+            if i + 1 < len(self.value_net):
+                x = F.dropout(F.relu(x), self.value_dropout, self.training)
+        return x.squeeze(-1)
+
     def forward(self, s, a, toks, lens):
-        """s [B, S], a [B, K, A], toks [B, L, D], lens [B] -> value [B], logits [B, K]."""
+        """s [B, S], a [B, K, A], toks [B, L, D], lens [B] -> value [B],
+        logits [B, K], trunk value [B]. Without a value net both values are
+        the trunk's."""
         h = self.forward_trunk(s, self.encode_seq(toks, lens))
-        v = self._head(self.value, h).squeeze(-1)
+        tv = self._head(self.value, h).squeeze(-1)
         hk = h.unsqueeze(1).expand(-1, a.shape[1], -1)
         logits = self._head(self.policy, torch.cat([hk, a], dim=-1)).squeeze(-1)
-        return v, logits
+        v = self.forward_value_net(s) if self.value_net is not None else tv
+        return v, logits, tv
 
 
 def write_tnet(model, path, args, data, check):
@@ -79,7 +102,9 @@ def write_tnet(model, path, args, data, check):
     header = dict(
         format=1, feature_version=int(data.feature_version),
         state_dim=int(data.state_dim), action_dim=int(data.action_dim),
-        trunk=layers(model.trunk), value=layers(model.value), policy=layers(model.policy),
+        trunk=layers(model.trunk), policy=layers(model.policy),
+        value=layers(model.value_net if model.value_net is not None else model.value),
+        value_input="state" if model.value_net is not None else "trunk",
         seq=dict(token_dim=int(data.token_dim), hidden=model.seq_hidden) if model.gru is not None else None,
         value_scale=args.value_scale, check=check,
         trained=dict(data=args.data, policy=args.policy, records=len(data), epochs=args.epochs),
@@ -87,7 +112,8 @@ def write_tnet(model, path, args, data, check):
     hb = json.dumps(header).encode()
     with open(path, "wb") as f:
         f.write(b"TNET" + struct.pack("<I", len(hb)) + hb)
-        for ml in (model.trunk, model.value, model.policy):
+        value = model.value_net if model.value_net is not None else model.value
+        for ml in (model.trunk, value, model.policy):
             for l in ml:
                 f.write(l.weight.detach().cpu().float().numpy().astype("<f4").tobytes())
                 f.write(l.bias.detach().cpu().float().numpy().astype("<f4").tobytes())
@@ -103,7 +129,10 @@ def main():
     ap.add_argument("--init", help="start from this .pt checkpoint (saved next to every .tnet)")
     ap.add_argument("--policy", choices=["label", "q"], default="label")
     ap.add_argument("--tau", type=float, default=20.0, help="Q temperature in points (--policy q)")
-    ap.add_argument("--value-weight", type=float, default=1.0)
+    ap.add_argument("--value-weight", type=float, default=0.25, help="weight of the trunk's (auxiliary) value loss")
+    ap.add_argument("--value-net", type=int, default=128, help="units of the separate value net (0 = export the trunk's head)")
+    ap.add_argument("--value-dropout", type=float, default=0.3)
+    ap.add_argument("--value-wd", type=float, default=1e-2)
     ap.add_argument("--value-scale", type=float, default=100.0)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--depth", type=int, default=2)
@@ -162,16 +191,21 @@ def main():
         return idx, s, a, mask, rows, toks, lens
 
     model = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head,
-                     data.token_dim, args.seq_hidden).to(dev)
+                     data.token_dim, args.seq_hidden, args.value_net, args.value_dropout).to(dev)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location=dev))
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    vparams = list(model.value_net.parameters()) if model.value_net is not None else []
+    vids = {id(p) for p in vparams}
+    groups = [dict(params=[p for p in model.parameters() if id(p) not in vids], weight_decay=args.wd)]
+    if vparams:
+        groups.append(dict(params=vparams, weight_decay=args.value_wd))
+    opt = torch.optim.AdamW(groups, lr=args.lr)
     steps = max(1, int(args.epochs * len(train_idx) / args.batch))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
 
     def losses(idx):
         idx, s, a, mask, rows, toks, lens = batch(idx)
-        v, logits = model(s, a, toks, lens)
+        v, logits, tv = model(s, a, toks, lens)
         logits = logits.masked_fill(~mask, -1e9)
         logp = F.log_softmax(logits, dim=-1)
         if args.policy == "q":
@@ -181,14 +215,15 @@ def main():
             pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
         else:
             pl = -logp.gather(1, label[idx][:, None]).squeeze(1)
-        vl = F.mse_loss(v, margin[idx], reduction="none")
+        vl = F.mse_loss(v, margin[idx])
+        tvl = F.mse_loss(tv, margin[idx]) if model.value_net is not None else vl
         acc = (logits.argmax(-1) == label[idx]).float()
-        return pl.mean(), vl.mean(), acc.mean()
+        return pl.mean(), vl, acc.mean(), tvl
 
     @torch.no_grad()
     def evaluate():
         model.eval()
-        tot = np.zeros(3)
+        tot = np.zeros(4)
         chunks = np.array_split(val_idx, max(1, len(val_idx) // 4096))
         for c in chunks:
             tot += np.array([x.item() for x in losses(c)]) * len(c)
@@ -200,23 +235,34 @@ def main():
           f"(value MSE to beat); {steps} steps on {dev}", flush=True)
     t0, step = time.time(), 0
     log_every = max(1, steps // 20)
+    eval_every = max(1, steps // 60)
+    best_value = (float("inf"), None, 0)
     while step < steps:
         perm = rng.permutation(train_idx)
         for i in range(0, len(perm) - args.batch + 1, args.batch):
-            pl, vl, _ = losses(perm[i:i + args.batch])
-            loss = pl + args.value_weight * vl
+            pl, vl, _, tvl = losses(perm[i:i + args.batch])
+            loss = pl + args.value_weight * tvl + (vl if model.value_net is not None else 0)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             sched.step()
             step += 1
+            if model.value_net is not None and (step % eval_every == 0 or step == steps):
+                vp, vv, va, tv = evaluate()
+                if vv < best_value[0]:
+                    best_value = (vv, {k: t.detach().clone() for k, t in model.value_net.state_dict().items()}, step)
             if step % log_every == 0 or step == steps:
-                vp, vv, va = evaluate()
+                vp, vv, va, tv = evaluate()
                 print(f"step {step}/{steps}  train pol {pl.item():.3f} val {vp:.3f} | "
-                      f"value mse {vv:.3f} (R² {1 - vv / var:.3f}) | label acc {va:.1%} | "
-                      f"{time.time() - t0:.0f}s", flush=True)
+                      f"value mse {vv:.3f} (R² {1 - vv / var:.3f}, trunk's {1 - tv / var:.3f}) | "
+                      f"label acc {va:.1%} | {time.time() - t0:.0f}s", flush=True)
             if step >= steps:
                 break
+
+    if best_value[1] is not None:
+        model.value_net.load_state_dict(best_value[1])
+        print(f"value net: kept step {best_value[2]}, val mse {best_value[0]:.3f} "
+              f"(R² {1 - best_value[0] / var:.3f})", flush=True)
 
     # A worked example in the header: the Rust loader recomputes it and
     # refuses the model if the two implementations disagree.
@@ -230,7 +276,7 @@ def main():
         s = torch.from_numpy(data.states[i:i + 1]).float() / 255.0
         a = torch.from_numpy(data.actions[o:o + n][None]).float() / 255.0
         toks = torch.from_numpy(tk[None]).float() / 255.0
-        v, lg = model(s, a, toks, torch.tensor([tl]))
+        v, lg, _ = model(s, a, toks, torch.tensor([tl]))
     check = dict(state=data.states[i].tolist(), actions=data.actions[o:o + n].reshape(-1).tolist(),
                  tokens=tk.reshape(-1).tolist(),
                  value=float(v[0]) * args.value_scale, logits=[float(x) for x in lg[0]])

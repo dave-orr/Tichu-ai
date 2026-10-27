@@ -150,6 +150,11 @@ struct Header {
     policy: Vec<[usize; 2]>,
     /// The value head predicts margin / value_scale.
     value_scale: f32,
+    /// "state": the value layers are a separate net over the state features
+    /// (trained apart from the trunk and early-stopped); otherwise they
+    /// read the trunk's output.
+    #[serde(default)]
+    value_input: Option<String>,
     /// One position with the trainer's outputs, recomputed on load.
     check: Option<Check>,
 }
@@ -171,6 +176,7 @@ pub struct Net {
     gru: Option<Gru>,
     value_scale: f32,
     hidden: usize,
+    value_on_state: bool,
 }
 
 pub fn to_inputs(bytes: &[u8]) -> Vec<f32> {
@@ -236,6 +242,11 @@ impl Net {
                 })
             }
         };
+        let value_on_state = match header.value_input.as_deref() {
+            None | Some("trunk") => false,
+            Some("state") => true,
+            Some(x) => return Err(format!("{path}: unknown value_input {x:?}")),
+        };
         let seq_dim = gru.as_ref().map_or(0, |g| g.hidden);
         let hidden = trunk.last().map_or(STATE_DIM + seq_dim, |l| l.out);
         let chain_ok = |ls: &[Layer], first: usize| {
@@ -245,15 +256,15 @@ impl Net {
         };
         if trunk.first().is_some_and(|l| l.inp != STATE_DIM + seq_dim)
             || trunk.windows(2).any(|w| w[0].out != w[1].inp)
-            || !chain_ok(&value, hidden)
+            || !chain_ok(&value, if value_on_state { STATE_DIM } else { hidden })
             || !chain_ok(&policy, hidden + ACTION_DIM)
         {
             return Err(format!("{path}: layer shapes don't chain"));
         }
-        let net = Net { trunk, value, policy, gru, value_scale: header.value_scale, hidden };
+        let net = Net { trunk, value, policy, gru, value_scale: header.value_scale, hidden, value_on_state };
         if let Some(c) = &header.check {
             let h = net.trunk(&c.state, &net.encode_seq(&c.tokens));
-            let (v, l) = (net.value(&h), net.logits(&h, &c.actions));
+            let (v, l) = (net.value(&c.state, &h), net.logits(&h, &c.actions));
             let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * (1.0 + b.abs());
             if !close(v, c.value) || l.len() != c.logits.len() || l.iter().zip(&c.logits).any(|(a, b)| !close(*a, *b)) {
                 return Err(format!("{path}: outputs differ from the trainer's (value {v} vs {})", c.value));
@@ -315,9 +326,11 @@ impl Net {
         h
     }
 
-    /// Expected round margin (points) for my team.
-    pub fn value(&self, h: &[f32]) -> f32 {
-        mlp(&self.value, h)[0] * self.value_scale
+    /// Expected round margin (points) for my team, from the state features
+    /// and the trunk's output for them.
+    pub fn value(&self, state: &[u8], h: &[f32]) -> f32 {
+        let v = if self.value_on_state { mlp(&self.value, &to_inputs(state)) } else { mlp(&self.value, h) };
+        v[0] * self.value_scale
     }
 
     /// One logit per candidate (`actions` holds `ACTION_DIM` bytes each).
@@ -343,7 +356,10 @@ impl Net {
         let walk = HistoryWalk::of(view);
         let mut s = Vec::with_capacity(STATE_DIM);
         encode_state_with(view, &walk, &mut s);
-        self.value(&self.trunk(&s, &self.encode_seq(walk.tokens())))
+        if self.value_on_state {
+            return self.value(&s, &[]);
+        }
+        self.value(&s, &self.trunk(&s, &self.encode_seq(walk.tokens())))
     }
 }
 
@@ -568,7 +584,7 @@ mod tests {
         ha.extend(to_inputs(&a));
         let want_l = fwd(&dense[2], &ha, false)[0];
         let got_h = net.trunk(&s, &[]);
-        assert!((net.value(&got_h) - want_v).abs() < 1e-3);
+        assert!((net.value(&s, &got_h) - want_v).abs() < 1e-3);
         assert!((net.logits(&got_h, &a)[0] - want_l).abs() < 1e-4);
         std::fs::remove_file(path).ok();
     }
