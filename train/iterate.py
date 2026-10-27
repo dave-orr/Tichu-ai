@@ -63,7 +63,8 @@ def main():
         files = [data(k) for k in range(max(0, g - args.window + 1), g + 1)]
         run([sys.executable, os.path.join(HERE, "train.py"), *files, "--policy", "q",
              "--epochs", str(args.epochs), "--out", model(g), *args.train_args.split()], log)
-        opponents = ["heuristic", args.base] + ([f"net:{model(g - 1)}"] if g > 0 else [])
+        # The previous generation, and gen0 as a fixed yardstick for drift.
+        opponents = ["heuristic", args.base] + [f"net:{model(k)}" for k in sorted({g - 1, 0}) if 0 <= k < g]
         for opp in opponents:
             out = run([args.tichu, "arena", f"net:{model(g)}", opp, "--rounds", str(args.arena_rounds),
                        "--seed", str(77 + g)], log)
