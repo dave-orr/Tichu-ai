@@ -140,6 +140,48 @@ fn run(state: &GameState, node: Node, budget: usize, reference: bool) -> Option<
     Some(Solution { value, seat, decision, nodes: s.nodes })
 }
 
+/// The exact value of every option at a decision.
+#[derive(Debug, Clone)]
+pub struct OptionValue {
+    pub decision: Decision,
+    /// The engine action (None for declining a bomb offer).
+    pub action: Option<Action>,
+    /// Round margin for team 0 under best play after this choice.
+    pub value: i32,
+}
+
+/// Solve every option at `node` (no suit merging at the root, so each legal
+/// play is listed). Returns the deciding seat and the options, or None if it
+/// isn't a two-player endgame decision or the search runs over `budget`
+/// nodes in total.
+pub fn solve_options(state: &GameState, node: Node, budget: usize) -> Option<(Seat, Vec<OptionValue>)> {
+    if !is_two_player_endgame(state) {
+        return None;
+    }
+    let mut root = state.clone();
+    root.log.clear();
+    root.round_results.clear();
+    root.deck.clear();
+    let (root, node) = normalize(root, node);
+    let node = node?;
+    let (seat, moves) = moves(&root, node, false);
+    let mut s = Searcher { tt: HashMap::new(), nodes: 0, budget, reference: false, root_best: 0 };
+    let mut out = vec![];
+    for m in moves {
+        let mut child = root.clone();
+        if let Some(a) = &m.action {
+            child.apply(a).ok()?;
+        }
+        let (child, next) = normalize(child, m.next);
+        let value = match next {
+            None => child.last_result()?.diff(),
+            Some(n) => s.search(&child, n, i32::MIN + 1, i32::MAX - 1, false).ok()?,
+        };
+        out.push(OptionValue { decision: m.decision, action: m.action, value });
+    }
+    Some((seat, out))
+}
+
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------

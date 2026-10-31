@@ -45,6 +45,7 @@ heuristic vs random  (2000 deals)
 | `src/bots/` | `random`, `heuristic` (a simple rule-based baseline), `h2` (stronger rules: card tracking, hand structure, lead planning, defense), `pimcN` (search bot; `/h` h2 rollouts, `/i` inference, `/b` searched bombs, `/s` searched wish and Dragon), and `eg:BOT` (any bot plus the exact endgame solver) |
 | `src/infer.rs` | hand inference: weight guessed deals by how well a model player explains the play so far |
 | `src/endgame.rs` | exact alpha-beta solver for two-player endgames (see below) |
+| `src/humanlog.rs` | real games: rebuilds an `npm run export-rounds` round with a play log through the engine (used by `examples/endgame_audit.rs` and `examples/human_disagree.rs`; findings in [docs/ENDGAME_AUDIT.md](docs/ENDGAME_AUDIT.md)) |
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
 | `src/replay.rs`, `viewer/` | game logs and the visual replay viewer (see below) |
 | `src/llm/`, `examples/llm_match.rs` | Claude as a player (via `claude -p` on a subscription) and a resumable Claude-vs-bot match; see [docs/LLM_MATCH.md](docs/LLM_MATCH.md) |
@@ -183,6 +184,7 @@ the Phoenix the other card's rank.
 | | |
 |---|---|
 | `rules.rs`, `endgame.rs` | rule cases mirrored from the TS tests; the endgame solver |
+| `humanlog.rs` | bot rounds written in the server's round-log format rebuild exactly; `solve_options` agrees with `solve` |
 | `invariants.rs` | at every decision of whole random/heuristic/h2 rounds: cards conserved, every offered play and bomb accepted, views hide exactly the other hands, `sample_hands` and `from_view` consistent with the real state |
 | `bots.rs` | every bundled bot spec (`tests/common/mod.rs`) plays legal rounds and is deterministic given its seed; bot names parse or are rejected; bad `.tnet` files are refused |
 | `arena.rs` | results independent of the thread count, duplicate mirror matches exactly even, swapping sides negates |

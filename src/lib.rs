@@ -20,6 +20,7 @@ pub mod endgame;
 pub mod engine;
 pub mod features;
 pub mod hand;
+pub mod humanlog;
 pub mod infer;
 pub mod llm;
 pub mod replay;
