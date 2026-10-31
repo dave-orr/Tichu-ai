@@ -13,6 +13,11 @@
 //!   before the first player goes out if that comes sooner;
 //! - wishes and Dragon gifts come from `mahJongWishes` / `dragonGiveaways`.
 //!
+//! Logs from after dave-orr/tichu#127 also carry `actions` (every pass,
+//! call, wish, gift and concession, with the Phoenix's reading) and the
+//! table direction; `replay` then follows them exactly and infers nothing
+//! but the end of each trick countdown.
+//!
 //! The rebuilt round must finish the way the log says (finishing order and
 //! card points), otherwise `replay` returns an error.
 
@@ -73,6 +78,27 @@ pub struct RoundLog {
     pub mah_jong_wishes: Vec<LogWish>,
     #[serde(default)]
     pub dragon_giveaways: Vec<LogDragon>,
+    /// Table direction (newer logs only).
+    #[serde(default)]
+    pub clockwise: Option<bool>,
+    /// Every play-phase action in order (newer logs only). When present,
+    /// `replay` follows it exactly instead of inferring.
+    #[serde(default)]
+    pub actions: Vec<LogAction>,
+}
+
+/// One logged play-phase action (`RoundAction` in the server's types).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum LogAction {
+    #[serde(rename_all = "camelCase")]
+    Play { seat: Seat, cards: Vec<Card>, phoenix_as: Option<u8> },
+    Bomb { seat: Seat, cards: Vec<Card> },
+    Pass { seat: Seat },
+    SmallTichu { seat: Seat },
+    Wish { seat: Seat, rank: Option<Rank> },
+    Dragon { seat: Seat, to: Seat },
+    Concede { seat: Seat },
 }
 
 impl RoundLog {
@@ -120,6 +146,10 @@ fn same_cards(a: &[Card], b: &[Card]) -> bool {
 /// before it. The log doesn't record the table's
 /// direction of play, so both are tried.
 pub fn replay(r: &RoundLog) -> Result<Replay, String> {
+    if !r.actions.is_empty() {
+        let settings = Settings { clockwise: r.clockwise.unwrap_or(false), ..Settings::default() };
+        return replay_actions(r, settings);
+    }
     let mut settings = Settings::default();
     let first = replay_with(r, settings);
     if first.is_ok() {
@@ -134,32 +164,8 @@ pub fn replay_with(r: &RoundLog, settings: Settings) -> Result<Replay, String> {
     if r.plays.is_empty() {
         return Err("no play log".into());
     }
-    let mut ps: Vec<&LogPlayer> = r.players.iter().collect();
-    ps.sort_by_key(|p| p.seat);
-    if ps.len() != 4 || ps.iter().enumerate().any(|(i, p)| p.seat != i || p.initial_hand.len() != 14) {
-        return Err("bad players".into());
-    }
-    let mut deck = vec![];
-    for p in &ps {
-        deck.extend_from_slice(&p.initial_hand);
-    }
-    let mut g = GameState::new(settings);
-    g.start_round(deck);
-    g.scores = r.scores_before_round;
+    let (mut g, ps) = deal(r, settings)?;
     let mut steps: Vec<Step> = vec![];
-    for s in 0..4 {
-        apply(&mut g, Action::GrandTichu { seat: s, call: ps[s].tichu_call == TichuCall::Grand }, &mut steps)?;
-    }
-    for s in 0..4 {
-        let p = ps[s];
-        let (Some(left), Some(partner), Some(right)) = (p.passed_left, p.passed_partner, p.passed_right) else {
-            return Err("missing pass".into());
-        };
-        apply(&mut g, Action::PassCards { seat: s, pass: PassInfo { left, partner, right } }, &mut steps)?;
-    }
-    // Before passes are logged as steps: keep only the play phase.
-    steps.clear();
-
     let small: Vec<bool> = ps.iter().map(|p| p.tichu_call == TichuCall::Small).collect();
     let mut wishes = r.mah_jong_wishes.iter();
     let mut dragons = r.dragon_giveaways.iter();
@@ -235,6 +241,12 @@ pub fn replay_with(r: &RoundLog, settings: Settings) -> Result<Replay, String> {
     if conceded {
         return Ok(Replay { steps, end: g, conceded });
     }
+    check_result(r, &g)?;
+    Ok(Replay { steps, end: g, conceded })
+}
+
+/// The rebuilt round must finish the way the log says.
+fn check_result(r: &RoundLog, g: &GameState) -> Result<(), String> {
     let res = g.last_result().ok_or("no result")?;
     if !r.out_order.is_empty() {
         let n = r.out_order.len().min(4);
@@ -246,6 +258,68 @@ pub fn replay_with(r: &RoundLog, settings: Settings) -> Result<Replay, String> {
     }
     if r.round_card_points != [0, 0] && res.card_points != r.round_card_points {
         return Err(format!("card points {:?} != logged {:?}", res.card_points, r.round_card_points));
+    }
+    Ok(())
+}
+
+/// Deal the logged hands and apply Grand calls and passes: the state as play begins.
+fn deal<'a>(r: &'a RoundLog, settings: Settings) -> Result<(GameState, Vec<&'a LogPlayer>), String> {
+    let mut ps: Vec<&LogPlayer> = r.players.iter().collect();
+    ps.sort_by_key(|p| p.seat);
+    if ps.len() != 4 || ps.iter().enumerate().any(|(i, p)| p.seat != i || p.initial_hand.len() != 14) {
+        return Err("bad players".into());
+    }
+    let mut deck = vec![];
+    for p in &ps {
+        deck.extend_from_slice(&p.initial_hand);
+    }
+    let mut g = GameState::new(settings);
+    g.start_round(deck);
+    g.scores = r.scores_before_round;
+    let mut steps = vec![];
+    for s in 0..4 {
+        apply(&mut g, Action::GrandTichu { seat: s, call: ps[s].tichu_call == TichuCall::Grand }, &mut steps)?;
+    }
+    for s in 0..4 {
+        let p = ps[s];
+        let (Some(left), Some(partner), Some(right)) = (p.passed_left, p.passed_partner, p.passed_right) else {
+            return Err("missing pass".into());
+        };
+        apply(&mut g, Action::PassCards { seat: s, pass: PassInfo { left, partner, right } }, &mut steps)?;
+    }
+    Ok((g, ps))
+}
+
+/// Replay a log that carries `actions`: nothing to infer except the award
+/// of each trick when its countdown runs out.
+pub fn replay_actions(r: &RoundLog, settings: Settings) -> Result<Replay, String> {
+    let (mut g, _) = deal(r, settings)?;
+    let mut steps: Vec<Step> = vec![];
+    let mut conceded = false;
+    for a in &r.actions {
+        let action = match a {
+            LogAction::Play { seat, cards, phoenix_as } => Action::Play { seat: *seat, cards: cards.clone(), phoenix_as: *phoenix_as },
+            LogAction::Bomb { seat, cards } => Action::Bomb { seat: *seat, cards: cards.clone() },
+            LogAction::Pass { seat } => Action::PassTurn { seat: *seat },
+            LogAction::SmallTichu { seat } => Action::SmallTichu { seat: *seat },
+            LogAction::Wish { seat, rank } => Action::Wish { seat: *seat, rank: *rank },
+            LogAction::Dragon { seat, to } => Action::GiveDragon { seat: *seat, to: *to },
+            LogAction::Concede { .. } => {
+                conceded = true;
+                break;
+            }
+        };
+        // A pending countdown ends unless this action is a bomb on that trick.
+        if g.trick_countdown.is_some() && !matches!(action, Action::Bomb { .. } | Action::SmallTichu { .. }) {
+            apply(&mut g, Action::ResolveTrick, &mut steps)?;
+        }
+        apply(&mut g, action, &mut steps)?;
+    }
+    while !conceded && g.trick_countdown.is_some() && g.phase == Phase::Playing {
+        apply(&mut g, Action::ResolveTrick, &mut steps)?;
+    }
+    if !conceded {
+        check_result(r, &g)?;
     }
     Ok(Replay { steps, end: g, conceded })
 }
