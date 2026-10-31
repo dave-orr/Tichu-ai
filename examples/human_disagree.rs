@@ -13,7 +13,7 @@
 //!   endgames Q is the exact solver value instead.
 //!
 //!     cargo run --release --example human_disagree -- ROUNDS.jsonl --net PATH
-//!         [--samples S] [--rollout BOT] [--out DIR] [--threads T]
+//!         [--samples S] [--rollout BOT] [--only IDS_FILE] [--out DIR] [--threads T]
 //!
 //! `--out DIR` writes `decisions.jsonl` (everything above, per decision) and
 //! `disagreements.txt` (readable: clear human errors the net avoids, and
@@ -223,6 +223,9 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
     let net = Net::cached(&net_path).expect("load net");
 
+    // --only FILE: analyze just these decision ids (one per line).
+    let only: Option<std::collections::HashSet<String>> = get("--only")
+        .map(|f| std::fs::read_to_string(f).unwrap().lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect());
     let rounds = humanlog::read_rounds(&std::fs::read_to_string(path).unwrap());
     let mut items = vec![];
     for r in rounds.iter().filter(|r| !r.plays.is_empty()) {
@@ -237,7 +240,11 @@ fn main() {
             };
             let plays = stp.state.legal_plays(seat);
             let Some(hp) = find_play(&plays, &stp.action, &stp.state) else { continue };
-            items.push(Item { id: format!("{}.{k}", r.id()), state: stp.state.clone(), seat, human_play: hp });
+            let id = format!("{}.{k}", r.id());
+            if only.as_ref().is_some_and(|o| !o.contains(&id)) {
+                continue;
+            }
+            items.push(Item { id, state: stp.state.clone(), seat, human_play: hp });
         }
     }
     eprintln!("{} human turn decisions", items.len());
