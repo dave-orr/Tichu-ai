@@ -25,8 +25,15 @@ ROOT = os.path.dirname(HERE)
 
 def run(cmd, log):
     print("+ " + " ".join(cmd), flush=True)
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", cwd=ROOT)
-    log.write(out.stdout)
+    # Children print "R²" and "±": make them write UTF-8 whatever the console
+    # code page (Windows defaults to cp1252), and never die on a bad byte.
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT, env=env)
+    log.write(out.stdout or "")
+    if out.returncode != 0:
+        log.write(out.stderr or "")
+        log.flush()
+        raise SystemExit(f"command failed ({out.returncode}): {' '.join(cmd)}\n{(out.stderr or '')[-2000:]}")
     log.flush()
     return out.stdout
 
