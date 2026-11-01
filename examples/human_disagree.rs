@@ -13,7 +13,7 @@
 //!   endgames Q is the exact solver value instead.
 //!
 //!     cargo run --release --example human_disagree -- ROUNDS.jsonl --net PATH
-//!         [--samples S] [--rollout BOT] [--only IDS_FILE] [--out DIR] [--threads T]
+//!         [--samples S] [--rollout BOT] [--only IDS_FILE] [--infer K] [--out DIR] [--threads T]
 //!
 //! `--out DIR` writes `decisions.jsonl` (everything above, per decision) and
 //! `disagreements.txt` (readable: clear human errors the net avoids, and
@@ -125,7 +125,7 @@ fn describe(state: &GameState, view: &PlayerView) -> String {
     s
 }
 
-fn analyze(it: &Item, net: &Net, rollout: &str, samples: usize, seed: u64) -> Option<Out> {
+fn analyze(it: &Item, net: &Net, rollout: &str, samples: usize, infer: usize, seed: u64) -> Option<Out> {
     let st = &it.state;
     let seat = it.seat;
     let view = st.view(seat);
@@ -168,8 +168,13 @@ fn analyze(it: &Item, net: &Net, rollout: &str, samples: usize, seed: u64) -> Op
             let mut rng = StdRng::seed_from_u64(seed);
             let mut m = vec![vec![0.0f64; n]; samples];
             let mut rb: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|k| bots::by_name(rollout, seed + k).unwrap());
-            for row in m.iter_mut() {
-                let base = GameState::from_view(&view, view.sample_hands(&mut rng));
+            let guesses: Vec<[Vec<Card>; 4]> = if infer > 1 {
+                tichu_engine::infer::sample_hands_weighted(&view, &mut rng, samples, &tichu_engine::infer::InferConfig { k: infer, ..Default::default() })
+            } else {
+                (0..samples).map(|_| view.sample_hands(&mut rng)).collect()
+            };
+            for (row, guess) in m.iter_mut().zip(guesses) {
+                let base = GameState::from_view(&view, guess);
                 for (k, o) in cands.options.iter().enumerate() {
                     let mut g = base.clone();
                     let a = match o {
@@ -217,6 +222,9 @@ fn main() {
     let path = args.first().expect("usage: human_disagree ROUNDS.jsonl --net PATH");
     let net_path = get("--net").expect("--net PATH");
     let samples: usize = get("--samples").and_then(|s| s.parse().ok()).unwrap_or(48);
+    // --infer K: weight guesses by how well they explain the others' plays
+    // (infer::sample_hands_weighted, K uniform candidates per sample); default uniform.
+    let infer: usize = get("--infer").and_then(|s| s.parse().ok()).unwrap_or(1);
     let rollout = get("--rollout").unwrap_or_else(|| format!("net:{net_path}"));
     let threads: usize = get("--threads")
         .and_then(|s| s.parse().ok())
@@ -256,7 +264,7 @@ fn main() {
             let (queue, results, net, rollout) = (queue.clone(), results.clone(), net.clone(), rollout.clone());
             std::thread::spawn(move || loop {
                 let Some((i, it)) = queue.lock().unwrap().pop() else { break };
-                if let Some(o) = analyze(&it, &net, &rollout, samples, 7 + i as u64) {
+                if let Some(o) = analyze(&it, &net, &rollout, samples, infer, 7 + i as u64) {
                     results.lock().unwrap().push((i, o));
                 }
             })
