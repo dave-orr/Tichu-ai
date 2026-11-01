@@ -114,6 +114,15 @@ when it's at least 20 points and 2 standard errors (or exact):
 
 Expect a handful of each list to be noise (2 SE over ~300 tests).
 
+**Rechecked (Nov 1).** The 80 flags were picked out of ~300 tests, so they
+regress to the mean. Rescored with fresh deals and the same gen3 rollouts,
+52 of 80 stay flagged (26 each way). Rescored with the endgame solver inside
+the rollouts (`--rollout eg:net:models/gen3.tnet`, 40 deals, since the
+earlier rollouts played two-player endgames with plain gen3), 34 stay
+flagged. 31 hold up in all three runs, 15 human errors and 16 net errors,
+and only one flag ever flipped direction. `--only IDS_FILE` rescores a
+chosen set. Treat the 31 as the curated list; the rest are too close to call.
+
 ## What to do with it
 
 1. **Exact endgame labels for training.** About two thirds of rounds reach
