@@ -52,6 +52,7 @@ def main():
     ap.add_argument("--tichu", default=os.path.join(ROOT, "target", "release", "tichu.exe" if os.name == "nt" else "tichu"))
     ap.add_argument("--train-args", default="", help="extra arguments for train.py")
     ap.add_argument("--selfplay-args", default="", help="extra arguments for `tichu selfplay`")
+    ap.add_argument("--opponents", default="", help="extra arena opponents for every generation, comma-separated bot names")
     args = ap.parse_args()
     d = os.path.abspath(args.dir)
     os.makedirs(d, exist_ok=True)
@@ -73,6 +74,7 @@ def main():
              "--epochs", str(args.epochs), "--out", model(g), *args.train_args.split()], log)
         # The previous generation, and gen0 as a fixed yardstick for drift.
         opponents = ["heuristic", args.base] + [f"net:{model(k)}" for k in sorted({g - 1, 0}) if 0 <= k < g]
+        opponents += [o for o in args.opponents.split(",") if o]
         for opp in opponents:
             out = run([args.tichu, "arena", f"net:{model(g)}", opp, "--rounds", str(args.arena_rounds),
                        "--seed", str(77 + g)], log)
