@@ -157,3 +157,27 @@ fn solve_options_agrees_with_solve() {
 }
 
 
+
+#[test]
+fn selfplay_exact_q_matches_the_solver() {
+    use rand::rngs::StdRng;
+    use tichu_engine::features::Candidates;
+    let mut found = 0;
+    for seed in 0..12 {
+        let (log, _) = logged_round("h2", seed, false);
+        let rp = humanlog::replay(&log).unwrap();
+        for st in rp.steps.iter().filter(|s| s.is_turn_decision() && endgame::is_two_player_endgame(&s.state)) {
+            let Some(sol) = endgame::solve(&st.state, 2_000_000) else { continue };
+            let seat = sol.seat;
+            let view = st.state.view(seat);
+            let plays = st.state.legal_plays(seat);
+            let cands = Candidates::new(&view, &plays, st.state.can_pass(seat));
+            let mut rng = StdRng::seed_from_u64(seed);
+            let Some(q) = tichu_engine::selfplay::exact_q(&view, &plays, &cands, 20_000_000, &mut rng) else { continue };
+            let best = q.iter().cloned().fold(f32::MIN, f32::max);
+            assert_eq!(best as i32, sol.value_for(team_for_seat(seat)), "seed {seed}");
+            found += 1;
+        }
+    }
+    assert!(found > 10, "only {found}");
+}

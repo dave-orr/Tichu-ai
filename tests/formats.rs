@@ -279,6 +279,8 @@ fn selfplay_records_parse_and_are_reproducible() {
         q_samples: 0,
         rollout: "heuristic".into(),
         explore: 0.1,
+        exact_endgame: false,
+        infer: 0,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -318,6 +320,8 @@ fn selfplay_q_labels_are_written() {
         q_samples: 2,
         rollout: "heuristic".into(),
         explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -329,5 +333,28 @@ fn selfplay_q_labels_are_written() {
         // The labeler plays the best Q.
         let best = q.iter().cloned().fold(f32::MIN, f32::max);
         assert_eq!(q[r.label], best);
+    }
+}
+
+#[test]
+fn selfplay_exact_endgame_and_infer_options_run() {
+    let cfg = SelfplayConfig {
+        bot: "heuristic".into(),
+        rounds: 3,
+        seed: 5,
+        threads: 2,
+        q_samples: 2,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: true,
+        infer: 3,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    for r in &recs {
+        let q = r.q.as_ref().expect("--q records carry Q-values");
+        assert_eq!(q.len(), r.n);
+        assert!(q.iter().all(|x| x.is_finite()));
     }
 }

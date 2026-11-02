@@ -37,6 +37,8 @@ use rand::{Rng, SeedableRng};
 use crate::bot::Bot;
 use crate::bots;
 use crate::deck::shuffled_deck;
+use crate::endgame;
+use crate::infer;
 use crate::engine::{Action, GameState};
 use crate::features::*;
 use crate::scoring::RoundResult;
@@ -60,7 +62,20 @@ pub struct SelfplayConfig {
     /// Chance of playing a uniformly random option instead of the label
     /// (the label is still recorded), for more varied positions.
     pub explore: f64,
+    /// With `q_samples`: in two-player endgames (perfect information) label
+    /// with the solver's exact value of every option
+    /// (`endgame::solve_options`) instead of rollouts. Falls back to
+    /// rollouts if the solve runs past its node budget.
+    pub exact_endgame: bool,
+    /// With `q_samples`: weight the guessed deals by how well they explain
+    /// the other players' plays and calls (`infer::sample_hands_weighted`,
+    /// this many uniform candidates per sample). 0 or 1 = uniform guesses.
+    pub infer: usize,
 }
+
+/// Node budget for one exact endgame label (median solve is well under a
+/// millisecond; this caps the rare deep one).
+const ENDGAME_BUDGET: usize = 2_000_000;
 
 struct Rec {
     state: Vec<u8>,
@@ -81,19 +96,27 @@ struct Block {
 }
 
 /// Mean round margin for `view.seat`'s team after each option, over
-/// `samples` guessed deals, with `rollout` playing all four seats.
+/// `samples` guessed deals, with `rollout` playing all four seats. With
+/// `infer` > 1 the guesses are weighted by the others' play so far
+/// (`infer::sample_hands_weighted` with `infer` candidates per sample).
 pub fn pimc_q(
     view: &PlayerView,
     plays: &[Combo],
     cands: &Candidates,
     samples: usize,
+    infer: usize,
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<f32> {
     let team = view.my_team();
     let mut totals = vec![0.0f64; cands.len()];
-    for _ in 0..samples {
-        let base = GameState::from_view_with_history(view, view.sample_hands(rng));
+    let guesses: Vec<[Vec<Card>; 4]> = if infer > 1 {
+        infer::sample_hands_weighted(view, rng, samples, &infer::InferConfig { k: infer, ..Default::default() })
+    } else {
+        (0..samples).map(|_| view.sample_hands(rng)).collect()
+    };
+    for guess in guesses {
+        let base = GameState::from_view_with_history(view, guess);
         for (k, opt) in cands.options.iter().enumerate() {
             let mut g = base.clone();
             let action = match opt {
@@ -109,10 +132,42 @@ pub fn pimc_q(
     totals.iter().map(|t| (t / samples.max(1) as f64) as f32).collect()
 }
 
+/// Exact value of each option for `view.seat`'s team, as round margin, if
+/// this is a two-player endgame (perfect information: the one other hand is
+/// every unseen card) and the solver finishes within `budget` nodes.
+pub fn exact_q(view: &PlayerView, plays: &[Combo], cands: &Candidates, budget: usize, rng: &mut StdRng) -> Option<Vec<f32>> {
+    if view.players.iter().filter(|p| !p.is_out()).count() != 2 {
+        return None;
+    }
+    let state = GameState::from_view_with_history(view, view.sample_hands(rng));
+    let (seat, opts) = endgame::solve_options(&state, endgame::Node::Engine, budget)?;
+    if seat != view.seat {
+        return None;
+    }
+    let sign = if view.my_team() == 0 { 1.0 } else { -1.0 };
+    cands
+        .options
+        .iter()
+        .map(|o| {
+            opts.iter()
+                .find(|ov| match (&ov.decision, o) {
+                    (endgame::Decision::Pass, None) => true,
+                    (endgame::Decision::Play(c), Some(i)) => {
+                        CardSet::from_cards(&c.cards) == CardSet::from_cards(&plays[*i].cards) && c.rank == plays[*i].rank
+                    }
+                    _ => false,
+                })
+                .map(|v| sign * v.value as f32)
+        })
+        .collect()
+}
+
 struct Recorder {
     inner: Box<dyn Bot>,
     rng: StdRng,
     q_samples: usize,
+    exact_endgame: bool,
+    infer: usize,
     rollout: [Box<dyn Bot>; 4],
     explore: f64,
     recs: Vec<Rec>,
@@ -148,7 +203,8 @@ impl Bot for Recorder {
             return self.inner.play(view, plays, can_pass);
         }
         let (label, q) = if self.q_samples > 0 {
-            let q = pimc_q(view, plays, &cands, self.q_samples, &mut self.rollout, &mut self.rng);
+            let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
+            let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, &mut self.rollout, &mut self.rng));
             let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
             (best, Some(q))
         } else {
@@ -234,6 +290,8 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                             inner: bots::by_name(&cfg.bot, sd).expect("unknown bot"),
                             rng: StdRng::seed_from_u64(sd ^ 0xABCD),
                             q_samples: cfg.q_samples,
+                            exact_endgame: cfg.exact_endgame,
+                            infer: cfg.infer,
                             rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
                             recs: vec![],

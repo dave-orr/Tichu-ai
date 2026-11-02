@@ -140,7 +140,9 @@ fn analyze(it: &Item, net: &Net, rollout: &str, samples: usize, infer: usize, se
     // Net policy.
     let mut sb = Vec::with_capacity(STATE_DIM);
     encode_state(&view, &mut sb);
-    let net_p = softmax(&net.logits(&net.trunk(&sb), &cands.features));
+    let mut tokens = vec![];
+    encode_history(&view, &mut tokens);
+    let net_p = softmax(&net.logits(&net.trunk(&sb, &net.encode_seq(&tokens)), &cands.features));
     let net_top = (0..net_p.len()).max_by(|&a, &b| net_p[a].total_cmp(&net_p[b])).unwrap();
     let h2 = cands.option_of(bots::by_name("h2", 0).unwrap().play(&view, &plays, can_pass))?;
     let team = view.my_team();
@@ -174,7 +176,7 @@ fn analyze(it: &Item, net: &Net, rollout: &str, samples: usize, infer: usize, se
                 (0..samples).map(|_| view.sample_hands(&mut rng)).collect()
             };
             for (row, guess) in m.iter_mut().zip(guesses) {
-                let base = GameState::from_view(&view, guess);
+                let base = GameState::from_view_with_history(&view, guess);
                 for (k, o) in cands.options.iter().enumerate() {
                     let mut g = base.clone();
                     let a = match o {

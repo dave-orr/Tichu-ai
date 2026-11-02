@@ -37,6 +37,8 @@ usage:
       --q N           label with an N-sample PIMC search instead, and write its Q-values
       --rollout NAME  rollout policy for --q (default heuristic; e.g. net:models/q10.tnet)
       --explore P     play a random option with probability P (the label is still recorded)
+      --exact-endgame with --q: label two-player endgames with the solver's exact values
+      --infer K       with --q: weight guessed deals by the others' plays (K candidates each)
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -69,7 +71,7 @@ impl Args {
         while i < raw.len() {
             let s = &raw[i];
             if let Some(f) = s.strip_prefix("--") {
-                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only");
+                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only" | "exact-endgame");
                 let v = if takes_value { i += 1; raw.get(i).cloned() } else { None };
                 if takes_value && v.is_none() {
                     eprintln!("--{f} needs a value");
@@ -192,6 +194,8 @@ fn main() {
                 q_samples: args.num("q").unwrap_or(0),
                 rollout: flag("rollout").unwrap_or_else(|| "heuristic".into()),
                 explore: args.num("explore").unwrap_or(0.0),
+                exact_endgame: args.has("exact-endgame"),
+                infer: args.num("infer").unwrap_or(0),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");
