@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--arena-rounds", type=int, default=4000)
     ap.add_argument("--tichu", default=os.path.join(ROOT, "target", "release", "tichu.exe" if os.name == "nt" else "tichu"))
     ap.add_argument("--train-args", default="", help="extra arguments for train.py")
+    ap.add_argument("--selfplay-args", default="", help="extra arguments for `tichu selfplay`")
     args = ap.parse_args()
     d = os.path.abspath(args.dir)
     os.makedirs(d, exist_ok=True)
@@ -65,7 +66,7 @@ def main():
         log.write(f"\n== generation {g} (rollouts: {rollout})\n")
         if not os.path.exists(data(g)):
             run([args.tichu, "selfplay", "--bot", args.base, "--q", str(args.q), "--rollout", rollout, "--rounds", str(args.rounds),
-                 "--seed", str(1000 + g), "--out", data(g) + ".part"], log)
+                 "--seed", str(1000 + g), "--out", data(g) + ".part", *args.selfplay_args.split()], log)
             os.replace(data(g) + ".part", data(g))
         files = [data(k) for k in range(max(0, g - args.window + 1), g + 1)]
         run([sys.executable, os.path.join(HERE, "train.py"), *files, "--policy", "q",
