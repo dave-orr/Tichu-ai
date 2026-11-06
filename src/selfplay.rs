@@ -71,6 +71,10 @@ pub struct SelfplayConfig {
     /// the other players' plays and calls (`infer::sample_hands_weighted`,
     /// this many uniform candidates per sample). 0 or 1 = uniform guesses.
     pub infer: usize,
+    /// With `q_samples`: keep sampling past `q_samples`, up to this many,
+    /// until the best option is clearly ahead of the runner-up (paired
+    /// difference over 2 standard errors). 0 = fixed `q_samples`.
+    pub q_max: usize,
 }
 
 /// Node budget for one exact endgame label (median solve is well under a
@@ -99,37 +103,76 @@ struct Block {
 /// `samples` guessed deals, with `rollout` playing all four seats. With
 /// `infer` > 1 the guesses are weighted by the others' play so far
 /// (`infer::sample_hands_weighted` with `infer` candidates per sample).
+///
+/// With `max_samples` > `samples` (uniform guesses only) sampling is
+/// adaptive: after `samples` deals it keeps drawing, up to `max_samples`,
+/// while the best option isn't clearly ahead of the runner-up (their paired
+/// difference within two standard errors). Clear decisions stay cheap and
+/// close ones get the samples.
 pub fn pimc_q(
     view: &PlayerView,
     plays: &[Combo],
     cands: &Candidates,
     samples: usize,
     infer: usize,
+    max_samples: usize,
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<f32> {
     let team = view.my_team();
-    let mut totals = vec![0.0f64; cands.len()];
-    let guesses: Vec<[Vec<Card>; 4]> = if infer > 1 {
-        infer::sample_hands_weighted(view, rng, samples, &infer::InferConfig { k: infer, ..Default::default() })
-    } else {
-        (0..samples).map(|_| view.sample_hands(rng)).collect()
-    };
-    for guess in guesses {
+    let n = cands.len();
+    let run = |guess: [Vec<Card>; 4], rollout: &mut [Box<dyn Bot>; 4]| -> Vec<f64> {
         let base = GameState::from_view_with_history(view, guess);
-        for (k, opt) in cands.options.iter().enumerate() {
-            let mut g = base.clone();
-            let action = match opt {
-                Some(i) => Action::Play { seat: view.seat, cards: plays[*i].cards.clone(), phoenix_as: plays[*i].phoenix_as },
-                None => Action::PassTurn { seat: view.seat },
-            };
-            g.apply(&action).expect("candidate rejected by engine");
-            if let Ok(r) = play_from(&mut g, rollout, None, false) {
-                totals[k] += (r.total(team) - r.total(1 - team)) as f64;
+        cands
+            .options
+            .iter()
+            .map(|opt| {
+                let mut g = base.clone();
+                let action = match opt {
+                    Some(i) => Action::Play { seat: view.seat, cards: plays[*i].cards.clone(), phoenix_as: plays[*i].phoenix_as },
+                    None => Action::PassTurn { seat: view.seat },
+                };
+                g.apply(&action).expect("candidate rejected by engine");
+                match play_from(&mut g, rollout, None, false) {
+                    Ok(r) => (r.total(team) - r.total(1 - team)) as f64,
+                    Err(_) => 0.0,
+                }
+            })
+            .collect()
+    };
+    let mut rows: Vec<Vec<f64>> = vec![];
+    if infer > 1 {
+        for guess in infer::sample_hands_weighted(view, rng, samples, &infer::InferConfig { k: infer, ..Default::default() }) {
+            rows.push(run(guess, rollout));
+        }
+    } else {
+        let max = max_samples.max(samples);
+        while rows.len() < max {
+            rows.push(run(view.sample_hands(rng), rollout));
+            if rows.len() >= samples.max(2) && rows.len() < max && clearly_best(&rows, n) {
+                break;
             }
         }
     }
-    totals.iter().map(|t| (t / samples.max(1) as f64) as f32).collect()
+    let m = rows.len().max(1) as f64;
+    (0..n).map(|k| (rows.iter().map(|r| r[k]).sum::<f64>() / m) as f32).collect()
+}
+
+/// Whether the best option's lead over the runner-up, paired by deal, is
+/// more than two standard errors.
+fn clearly_best(rows: &[Vec<f64>], n: usize) -> bool {
+    if n < 2 {
+        return true;
+    }
+    let m = rows.len() as f64;
+    let mean: Vec<f64> = (0..n).map(|k| rows.iter().map(|r| r[k]).sum::<f64>() / m).collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| mean[b].total_cmp(&mean[a]));
+    let (b, c) = (order[0], order[1]);
+    let d: Vec<f64> = rows.iter().map(|r| r[b] - r[c]).collect();
+    let dm = d.iter().sum::<f64>() / m;
+    let var = d.iter().map(|x| (x - dm) * (x - dm)).sum::<f64>() / (m - 1.0);
+    dm > 2.0 * (var / m).sqrt()
 }
 
 /// Exact value of each option for `view.seat`'s team, as round margin, if
@@ -168,6 +211,7 @@ struct Recorder {
     q_samples: usize,
     exact_endgame: bool,
     infer: usize,
+    q_max: usize,
     rollout: [Box<dyn Bot>; 4],
     explore: f64,
     recs: Vec<Rec>,
@@ -204,7 +248,7 @@ impl Bot for Recorder {
         }
         let (label, q) = if self.q_samples > 0 {
             let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
-            let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, &mut self.rollout, &mut self.rng));
+            let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, self.q_max, &mut self.rollout, &mut self.rng));
             let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
             (best, Some(q))
         } else {
@@ -243,13 +287,14 @@ impl Bot for Recorder {
 /// play the teacher itself: it plays the best of `pimc_q` (or `exact_q`)
 /// exactly as `selfplay --q N --rollout ROLLOUT` labels it, and leaves every
 /// other decision to h2 (`selfplay --bot h2`). Flags: `e` = `--exact-endgame`,
-/// `iK` = `--infer K`.
+/// `iK` = `--infer K`, `aM` = `--q-max M` (adaptive samples).
 pub struct LabelerBot {
     base: crate::bots::H2Bot,
     rng: StdRng,
     q_samples: usize,
     exact_endgame: bool,
     infer: usize,
+    q_max: usize,
     rollout: [Box<dyn Bot>; 4],
     name: String,
 }
@@ -259,18 +304,23 @@ impl LabelerBot {
         let (head, rollout) = name.split_once(':')?;
         let (head, flags) = head.split_once('/').unwrap_or((head, ""));
         let q_samples: usize = head.strip_prefix("label")?.parse().ok().filter(|&n| n > 0)?;
-        let (mut exact_endgame, mut infer) = (false, 0);
+        let (mut exact_endgame, mut infer, mut q_max) = (false, 0, 0);
         let mut chars = flags.chars().peekable();
         while let Some(f) = chars.next() {
             match f {
                 'e' => exact_endgame = true,
-                'i' => {
+                'i' | 'a' => {
                     let mut k = String::new();
                     while let Some(d) = chars.peek().filter(|c| c.is_ascii_digit()) {
                         k.push(*d);
                         chars.next();
                     }
-                    infer = k.parse().ok()?;
+                    let k: usize = k.parse().ok()?;
+                    if f == 'i' {
+                        infer = k;
+                    } else {
+                        q_max = k;
+                    }
                 }
                 _ => return None,
             }
@@ -286,6 +336,7 @@ impl LabelerBot {
             q_samples,
             exact_endgame,
             infer,
+            q_max,
             rollout,
             name: name.to_string(),
         }))
@@ -320,7 +371,7 @@ impl Bot for LabelerBot {
             return self.base.play(view, plays, can_pass);
         }
         let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
-        let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, &mut self.rollout, &mut self.rng));
+        let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, self.q_max, &mut self.rollout, &mut self.rng));
         let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
         cands.options[best]
     }
@@ -379,6 +430,7 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                             q_samples: cfg.q_samples,
                             exact_endgame: cfg.exact_endgame,
                             infer: cfg.infer,
+                            q_max: cfg.q_max,
                             rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
                             recs: vec![],

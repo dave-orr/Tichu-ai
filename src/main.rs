@@ -39,6 +39,7 @@ usage:
       --explore P     play a random option with probability P (the label is still recorded)
       --exact-endgame with --q: label two-player endgames with the solver's exact values
       --infer K       with --q: weight guessed deals by the others' plays (K candidates each)
+      --q-max M       with --q: keep sampling (up to M) until the best option is clearly ahead
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -196,6 +197,7 @@ fn main() {
                 explore: args.num("explore").unwrap_or(0.0),
                 exact_endgame: args.has("exact-endgame"),
                 infer: args.num("infer").unwrap_or(0),
+                q_max: args.num("q-max").unwrap_or(0),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");

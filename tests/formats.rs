@@ -281,6 +281,7 @@ fn selfplay_records_parse_and_are_reproducible() {
         explore: 0.1,
         exact_endgame: false,
         infer: 0,
+        q_max: 0,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -322,6 +323,7 @@ fn selfplay_q_labels_are_written() {
         explore: 0.0,
         exact_endgame: false,
         infer: 0,
+        q_max: 0,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -348,6 +350,7 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         explore: 0.0,
         exact_endgame: true,
         infer: 3,
+        q_max: 0,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -357,4 +360,34 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         assert_eq!(q.len(), r.n);
         assert!(q.iter().all(|x| x.is_finite()));
     }
+}
+
+#[test]
+fn selfplay_adaptive_samples_run_and_are_deterministic() {
+    let cfg = SelfplayConfig {
+        bot: "heuristic".into(),
+        rounds: 3,
+        seed: 6,
+        threads: 1,
+        q_samples: 2,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 8,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    for r in &recs {
+        let q = r.q.as_ref().expect("--q records carry Q-values");
+        assert!(q.iter().all(|x| x.is_finite()));
+    }
+    let (four, _) = selfplay_file(&SelfplayConfig { threads: 4, ..cfg.clone() });
+    let by_round = |recs: Vec<Rec>| {
+        let mut v: Vec<(u32, Vec<u8>)> = recs.into_iter().map(|r| (r.round, r.bytes)).collect();
+        v.sort_by_key(|x| x.0);
+        v
+    };
+    assert_eq!(by_round(recs), by_round(parse_records(&four)));
 }
