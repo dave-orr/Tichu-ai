@@ -162,6 +162,117 @@ pub fn exact_q(view: &PlayerView, plays: &[Combo], cands: &Candidates, budget: u
         .collect()
 }
 
+/// The `--q` labeler's Q-values for one decision: the solver's exact values
+/// with `exact_endgame` when it applies and finishes, else `pimc_q`.
+#[allow(clippy::too_many_arguments)]
+pub fn teacher_q(
+    view: &PlayerView,
+    plays: &[Combo],
+    cands: &Candidates,
+    samples: usize,
+    exact_endgame: bool,
+    infer: usize,
+    rollout: &mut [Box<dyn Bot>; 4],
+    rng: &mut StdRng,
+) -> Vec<f32> {
+    let exact = if exact_endgame { exact_q(view, plays, cands, ENDGAME_BUDGET, rng) } else { None };
+    exact.unwrap_or_else(|| pimc_q(view, plays, cands, samples, infer, rollout, rng))
+}
+
+fn best_of(q: &[f32]) -> usize {
+    (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap()
+}
+
+/// The `--q` labeler as a player, `teachN[/F]:ROLLOUT`: N samples, ROLLOUT
+/// (any `bots::by_name` spec, e.g. `net:PATH`) in all four rollout seats,
+/// flags `e` = exact endgames, `iK` = inference with K candidates per
+/// sample. It plays as `selfplay --bot h2 --q N --rollout ROLLOUT` does: the
+/// best Q, and h2 for every other decision. That makes the teacher of
+/// expert iteration measurable in the arena, against its student or itself
+/// at another N.
+pub struct TeacherBot {
+    name: String,
+    base: Box<dyn Bot>,
+    rng: StdRng,
+    samples: usize,
+    exact_endgame: bool,
+    infer: usize,
+    rollout: [Box<dyn Bot>; 4],
+}
+
+impl TeacherBot {
+    pub fn by_name(name: &str, seed: u64) -> Option<TeacherBot> {
+        let (head, rollout) = name.strip_prefix("teach")?.split_once(':')?;
+        let (n, flags) = head.split_once('/').unwrap_or((head, ""));
+        let samples = n.parse().ok().filter(|&n: &usize| n > 0)?;
+        let (mut exact_endgame, mut infer) = (false, 0);
+        let mut chars = flags.chars().peekable();
+        while let Some(f) = chars.next() {
+            match f {
+                'e' => exact_endgame = true,
+                'i' => {
+                    let mut k = String::new();
+                    while let Some(d) = chars.peek().copied().filter(|c| c.is_ascii_digit()) {
+                        k.push(d);
+                        chars.next();
+                    }
+                    infer = k.parse().ok()?;
+                }
+                _ => return None,
+            }
+        }
+        let rollout = [0, 1, 2, 3].map(|k| bots::by_name(rollout, seed.wrapping_mul(4).wrapping_add(k)));
+        if rollout.iter().any(Option::is_none) {
+            return None;
+        }
+        Some(TeacherBot {
+            name: name.to_string(),
+            base: bots::by_name("h2", seed)?,
+            rng: StdRng::seed_from_u64(seed ^ 0xABCD),
+            samples,
+            exact_endgame,
+            infer,
+            rollout: rollout.map(Option::unwrap),
+        })
+    }
+}
+
+impl Bot for TeacherBot {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn grand_tichu(&mut self, v: &PlayerView) -> bool {
+        self.base.grand_tichu(v)
+    }
+    fn small_tichu(&mut self, v: &PlayerView) -> bool {
+        self.base.small_tichu(v)
+    }
+    fn pass_cards(&mut self, v: &PlayerView) -> PassInfo {
+        self.base.pass_cards(v)
+    }
+    fn bomb(&mut self, v: &PlayerView, bombs: &[Combo]) -> Option<usize> {
+        self.base.bomb(v, bombs)
+    }
+    fn wish(&mut self, v: &PlayerView) -> Option<Rank> {
+        self.base.wish(v)
+    }
+    fn dragon_recipient(&mut self, v: &PlayerView) -> Seat {
+        self.base.dragon_recipient(v)
+    }
+    fn round_over(&mut self, v: &PlayerView, result: &RoundResult) {
+        self.base.round_over(v, result);
+    }
+
+    fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+        let cands = Candidates::new(view, plays, can_pass);
+        if cands.len() < 2 {
+            return self.base.play(view, plays, can_pass);
+        }
+        let q = teacher_q(view, plays, &cands, self.samples, self.exact_endgame, self.infer, &mut self.rollout, &mut self.rng);
+        cands.options[best_of(&q)]
+    }
+}
+
 struct Recorder {
     inner: Box<dyn Bot>,
     rng: StdRng,
@@ -203,10 +314,8 @@ impl Bot for Recorder {
             return self.inner.play(view, plays, can_pass);
         }
         let (label, q) = if self.q_samples > 0 {
-            let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
-            let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, &mut self.rollout, &mut self.rng));
-            let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
-            (best, Some(q))
+            let q = teacher_q(view, plays, &cands, self.q_samples, self.exact_endgame, self.infer, &mut self.rollout, &mut self.rng);
+            (best_of(&q), Some(q))
         } else {
             let choice = self.inner.play(view, plays, can_pass);
             (cands.option_of(choice).expect("bot chose an unknown option"), None)

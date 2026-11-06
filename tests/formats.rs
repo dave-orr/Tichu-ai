@@ -358,3 +358,79 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         assert!(q.iter().all(|x| x.is_finite()));
     }
 }
+
+/// Records the option (`Candidates` index) its bot picks at every decision
+/// with 2+ options, as the labeler's `label`.
+struct Choices {
+    inner: Box<dyn Bot>,
+    out: std::rc::Rc<std::cell::RefCell<Vec<(u8, usize)>>>,
+}
+
+impl Bot for Choices {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    fn grand_tichu(&mut self, v: &PlayerView) -> bool {
+        self.inner.grand_tichu(v)
+    }
+    fn small_tichu(&mut self, v: &PlayerView) -> bool {
+        self.inner.small_tichu(v)
+    }
+    fn pass_cards(&mut self, v: &PlayerView) -> PassInfo {
+        self.inner.pass_cards(v)
+    }
+    fn bomb(&mut self, v: &PlayerView, bombs: &[Combo]) -> Option<usize> {
+        self.inner.bomb(v, bombs)
+    }
+    fn wish(&mut self, v: &PlayerView) -> Option<Rank> {
+        self.inner.wish(v)
+    }
+    fn dragon_recipient(&mut self, v: &PlayerView) -> Seat {
+        self.inner.dragon_recipient(v)
+    }
+    fn play(&mut self, v: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+        let choice = self.inner.play(v, plays, can_pass);
+        let cands = Candidates::new(v, plays, can_pass);
+        if cands.len() >= 2 {
+            self.out.borrow_mut().push((v.seat as u8, cands.option_of(choice).unwrap()));
+        }
+        choice
+    }
+}
+
+#[test]
+fn teacher_bot_plays_like_the_q_labeler() {
+    // `teachN/F:R` must make exactly the labeler's choices, or arena results
+    // for it say nothing about the expert-iteration teacher.
+    let cfg = SelfplayConfig {
+        bot: "h2".into(),
+        rounds: 3,
+        seed: 9,
+        threads: 1,
+        q_samples: 2,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: true,
+        infer: 3,
+    };
+    let recs = parse_records(&selfplay_file(&cfg).0);
+    for i in 0..cfg.rounds {
+        // Deal and seats exactly as `selfplay::run` does for round i.
+        let seed = cfg.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(i as u64);
+        let out = std::rc::Rc::new(std::cell::RefCell::new(vec![]));
+        let mut bots: [Box<dyn Bot>; 4] = [0u64, 1, 2, 3].map(|s| -> Box<dyn Bot> {
+            let inner = common::bot("teach2/ei3:heuristic", seed.wrapping_mul(31).wrapping_add(s));
+            Box::new(Choices { inner, out: out.clone() })
+        });
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut state = GameState::new(Settings { clockwise: rand::Rng::gen_bool(&mut rng, 0.5), ..Settings::default() });
+        state.start_round(shuffled_deck(&mut rng));
+        play_dealt_round(&mut state, &mut bots, None).unwrap();
+        for seat in 0..4u8 {
+            let want: Vec<usize> = recs.iter().filter(|r| r.round as usize == i && r.seat == seat).map(|r| r.label).collect();
+            let got: Vec<usize> = out.borrow().iter().filter(|c| c.0 == seat).map(|c| c.1).collect();
+            assert!(!want.is_empty());
+            assert_eq!(got, want, "round {i}, seat {seat}");
+        }
+    }
+}

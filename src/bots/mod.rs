@@ -32,6 +32,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("pass2[~F]:BOT", "BOT with v2 passing (F = only these rules: o opponents, m Mah Jong vs Grand, p partner; e.g. pass2~o:h2): low singletons odd left / even right, Mah Jong before a Grand, partner gets my best card unless a gift would make me a Tichu hand"),
     ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; h2 for calls, passes, bombs out of turn"),
     ("vpimcN:PATH", "pimcN whose rollouts stop at my next turn and are scored by the model's value head"),
+    ("teachN[/F]:BOT", "the `selfplay --q N --rollout BOT` labeler as a player (the expert-iteration teacher): flags F: e = exact endgames, iK = inference, K candidates per sample; h2 for everything but plays (teach24/ei4:net:PATH)"),
 ];
 
 /// Construct a bundled bot by name.
@@ -57,6 +58,7 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
         }
         _ if name.starts_with("net:") || name.starts_with("vpimc") => net::by_name(name, seed),
         _ if name.starts_with("eg:") => Some(Box::new(EndgameBot::new(by_name(&name[3..], seed)?))),
+        _ if name.starts_with("teach") => Some(Box::new(crate::selfplay::TeacherBot::by_name(name, seed)?)),
         _ => {
             // pimcN / oracleN, optionally @noise, optionally /flags.
             let (name, flags) = name.split_once('/').unwrap_or((name, ""));

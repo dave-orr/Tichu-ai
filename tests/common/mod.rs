@@ -93,6 +93,8 @@ pub fn bot_specs() -> Vec<String> {
     .collect();
     v.push(format!("net:{}", random_tnet()));
     v.push(format!("vpimc2:{}", random_tnet()));
+    v.push("teach2:h2".to_string());
+    v.push(format!("teach2/ei3:net:{}", random_tnet()));
     v
 }
 
