@@ -148,6 +148,27 @@ v2 + GRU vs v2 flat: +0.3 ± 2.8 over 4000 deals. One v2 generation matches
 three v1 generations; the GRU adds nothing yet. The value head still
 overfits: R² peaks near 0.33 after ~1000 steps and ends near 0.05.
 
+Desktop run `runs/v2` (Nov 2026): 8 generations of 20k `--q 10` rounds with
+`--exact-endgame --infer 4`, the separate value net, gen0 rollouts by the
+heuristic and then by the previous net. 4000 deals per match:
+
+| gen | vs h2 | vs gen0 | vs previous gen | value R² |
+|---|---|---|---|---|
+| 0 | +16.6 ± 3.4 | | | 0.34 |
+| 1 | +42.9 ± 3.3 | +30.4 ± 3.0 | (= vs gen0) | 0.35 |
+| 2 | +51.2 ± 3.4 | +36.0 ± 3.1 | +7.5 ± 3.0 | 0.35 |
+| 3 | +47.9 ± 3.4 | +36.3 ± 3.2 | +2.8 ± 3.0 | 0.33 |
+| 4 | +47.8 ± 3.4 | +38.3 ± 3.3 | +1.5 ± 3.1 | 0.34 |
+| 5 | +45.7 ± 3.3 | +34.6 ± 3.2 | +1.4 ± 3.0 | 0.38 |
+| 6 | +47.9 ± 3.4 | +36.1 ± 3.1 | +1.7 ± 3.0 | 0.34 |
+| 7 | +46.1 ± 3.3 | +37.3 ± 3.1 | +1.4 ± 3.0 | 0.34 |
+
+gen7 vs gen2 directly: +4.6 ± 3.0. Most of the gain comes in the first two
+generations; after that, each generation adds a point or two, too little to
+see one step at a time. The exact-endgame/infer labels didn't change gen0
+(+16.6 vs +16.5 without them). The likely ceiling is the teacher (10 guessed
+deals per decision); the next run tries `--q 24`.
+
 The distilled policy beats the search that labelled it, and a second
 generation beats the first. The value head isn't good enough to stop
 rollouts after one orbit yet: a single position's value is noisy (hidden
