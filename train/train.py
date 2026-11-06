@@ -133,6 +133,9 @@ def main():
     ap.add_argument("--value-net", type=int, default=128, help="units of the separate value net (0 = export the trunk's head)")
     ap.add_argument("--value-dropout", type=float, default=0.3)
     ap.add_argument("--value-wd", type=float, default=1e-2)
+    ap.add_argument("--value-q-from", type=float, default=40.0, help="history tokens where the Q blend starts")
+    ap.add_argument("--value-q-mix", type=float, default=0.0,
+                    help="value target = (1-x)·final margin + x·search Q of the labelled option, where records have Q")
     ap.add_argument("--value-scale", type=float, default=100.0)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--depth", type=int, default=2)
@@ -172,6 +175,16 @@ def main():
     margin = T(data.margin / args.value_scale)
     q = T(np.nan_to_num(data.q, nan=0.0))
     rec_has_q = T(np.add.reduceat(has_q, data.act_off) > 0)
+    # Value target: the round's final margin, blended with the search's
+    # estimate of the position (Q of the labelled option) where there is one.
+    q_label = np.nan_to_num(data.q[data.act_off + data.label], nan=0.0)
+    rec_q = np.add.reduceat(has_q, data.act_off) > 0
+    # The search's Q is poor early in the round (too extreme, R² < 0 vs the
+    # outcome) and good late (exact endgames), so the blend ramps in with
+    # the history length: 0 before --value-q-from tokens, full 40 later.
+    ramp = np.clip((data.tok_len - args.value_q_from) / 40.0, 0.0, 1.0)
+    mix = np.where(rec_q, args.value_q_mix * ramp, 0.0)
+    vtarget = T(((1 - mix) * data.margin + mix * q_label).astype(np.float32) / args.value_scale)
 
     def batch(idx):
         idx = torch.as_tensor(idx, device=dev)
@@ -203,7 +216,7 @@ def main():
     steps = max(1, int(args.epochs * len(train_idx) / args.batch))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
 
-    def losses(idx):
+    def losses(idx, train=True):
         idx, s, a, mask, rows, toks, lens = batch(idx)
         v, logits, tv = model(s, a, toks, lens)
         logits = logits.masked_fill(~mask, -1e9)
@@ -215,8 +228,10 @@ def main():
             pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
         else:
             pl = -logp.gather(1, label[idx][:, None]).squeeze(1)
-        vl = F.mse_loss(v, margin[idx])
-        tvl = F.mse_loss(tv, margin[idx]) if model.value_net is not None else vl
+        # Train toward the blended target; always report against the margin.
+        y = vtarget[idx] if train else margin[idx]
+        vl = F.mse_loss(v, y)
+        tvl = F.mse_loss(tv, y) if model.value_net is not None else vl
         acc = (logits.argmax(-1) == label[idx]).float()
         return pl.mean(), vl, acc.mean(), tvl
 
@@ -226,7 +241,7 @@ def main():
         tot = np.zeros(4)
         chunks = np.array_split(val_idx, max(1, len(val_idx) // 4096))
         for c in chunks:
-            tot += np.array([x.item() for x in losses(c)]) * len(c)
+            tot += np.array([x.item() for x in losses(c, train=False)]) * len(c)
         model.train()
         return tot / max(1, len(val_idx))
 
@@ -263,6 +278,23 @@ def main():
         model.value_net.load_state_dict(best_value[1])
         print(f"value net: kept step {best_value[2]}, val mse {best_value[0]:.3f} "
               f"(R² {1 - best_value[0] / var:.3f})", flush=True)
+
+    # Where in the round the exported value is good: R² by history length.
+    with torch.no_grad():
+        model.eval()
+        pred = []
+        for c in np.array_split(val_idx, max(1, len(val_idx) // 4096)):
+            _, s_, a_, _, _, toks_, lens_ = batch(c)
+            pred.append(model(s_, a_, toks_, lens_)[0].cpu().numpy())
+        model.train()
+    pred, y = np.concatenate(pred), data.margin[val_idx] / args.value_scale
+    tl = data.tok_len[val_idx]
+    parts = []
+    for lo, hi in ((0, 20), (20, 60), (60, 10**9)):
+        m = (tl >= lo) & (tl < hi)
+        if m.sum() > 1:
+            parts.append(f"{lo}-{hi if hi < 10**9 else ''} tokens R² {1 - np.mean((pred[m] - y[m]) ** 2) / np.var(y[m]):.3f}")
+    print("value by stage: " + ", ".join(parts), flush=True)
 
     # A worked example in the header: the Rust loader recomputes it and
     # refuses the model if the two implementations disagree.
