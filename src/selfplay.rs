@@ -239,6 +239,93 @@ impl Bot for Recorder {
     }
 }
 
+/// The `--q` labeler as a bot (`labelN[/FLAGS]:ROLLOUT`), so the arena can
+/// play the teacher itself: it plays the best of `pimc_q` (or `exact_q`)
+/// exactly as `selfplay --q N --rollout ROLLOUT` labels it, and leaves every
+/// other decision to h2 (`selfplay --bot h2`). Flags: `e` = `--exact-endgame`,
+/// `iK` = `--infer K`.
+pub struct LabelerBot {
+    base: crate::bots::H2Bot,
+    rng: StdRng,
+    q_samples: usize,
+    exact_endgame: bool,
+    infer: usize,
+    rollout: [Box<dyn Bot>; 4],
+    name: String,
+}
+
+impl LabelerBot {
+    pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
+        let (head, rollout) = name.split_once(':')?;
+        let (head, flags) = head.split_once('/').unwrap_or((head, ""));
+        let q_samples: usize = head.strip_prefix("label")?.parse().ok().filter(|&n| n > 0)?;
+        let (mut exact_endgame, mut infer) = (false, 0);
+        let mut chars = flags.chars().peekable();
+        while let Some(f) = chars.next() {
+            match f {
+                'e' => exact_endgame = true,
+                'i' => {
+                    let mut k = String::new();
+                    while let Some(d) = chars.peek().filter(|c| c.is_ascii_digit()) {
+                        k.push(*d);
+                        chars.next();
+                    }
+                    infer = k.parse().ok()?;
+                }
+                _ => return None,
+            }
+        }
+        let mut rollout_bots = Vec::with_capacity(4);
+        for k in 0..4 {
+            rollout_bots.push(bots::by_name(rollout, seed.wrapping_mul(4).wrapping_add(k))?);
+        }
+        let rollout: [Box<dyn Bot>; 4] = rollout_bots.try_into().ok()?;
+        Some(Box::new(LabelerBot {
+            base: crate::bots::H2Bot::new(),
+            rng: StdRng::seed_from_u64(seed ^ 0xABCD),
+            q_samples,
+            exact_endgame,
+            infer,
+            rollout,
+            name: name.to_string(),
+        }))
+    }
+}
+
+impl Bot for LabelerBot {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn grand_tichu(&mut self, v: &PlayerView) -> bool {
+        self.base.grand_tichu(v)
+    }
+    fn small_tichu(&mut self, v: &PlayerView) -> bool {
+        self.base.small_tichu(v)
+    }
+    fn pass_cards(&mut self, v: &PlayerView) -> PassInfo {
+        self.base.pass_cards(v)
+    }
+    fn bomb(&mut self, v: &PlayerView, bombs: &[Combo]) -> Option<usize> {
+        self.base.bomb(v, bombs)
+    }
+    fn wish(&mut self, v: &PlayerView) -> Option<Rank> {
+        self.base.wish(v)
+    }
+    fn dragon_recipient(&mut self, v: &PlayerView) -> Seat {
+        self.base.dragon_recipient(v)
+    }
+    fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+        let cands = Candidates::new(view, plays, can_pass);
+        if cands.len() < 2 {
+            return self.base.play(view, plays, can_pass);
+        }
+        let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
+        let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, &mut self.rollout, &mut self.rng));
+        let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
+        cands.options[best]
+    }
+}
+
 fn write_header(w: &mut impl Write) -> std::io::Result<()> {
     w.write_all(b"TCHR")?;
     for x in [FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32, TOKEN_DIM as u32] {

@@ -31,6 +31,8 @@ pub const NAMES: &[(&str, &str)] = &[
     ("nocalls:BOT", "same as calls:none:BOT"),
     ("pass2[~F]:BOT", "BOT with v2 passing (F = only these rules: o opponents, m Mah Jong vs Grand, p partner; e.g. pass2~o:h2): low singletons odd left / even right, Mah Jong before a Grand, partner gets my best card unless a gift would make me a Tichu hand"),
     ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; h2 for calls, passes, bombs out of turn"),
+    ("labelN[/FLAGS]:BOT", "the selfplay --q labeler as a player: best of N guessed deals with BOT rollouts, h2 for the rest; flags e = --exact-endgame, iK = --infer K (label10/ei4:net:m.tnet)"),
+    ("net@T:PATH", "net:PATH sampling its play from softmax(logits / T) instead of the top choice (net@0.5:m.tnet)"),
     ("vpimcN:PATH", "pimcN whose rollouts stop at my next turn and are scored by the model's value head"),
 ];
 
@@ -55,7 +57,8 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
             let (policy, inner) = name[6..].split_once(':')?;
             Some(Box::new(CallsBot::new(CallPolicy::parse(policy)?, by_name(inner, seed)?)))
         }
-        _ if name.starts_with("net:") || name.starts_with("vpimc") => net::by_name(name, seed),
+        _ if name.starts_with("net:") || name.starts_with("net@") || name.starts_with("vpimc") => net::by_name(name, seed),
+        _ if name.starts_with("label") => crate::selfplay::LabelerBot::by_name(name, seed),
         _ if name.starts_with("eg:") => Some(Box::new(EndgameBot::new(by_name(&name[3..], seed)?))),
         _ => {
             // pimcN / oracleN, optionally @noise, optionally /flags.

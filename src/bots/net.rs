@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 
 use crate::bot::Bot;
@@ -368,6 +368,9 @@ pub struct NetBot {
     net: Arc<Net>,
     base: H2Bot,
     memo: NetMemo,
+    /// > 0: sample from softmax(logits / temperature) instead (`net@T:PATH`).
+    temperature: f32,
+    rng: StdRng,
 }
 
 /// What a net bot carries from one decision to the next: its walk of the
@@ -381,10 +384,28 @@ pub struct NetMemo {
 
 impl NetBot {
     pub fn new(net: Arc<Net>) -> Self {
-        NetBot { net, base: H2Bot::new(), memo: NetMemo::default() }
+        NetBot { net, base: H2Bot::new(), memo: NetMemo::default(), temperature: 0.0, rng: StdRng::seed_from_u64(0) }
+    }
+
+    pub fn sampling(net: Arc<Net>, temperature: f32, seed: u64) -> Self {
+        NetBot { temperature, rng: StdRng::seed_from_u64(seed), ..NetBot::new(net) }
     }
 
     pub fn choose(net: &Net, view: &PlayerView, plays: &[Combo], can_pass: bool, memo: &mut NetMemo) -> Option<usize> {
+        Self::choose_with(net, view, plays, can_pass, memo, 0.0, None)
+    }
+
+    /// The top choice, or with `temperature` > 0 and an `rng`, a sample
+    /// from softmax(logits / temperature).
+    pub fn choose_with(
+        net: &Net,
+        view: &PlayerView,
+        plays: &[Combo],
+        can_pass: bool,
+        memo: &mut NetMemo,
+        temperature: f32,
+        rng: Option<&mut StdRng>,
+    ) -> Option<usize> {
         let cands = Candidates::new(view, plays, can_pass);
         if cands.len() == 1 {
             return cands.options[0];
@@ -395,7 +416,20 @@ impl NetBot {
         let seq = net.encode_seq_cached(memo.walk.tokens(), &mut memo.seq);
         let logits = net.logits(&net.trunk(&s, &seq), &cands.features);
         let best = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
-        cands.options[best]
+        match rng {
+            Some(rng) if temperature > 0.0 => {
+                let w: Vec<f64> = logits.iter().map(|l| (((l - logits[best]) / temperature) as f64).exp()).collect();
+                let mut x = rng.gen::<f64>() * w.iter().sum::<f64>();
+                for (k, wk) in w.iter().enumerate() {
+                    x -= wk;
+                    if x <= 0.0 {
+                        return cands.options[k];
+                    }
+                }
+                cands.options[best]
+            }
+            _ => cands.options[best],
+        }
     }
 }
 
@@ -428,7 +462,8 @@ impl Bot for NetBot {
     }
     rule_bot_rest!();
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
-        Self::choose(&self.net, view, plays, can_pass, &mut self.memo)
+        let t = self.temperature;
+        Self::choose_with(&self.net, view, plays, can_pass, &mut self.memo, t, Some(&mut self.rng))
     }
 }
 
@@ -512,6 +547,11 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
     };
     if let Some(path) = name.strip_prefix("net:") {
         return Some(Box::new(NetBot::new(load(path)?)));
+    }
+    if let Some(rest) = name.strip_prefix("net@") {
+        let (t, path) = rest.split_once(':')?;
+        let t: f32 = t.parse().ok().filter(|t: &f32| *t > 0.0 && t.is_finite())?;
+        return Some(Box::new(NetBot::sampling(load(path)?, t, seed)));
     }
     let (head, path) = name.split_once(':')?;
     let n: usize = head.strip_prefix("vpimc")?.parse().ok()?;
