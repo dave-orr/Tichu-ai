@@ -352,6 +352,14 @@ impl Net {
             .collect()
     }
 
+    /// The policy's logits for `cands` at `view` (no memo: walks the log).
+    pub fn option_logits(&self, view: &PlayerView, cands: &Candidates) -> Vec<f32> {
+        let walk = HistoryWalk::of(view);
+        let mut s = Vec::with_capacity(STATE_DIM);
+        encode_state_with(view, &walk, &mut s);
+        self.logits(&self.trunk(&s, &self.encode_seq(walk.tokens())), &cands.features)
+    }
+
     pub fn value_of(&self, view: &PlayerView) -> f32 {
         let walk = HistoryWalk::of(view);
         let mut s = Vec::with_capacity(STATE_DIM);

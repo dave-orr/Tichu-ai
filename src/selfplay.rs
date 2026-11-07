@@ -28,6 +28,8 @@
 
 use std::cell::RefCell;
 use std::io::Write;
+use std::sync::Arc;
+use crate::bots::net::Net;
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -75,6 +77,16 @@ pub struct SelfplayConfig {
     /// until the best option is clearly ahead of the runner-up (paired
     /// difference over 2 standard errors). 0 = fixed `q_samples`.
     pub q_max: usize,
+    /// With `q_samples` and a `net:` rollout: search only that net's top
+    /// this-many options and keep its choice unless another is clearly
+    /// ahead (`Teacher::anchor`). 0 = search every option.
+    pub anchor: usize,
+}
+
+/// The policy net of a `net:PATH` / `net@T:PATH` bot name.
+pub fn anchor_net(name: &str) -> Option<Arc<Net>> {
+    let path = name.strip_prefix("net:").or_else(|| name.strip_prefix("net@").and_then(|r| r.split_once(':').map(|x| x.1)))?;
+    Net::cached(path).ok()
 }
 
 /// Node budget for one exact endgame label (median solve is well under a
@@ -119,6 +131,24 @@ pub fn pimc_q(
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<f32> {
+    let rows = pimc_rows(view, plays, cands, samples, infer, max_samples, rollout, rng);
+    let m = rows.len().max(1) as f64;
+    (0..cands.len()).map(|k| (rows.iter().map(|r| r[k]).sum::<f64>() / m) as f32).collect()
+}
+
+/// `pimc_q`'s per-deal margins: one row per guessed deal, one column per
+/// option.
+#[allow(clippy::too_many_arguments)]
+fn pimc_rows(
+    view: &PlayerView,
+    plays: &[Combo],
+    cands: &Candidates,
+    samples: usize,
+    infer: usize,
+    max_samples: usize,
+    rollout: &mut [Box<dyn Bot>; 4],
+    rng: &mut StdRng,
+) -> Vec<Vec<f64>> {
     let team = view.my_team();
     let n = cands.len();
     let run = |guess: [Vec<Card>; 4], rollout: &mut [Box<dyn Bot>; 4]| -> Vec<f64> {
@@ -154,8 +184,74 @@ pub fn pimc_q(
             }
         }
     }
-    let m = rows.len().max(1) as f64;
-    (0..n).map(|k| (rows.iter().map(|r| r[k]).sum::<f64>() / m) as f32).collect()
+    rows
+}
+
+/// Whether option `b` beats option `a` by more than two standard errors,
+/// paired by deal.
+fn clearly_ahead(rows: &[Vec<f64>], b: usize, a: usize) -> bool {
+    let m = rows.len() as f64;
+    if m < 2.0 {
+        return false;
+    }
+    let d: Vec<f64> = rows.iter().map(|r| r[b] - r[a]).collect();
+    let dm = d.iter().sum::<f64>() / m;
+    let var = d.iter().map(|x| (x - dm) * (x - dm)).sum::<f64>() / (m - 1.0);
+    dm > 2.0 * (var / m).sqrt()
+}
+
+/// The search settings shared by the selfplay labeler and `LabelerBot`.
+pub struct Teacher {
+    pub q_samples: usize,
+    pub exact_endgame: bool,
+    pub infer: usize,
+    pub q_max: usize,
+    /// Anchor on a policy net: search only its top `anchor_k` options and
+    /// keep its choice unless another is clearly ahead (`clearly_ahead`).
+    pub anchor: Option<Arc<Net>>,
+    pub anchor_k: usize,
+}
+
+impl Teacher {
+    /// The option to play and every option's Q (NaN where not searched).
+    pub fn label(
+        &self,
+        view: &PlayerView,
+        plays: &[Combo],
+        cands: &Candidates,
+        rollout: &mut [Box<dyn Bot>; 4],
+        rng: &mut StdRng,
+    ) -> (usize, Vec<f32>) {
+        let argmax = |q: &[f32]| (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
+        if self.exact_endgame {
+            if let Some(q) = exact_q(view, plays, cands, ENDGAME_BUDGET, rng) {
+                return (argmax(&q), q);
+            }
+        }
+        let Some(net) = &self.anchor else {
+            let q = pimc_q(view, plays, cands, self.q_samples, self.infer, self.q_max, rollout, rng);
+            return (argmax(&q), q);
+        };
+        let logits = net.option_logits(view, cands);
+        let mut order: Vec<usize> = (0..cands.len()).collect();
+        order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        order.truncate(self.anchor_k.max(2));
+        let sub = Candidates {
+            options: order.iter().map(|&k| cands.options[k]).collect(),
+            features: order.iter().flat_map(|&k| cands.features[k * ACTION_DIM..(k + 1) * ACTION_DIM].iter().copied()).collect(),
+            group_of: vec![],
+        };
+        let rows = pimc_rows(view, plays, &sub, self.q_samples, self.infer, self.q_max, rollout, rng);
+        let m = rows.len().max(1) as f64;
+        let mean: Vec<f64> = (0..sub.len()).map(|k| rows.iter().map(|r| r[k]).sum::<f64>() / m).collect();
+        let best = (0..sub.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
+        let pick = if best != 0 && clearly_ahead(&rows, best, 0) { best } else { 0 };
+        let mut q = vec![f32::NAN; cands.len()];
+        for (j, &k) in order.iter().enumerate() {
+            q[k] = mean[j] as f32;
+        }
+        (order[pick], q)
+    }
 }
 
 /// Whether the best option's lead over the runner-up, paired by deal, is
@@ -208,10 +304,7 @@ pub fn exact_q(view: &PlayerView, plays: &[Combo], cands: &Candidates, budget: u
 struct Recorder {
     inner: Box<dyn Bot>,
     rng: StdRng,
-    q_samples: usize,
-    exact_endgame: bool,
-    infer: usize,
-    q_max: usize,
+    teacher: Teacher,
     rollout: [Box<dyn Bot>; 4],
     explore: f64,
     recs: Vec<Rec>,
@@ -246,10 +339,8 @@ impl Bot for Recorder {
         if cands.len() < 2 {
             return self.inner.play(view, plays, can_pass);
         }
-        let (label, q) = if self.q_samples > 0 {
-            let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
-            let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, self.q_max, &mut self.rollout, &mut self.rng));
-            let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
+        let (label, q) = if self.teacher.q_samples > 0 {
+            let (best, q) = self.teacher.label(view, plays, &cands, &mut self.rollout, &mut self.rng);
             (best, Some(q))
         } else {
             let choice = self.inner.play(view, plays, can_pass);
@@ -287,39 +378,37 @@ impl Bot for Recorder {
 /// play the teacher itself: it plays the best of `pimc_q` (or `exact_q`)
 /// exactly as `selfplay --q N --rollout ROLLOUT` labels it, and leaves every
 /// other decision to h2 (`selfplay --bot h2`). Flags: `e` = `--exact-endgame`,
-/// `iK` = `--infer K`, `aM` = `--q-max M` (adaptive samples).
+/// `iK` = `--infer K`, `aM` = `--q-max M` (adaptive samples), `pK` = `--anchor K` (needs a
+/// `net:` rollout).
 pub struct LabelerBot {
     base: crate::bots::H2Bot,
     rng: StdRng,
-    q_samples: usize,
-    exact_endgame: bool,
-    infer: usize,
-    q_max: usize,
+    teacher: Teacher,
     rollout: [Box<dyn Bot>; 4],
     name: String,
 }
 
 impl LabelerBot {
     pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
-        let (head, rollout) = name.split_once(':')?;
+        let (head, rollout_name) = name.split_once(':')?;
         let (head, flags) = head.split_once('/').unwrap_or((head, ""));
         let q_samples: usize = head.strip_prefix("label")?.parse().ok().filter(|&n| n > 0)?;
-        let (mut exact_endgame, mut infer, mut q_max) = (false, 0, 0);
+        let (mut exact_endgame, mut infer, mut q_max, mut anchor_k) = (false, 0, 0, 0);
         let mut chars = flags.chars().peekable();
         while let Some(f) = chars.next() {
             match f {
                 'e' => exact_endgame = true,
-                'i' | 'a' => {
+                'i' | 'a' | 'p' => {
                     let mut k = String::new();
                     while let Some(d) = chars.peek().filter(|c| c.is_ascii_digit()) {
                         k.push(*d);
                         chars.next();
                     }
                     let k: usize = k.parse().ok()?;
-                    if f == 'i' {
-                        infer = k;
-                    } else {
-                        q_max = k;
+                    match f {
+                        'i' => infer = k,
+                        'a' => q_max = k,
+                        _ => anchor_k = k,
                     }
                 }
                 _ => return None,
@@ -327,16 +416,18 @@ impl LabelerBot {
         }
         let mut rollout_bots = Vec::with_capacity(4);
         for k in 0..4 {
-            rollout_bots.push(bots::by_name(rollout, seed.wrapping_mul(4).wrapping_add(k))?);
+            rollout_bots.push(bots::by_name(rollout_name, seed.wrapping_mul(4).wrapping_add(k))?);
         }
         let rollout: [Box<dyn Bot>; 4] = rollout_bots.try_into().ok()?;
+        let anchor = match anchor_k {
+            0 => None,
+            1 => return None,
+            _ => Some(anchor_net(rollout_name)?),
+        };
         Some(Box::new(LabelerBot {
             base: crate::bots::H2Bot::new(),
             rng: StdRng::seed_from_u64(seed ^ 0xABCD),
-            q_samples,
-            exact_endgame,
-            infer,
-            q_max,
+            teacher: Teacher { q_samples, exact_endgame, infer, q_max, anchor, anchor_k },
             rollout,
             name: name.to_string(),
         }))
@@ -370,9 +461,7 @@ impl Bot for LabelerBot {
         if cands.len() < 2 {
             return self.base.play(view, plays, can_pass);
         }
-        let exact = if self.exact_endgame { exact_q(view, plays, &cands, ENDGAME_BUDGET, &mut self.rng) } else { None };
-        let q = exact.unwrap_or_else(|| pimc_q(view, plays, &cands, self.q_samples, self.infer, self.q_max, &mut self.rollout, &mut self.rng));
-        let best = (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
+        let (best, _) = self.teacher.label(view, plays, &cands, &mut self.rollout, &mut self.rng);
         cands.options[best]
     }
 }
@@ -427,10 +516,14 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                         Box::new(Recorder {
                             inner: bots::by_name(&cfg.bot, sd).expect("unknown bot"),
                             rng: StdRng::seed_from_u64(sd ^ 0xABCD),
-                            q_samples: cfg.q_samples,
-                            exact_endgame: cfg.exact_endgame,
-                            infer: cfg.infer,
-                            q_max: cfg.q_max,
+                            teacher: Teacher {
+                                q_samples: cfg.q_samples,
+                                exact_endgame: cfg.exact_endgame,
+                                infer: cfg.infer,
+                                q_max: cfg.q_max,
+                                anchor: (cfg.anchor > 0).then(|| anchor_net(&cfg.rollout).expect("--anchor needs a net rollout")),
+                                anchor_k: cfg.anchor,
+                            },
                             rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
                             recs: vec![],

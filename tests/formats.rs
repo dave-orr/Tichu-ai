@@ -282,6 +282,7 @@ fn selfplay_records_parse_and_are_reproducible() {
         exact_endgame: false,
         infer: 0,
         q_max: 0,
+        anchor: 0,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -324,6 +325,7 @@ fn selfplay_q_labels_are_written() {
         exact_endgame: false,
         infer: 0,
         q_max: 0,
+        anchor: 0,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -351,6 +353,7 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         exact_endgame: true,
         infer: 3,
         q_max: 0,
+        anchor: 0,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -375,6 +378,7 @@ fn selfplay_adaptive_samples_run_and_are_deterministic() {
         exact_endgame: false,
         infer: 0,
         q_max: 8,
+        anchor: 0,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -390,4 +394,30 @@ fn selfplay_adaptive_samples_run_and_are_deterministic() {
         v
     };
     assert_eq!(by_round(recs), by_round(parse_records(&four)));
+}
+
+#[test]
+fn selfplay_anchored_labels_search_only_the_nets_top_options() {
+    let cfg = SelfplayConfig {
+        bot: "heuristic".into(),
+        rounds: 2,
+        seed: 7,
+        threads: 2,
+        q_samples: 3,
+        rollout: format!("net:{}", common::random_tnet()),
+        explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 2,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    assert!(n > 0);
+    for r in &recs {
+        let q = r.q.as_ref().expect("--q records carry Q-values");
+        assert_eq!(q.iter().filter(|x| x.is_finite()).count(), 2, "{q:?}");
+        assert!(q[r.label].is_finite(), "the label is a searched option");
+    }
 }

@@ -40,6 +40,8 @@ usage:
       --exact-endgame with --q: label two-player endgames with the solver's exact values
       --infer K       with --q: weight guessed deals by the others' plays (K candidates each)
       --q-max M       with --q: keep sampling (up to M) until the best option is clearly ahead
+      --anchor K      with --q and a net rollout: search only the net's top K options and
+                      keep its choice unless another is clearly ahead
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -198,6 +200,7 @@ fn main() {
                 exact_endgame: args.has("exact-endgame"),
                 infer: args.num("infer").unwrap_or(0),
                 q_max: args.num("q-max").unwrap_or(0),
+                anchor: args.num("anchor").unwrap_or(0),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");

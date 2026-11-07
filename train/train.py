@@ -174,6 +174,9 @@ def main():
     act_off, n_opts, label = T(data.act_off), T(data.n_opts), T(data.label)
     margin = T(data.margin / args.value_scale)
     q = T(np.nan_to_num(data.q, nan=0.0))
+    # Anchored labels search only the policy's top options; the rest have
+    # NaN Q and get no target mass.
+    opt_has_q = T(has_q)
     rec_has_q = T(np.add.reduceat(has_q, data.act_off) > 0)
     # Value target: the round's final margin, blended with the search's
     # estimate of the position (Q of the labelled option) where there is one.
@@ -222,7 +225,7 @@ def main():
         logits = logits.masked_fill(~mask, -1e9)
         logp = F.log_softmax(logits, dim=-1)
         if args.policy == "q":
-            qt = q[rows].masked_fill(~mask, -1e9) / args.tau
+            qt = q[rows].masked_fill(~(mask & opt_has_q[rows]), -1e9) / args.tau
             target = F.softmax(qt, dim=-1)
             pl = -(target * logp).sum(-1)
             pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
