@@ -167,7 +167,30 @@ gen7 vs gen2 directly: +4.6 ± 3.0. Most of the gain comes in the first two
 generations; after that, each generation adds a point or two, too little to
 see one step at a time. The exact-endgame/infer labels didn't change gen0
 (+16.6 vs +16.5 without them). The likely ceiling is the teacher (10 guessed
-deals per decision); the next run tries `--q 24`.
+deals per decision).
+
+### The teacher (Nov 2026)
+
+Playing the labeler itself (`labelN[/FLAGS]:net:gen7`) against gen7, 500
+deals each, seed 900:
+
+| teacher | margin per deal | time |
+|---|---|---|
+| 10 samples (v2's) | −77.1 ± 10.0 | |
+| 24 samples | −40.0 ± 9.2 | 9 min |
+| 48 samples | −9.2 ± 9.7 | 18 min |
+| 96 samples | +4.6 ± 9.3 | 34 min |
+| 24, anchored on top 3 (`/ep3`, `--anchor 3`) | **+19.5 ± 6.5** | 6.6 min |
+| 24, anchored on top 6 | +18.8 ± 7.1 | 7.4 min |
+| 48, anchored on top 3 | +21.8 ± 6.7 | 9.3 min |
+
+The plain teacher was worse than its student: with every option searched,
+the noisiest one often wins by luck. Anchoring searches only the net's top K
+options and keeps the net's choice unless another is ahead by over two
+paired standard errors, which makes the teacher better than the student for
+less time. Adaptive sampling (`/a48`, `--q-max`) beat fixed 24 by +28.7 ± 9.7
+but cost as much as fixed 48. Sampled rollouts (`net@T:`) and weighted hand
+guesses (`--infer`) didn't help.
 
 The distilled policy beats the search that labelled it, and a second
 generation beats the first. The value head isn't good enough to stop
