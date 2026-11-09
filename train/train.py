@@ -129,6 +129,9 @@ def main():
     ap.add_argument("--init", help="start from this .pt checkpoint (saved next to every .tnet)")
     ap.add_argument("--policy", choices=["label", "q"], default="label")
     ap.add_argument("--tau", type=float, default=20.0, help="Q temperature in points (--policy q)")
+    ap.add_argument("--label-mix", type=float, default=0.0,
+                    help="--policy q: put this much of the target on the played label (the "
+                         "anchored teacher's gated choice) and the rest on softmax(Q/tau)")
     ap.add_argument("--value-weight", type=float, default=0.25, help="weight of the trunk's (auxiliary) value loss")
     ap.add_argument("--value-net", type=int, default=128, help="units of the separate value net (0 = export the trunk's head)")
     ap.add_argument("--value-dropout", type=float, default=0.3)
@@ -227,6 +230,9 @@ def main():
         if args.policy == "q":
             qt = q[rows].masked_fill(~(mask & opt_has_q[rows]), -1e9) / args.tau
             target = F.softmax(qt, dim=-1)
+            if args.label_mix > 0:
+                onehot = F.one_hot(label[idx].long(), target.shape[1]).float()
+                target = (1 - args.label_mix) * target + args.label_mix * onehot
             pl = -(target * logp).sum(-1)
             pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
         else:
