@@ -192,6 +192,29 @@ less time. Adaptive sampling (`/a48`, `--q-max`) beat fixed 24 by +28.7 ± 9.7
 but cost as much as fixed 48. Sampled rollouts (`net@T:`) and weighted hand
 guesses (`--infer`) didn't help.
 
+### v3: anchored teacher (`--q 24 --exact-endgame --anchor 3`, from gen7)
+
+4000 deals per match:
+
+| gen | vs heuristic | vs h2 | vs previous | vs v2 gen7 | value R² |
+|---|---|---|---|---|---|
+| 0 | +133.6 ± 3.8 | +47.2 ± 3.4 | | −0.3 ± 3.1 | 0.41 |
+| 1 | +139.9 ± 3.7 | +50.1 ± 3.4 | +6.6 ± 2.8 | +0.7 ± 2.9 | 0.36 |
+| 2 | +138.8 ± 3.7 | +52.7 ± 3.4 | +0.6 ± 3.0 | +3.7 ± 3.1 | 0.39 |
+| 3 | +140.9 ± 3.7 | +49.5 ± 3.4 | −3.3 ± 2.9 | +1.4 ± 3.1 | 0.39 |
+
+About 2 h per generation, nearly all self-play. The stronger teacher didn't
+make a clearly stronger student. Retraining gen2 on the same data, vs gen2
+(4000 deals): hard labels −10.4 ± 2.9, `--label-mix 0.5` −6.5 ± 2.8, τ 10
+−2.3 ± 2.9, hidden 512 −6.1 ± 2.9, hidden 512 depth 3 −1.7 ± 2.9, 16
+epochs +1.2 ± 2.9, three generations of data +3.8 ± 2.9, and another
+training seed −3.1 ± 3.0 (so training noise is about ±3 too). Label
+accuracy stays near 76%: the student is limited by noisy labels, not size.
+
+Search at play time is the reliable gain: `label24/ep3:net:gen2` beats gen2
+by +19.6 ± 4.5 and h2 by +62.2 ± 6.7 (1000 deals), at about 93 ms per
+decision on one core (12 samples: +11.2 ± 4.2, 51 ms).
+
 The distilled policy beats the search that labelled it, and a second
 generation beats the first. The value head isn't good enough to stop
 rollouts after one orbit yet: a single position's value is noisy (hidden
