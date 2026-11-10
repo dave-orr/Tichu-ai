@@ -127,7 +127,10 @@ def main():
     ap.add_argument("data", nargs="+", help="record files from `tichu selfplay`")
     ap.add_argument("--out", required=True, help="output .tnet path")
     ap.add_argument("--init", help="start from this .pt checkpoint (saved next to every .tnet)")
-    ap.add_argument("--policy", choices=["label", "q"], default="label")
+    ap.add_argument("--policy", choices=["label", "q", "adv"], default="label",
+                    help="label: imitate; q: cross-entropy to softmax(Q/tau); adv: regress the "
+                         "logits (centred over the searched options) onto Q/tau, which stays "
+                         "unbiased when Q is a noisy few-sample mean")
     ap.add_argument("--tau", type=float, default=20.0, help="Q temperature in points (--policy q)")
     ap.add_argument("--label-mix", type=float, default=0.0,
                     help="--policy q: put this much of the target on the played label (the "
@@ -160,7 +163,7 @@ def main():
     has_q = ~np.isnan(data.q)
     print(f"{len(data)} records, {len(data.actions)} candidates "
           f"({has_q.mean():.0%} with Q), loaded in {time.time() - t0:.1f}s", flush=True)
-    if args.policy == "q" and not has_q.any():
+    if args.policy in ("q", "adv") and not has_q.any():
         sys.exit("--policy q needs files written with `tichu selfplay --q N`")
 
     # Split by round so positions from one round don't straddle train/val.
@@ -225,9 +228,21 @@ def main():
     def losses(idx, train=True):
         idx, s, a, mask, rows, toks, lens = batch(idx)
         v, logits, tv = model(s, a, toks, lens)
+        raw = logits
         logits = logits.masked_fill(~mask, -1e9)
         logp = F.log_softmax(logits, dim=-1)
-        if args.policy == "q":
+        if args.policy == "adv":
+            m = (mask & opt_has_q[rows]).float()
+            k = m.sum(-1).clamp(min=1)
+            qc = q[rows] / args.tau
+            qc = (qc - (qc * m).sum(-1, keepdim=True) / k[:, None]) * m
+            lc = (raw - (raw * m).sum(-1, keepdim=True) / k[:, None]) * m
+            pl = ((lc - qc) ** 2).sum(-1) / k
+            # Options the search skipped (anchored labels) get no Q: just keep
+            # the policy's mass on the searched set.
+            pl = pl - torch.logsumexp(logp.masked_fill(m == 0, -1e9), dim=-1)
+            pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
+        elif args.policy == "q":
             qt = q[rows].masked_fill(~(mask & opt_has_q[rows]), -1e9) / args.tau
             target = F.softmax(qt, dim=-1)
             if args.label_mix > 0:

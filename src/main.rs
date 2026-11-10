@@ -208,7 +208,12 @@ fn main() {
             });
             let start = std::time::Instant::now();
             match tichu_engine::selfplay::run(&cfg, &mut std::io::BufWriter::new(file)) {
-                Ok(n) => println!("wrote {n} records to {out} ({:.1}s)", start.elapsed().as_secs_f64()),
+                Ok(n) => {
+                    println!("wrote {n} records to {out} ({:.1}s)", start.elapsed().as_secs_f64());
+                    if let Some(s) = tichu_engine::selfplay::teacher_stats() {
+                        println!("{s}");
+                    }
+                }
                 Err(e) => {
                     eprintln!("{out}: {e}");
                     exit(1)

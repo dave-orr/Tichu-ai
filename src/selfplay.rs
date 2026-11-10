@@ -200,6 +200,86 @@ fn clearly_ahead(rows: &[Vec<f64>], b: usize, a: usize) -> bool {
     dm > 2.0 * (var / m).sqrt()
 }
 
+/// Running totals over anchored decisions, for judging how noisy the labels
+/// are (`teacher_stats`).
+#[derive(Default, Clone, Copy)]
+pub struct TeacherStats {
+    pub decisions: u64,
+    /// The option with the best mean wasn't the net's choice.
+    pub best_not_anchor: u64,
+    /// ... and it was clearly ahead, so the teacher overrode the net.
+    pub overrides: u64,
+    /// Best-by-mean of the odd deals == best-by-mean of the even deals.
+    pub split_agree: u64,
+    /// Over (anchor, alternative) pairs: the mean paired difference squared,
+    /// and its squared standard error (the noise's share of it).
+    pub pairs: u64,
+    pub sum_d2: f64,
+    pub sum_se2: f64,
+}
+
+static TEACHER_STATS: std::sync::Mutex<TeacherStats> = std::sync::Mutex::new(TeacherStats {
+    decisions: 0,
+    best_not_anchor: 0,
+    overrides: 0,
+    split_agree: 0,
+    pairs: 0,
+    sum_d2: 0.0,
+    sum_se2: 0.0,
+});
+
+impl TeacherStats {
+    fn record(rows: &[Vec<f64>], mean: &[f64], best: usize, pick: usize) {
+        let m = rows.len();
+        if m < 4 {
+            return;
+        }
+        let n = mean.len();
+        let half = |par: usize| -> usize {
+            let sums: Vec<f64> = (0..n).map(|k| rows.iter().skip(par).step_by(2).map(|r| r[k]).sum()).collect();
+            (0..n).max_by(|&a, &b| sums[a].total_cmp(&sums[b])).unwrap()
+        };
+        let mut st = TEACHER_STATS.lock().unwrap();
+        st.decisions += 1;
+        st.best_not_anchor += (best != 0) as u64;
+        st.overrides += (pick != 0) as u64;
+        st.split_agree += (half(0) == half(1)) as u64;
+        for k in 1..n {
+            let d: Vec<f64> = rows.iter().map(|r| r[k] - r[0]).collect();
+            let dm = d.iter().sum::<f64>() / m as f64;
+            let var = d.iter().map(|x| (x - dm) * (x - dm)).sum::<f64>() / (m as f64 - 1.0);
+            st.pairs += 1;
+            st.sum_d2 += dm * dm;
+            st.sum_se2 += var / m as f64;
+        }
+    }
+}
+
+/// A one-paragraph summary of the anchored teacher's noise so far in this
+/// process, or `None` if it made no anchored decisions.
+pub fn teacher_stats() -> Option<String> {
+    let st = *TEACHER_STATS.lock().unwrap();
+    if st.decisions == 0 {
+        return None;
+    }
+    let n = st.decisions as f64;
+    let (d2, se2) = (st.sum_d2 / st.pairs as f64, st.sum_se2 / st.pairs as f64);
+    let signal = (d2 - se2).max(0.0);
+    Some(format!(
+        "teacher: {} anchored decisions; best-by-mean isn't the net's move in {:.1}%, overrides {:.1}%; \
+         split-half agreement on the best move {:.1}%; Q difference to the net's move: rms {:.1} pts, \
+         of which noise {:.1} (se) and signal {:.1}; reliability {:.2}",
+        st.decisions,
+        100.0 * st.best_not_anchor as f64 / n,
+        100.0 * st.overrides as f64 / n,
+        100.0 * st.split_agree as f64 / n,
+        d2.sqrt(),
+        se2.sqrt(),
+        signal.sqrt(),
+        signal / d2.max(1e-9),
+    ))
+}
+
 /// The search settings shared by the selfplay labeler and `LabelerBot`.
 pub struct Teacher {
     pub q_samples: usize,
@@ -246,6 +326,7 @@ impl Teacher {
         let mean: Vec<f64> = (0..sub.len()).map(|k| rows.iter().map(|r| r[k]).sum::<f64>() / m).collect();
         let best = (0..sub.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
         let pick = if best != 0 && clearly_ahead(&rows, best, 0) { best } else { 0 };
+        TeacherStats::record(&rows, &mean, best, pick);
         let mut q = vec![f32::NAN; cands.len()];
         for (j, &k) in order.iter().enumerate() {
             q[k] = mean[j] as f32;
