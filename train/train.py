@@ -126,6 +126,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("data", nargs="+", help="record files from `tichu selfplay`")
     ap.add_argument("--out", required=True, help="output .tnet path")
+    ap.add_argument("--prior", help="--policy q: a .pt checkpoint (same architecture) whose policy the "
+                                    "target keeps: softmax(prior log-policy + Q advantage / tau), with "
+                                    "unsearched options at advantage 0, instead of softmax(Q / tau)")
     ap.add_argument("--init", help="start from this .pt checkpoint (saved next to every .tnet)")
     ap.add_argument("--policy", choices=["label", "q", "adv"], default="label",
                     help="label: imitate; q: cross-entropy to softmax(Q/tau); adv: regress the "
@@ -216,6 +219,12 @@ def main():
                      data.token_dim, args.seq_hidden, args.value_net, args.value_dropout).to(dev)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location=dev))
+    prior = None
+    if args.prior:
+        prior = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head,
+                         data.token_dim, args.seq_hidden, args.value_net, args.value_dropout).to(dev)
+        prior.load_state_dict(torch.load(args.prior, map_location=dev))
+        prior.eval()
     vparams = list(model.value_net.parameters()) if model.value_net is not None else []
     vids = {id(p) for p in vparams}
     groups = [dict(params=[p for p in model.parameters() if id(p) not in vids], weight_decay=args.wd)]
@@ -243,8 +252,22 @@ def main():
             pl = pl - torch.logsumexp(logp.masked_fill(m == 0, -1e9), dim=-1)
             pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
         elif args.policy == "q":
-            qt = q[rows].masked_fill(~(mask & opt_has_q[rows]), -1e9) / args.tau
-            target = F.softmax(qt, dim=-1)
+            if prior is not None:
+                # The search nudges the prior instead of replacing it: Q's
+                # advantage over the prior-weighted mean of the searched
+                # options, added to the prior's log-policy.
+                with torch.no_grad():
+                    _, pl0, _ = prior(s, a, toks, lens)
+                    pl0 = F.log_softmax(pl0.masked_fill(~mask, -1e9), dim=-1)
+                    has = mask & opt_has_q[rows]
+                    qq = torch.where(has, q[rows], torch.zeros_like(q[rows]))
+                    w = pl0.exp() * has
+                    vmix = (w * qq).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp_min(1e-9)
+                    adv = torch.where(has, qq - vmix, torch.zeros_like(qq))
+                    target = F.softmax((pl0 + adv / args.tau).masked_fill(~mask, -1e9), dim=-1)
+            else:
+                qt = q[rows].masked_fill(~(mask & opt_has_q[rows]), -1e9) / args.tau
+                target = F.softmax(qt, dim=-1)
             if args.label_mix > 0:
                 onehot = F.one_hot(label[idx].long(), target.shape[1]).float()
                 target = (1 - args.label_mix) * target + args.label_mix * onehot

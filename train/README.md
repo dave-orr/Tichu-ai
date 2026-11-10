@@ -211,6 +211,24 @@ epochs +1.2 ± 2.9, three generations of data +3.8 ± 2.9, and another
 training seed −3.1 ± 3.0 (so training noise is about ±3 too). Label
 accuracy stays near 76%: the student is limited by noisy labels, not size.
 
+Two changes to training did help, and add up (vs gen2, 4000 deals, two
+training seeds each): `--prior` (target = softmax(prior log-policy + Q
+advantage / τ), the previous generation as prior) +5.1 and +4.2 on two
+generations of data; three generations with the old target +3.8 and +2.0;
+both together **+7.7 ± 2.9 and +6.8 ± 2.9**. `iterate.py --prior0 PT --window
+3 --data0 OLD.bin,...` runs the loop that way.
+
+Why the student lags the teacher: at 24 samples 29% of the variance of a
+label's Q difference is noise (60% at 6 samples, 9% at 96), and the teacher
+overrides the net in only 5% of decisions (`selfplay` prints these as
+"teacher: ..."). 36,000 rounds of 4-sample labels were no better than 12,000
+rounds of 24-sample ones (−8.9 ± 3.1 vs −10.7 ± 2.9 on one generation of
+data), `--policy adv` no better than `q` (+1.3 ± 3.0), and Tichu/Grand
+thresholds are at a local optimum (no calls −7.8 ± 2.5, stricter −2.2 ± 1.6,
+looser −3.0 ± 1.9). Of the search's gain, exact endgames are +3.2 ± 0.3 and
+the rest is mid-round. Net-only self-play runs 62.5 rounds/s on the desktop,
+34× the 24-sample teacher.
+
 Search at play time is the reliable gain: `label24/ep3:net:gen2` beats gen2
 by +19.6 ± 4.5 and h2 by +62.2 ± 6.7 (1000 deals), at about 93 ms per
 decision on one core (12 samples: +11.2 ± 4.2, 51 ms).

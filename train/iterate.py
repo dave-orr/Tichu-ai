@@ -50,6 +50,10 @@ def main():
     ap.add_argument("--epochs", type=float, default=8)
     ap.add_argument("--arena-rounds", type=int, default=4000)
     ap.add_argument("--tichu", default=os.path.join(ROOT, "target", "release", "tichu.exe" if os.name == "nt" else "tichu"))
+    ap.add_argument("--prior0", default="", help="train with train.py --prior: this .pt for generation 0, then each "
+                                                 "generation's predecessor (the net that labelled its newest data)")
+    ap.add_argument("--data0", default="", help="comma-separated record files from an earlier run, oldest first, "
+                                                "that count as the generations before 0 in the training window")
     ap.add_argument("--train-args", default="", help="extra arguments for train.py")
     ap.add_argument("--selfplay-args", default="", help="extra arguments for `tichu selfplay`")
     ap.add_argument("--opponents", default="", help="extra arena opponents for every generation, comma-separated bot names")
@@ -69,9 +73,13 @@ def main():
             run([args.tichu, "selfplay", "--bot", args.base, "--q", str(args.q), "--rollout", rollout, "--rounds", str(args.rounds),
                  "--seed", str(1000 + g), "--out", data(g) + ".part", *args.selfplay_args.split()], log)
             os.replace(data(g) + ".part", data(g))
-        files = [data(k) for k in range(max(0, g - args.window + 1), g + 1)]
+        earlier = [f for f in args.data0.split(",") if f]
+        files = (earlier + [data(k) for k in range(g + 1)])[-args.window:]
+        prior = []
+        if args.prior0:
+            prior = ["--prior", args.prior0 if g == 0 else os.path.splitext(model(g - 1))[0] + ".pt"]
         run([sys.executable, os.path.join(HERE, "train.py"), *files, "--policy", "q",
-             "--epochs", str(args.epochs), "--out", model(g), *args.train_args.split()], log)
+             "--epochs", str(args.epochs), "--out", model(g), *prior, *args.train_args.split()], log)
         # The previous generation, and gen0 as a fixed yardstick for drift.
         opponents = ["heuristic", args.base] + [f"net:{model(k)}" for k in sorted({g - 1, 0}) if 0 <= k < g]
         opponents += [o for o in args.opponents.split(",") if o]
