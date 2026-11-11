@@ -238,6 +238,57 @@ generation beats the first. The value head isn't good enough to stop
 rollouts after one orbit yet: a single position's value is noisy (hidden
 cards, the rest of the round), and R² stayed near 0.25.
 
+## Deep Monte Carlo (DouZero-style), no search
+
+`train/dmc.py` is a second loop that uses no search labels at all. It plays a
+great many ε-greedy self-play rounds and regresses each played option's value
+onto the round's final margin, as DouZero did for Dou Dizhu. The noise of a
+single round's outcome is averaged over millions of positions, not over
+samples within one.
+
+```sh
+python train/dmc.py --dir runs/dmc --init runs/v4/start.pt --chunks 200
+```
+
+- **Actor**: `tichu selfplay --bot net:<latest> --explore 0.03 --played-only`
+  plays `--chunk-rounds` rounds (default 20k) on every thread. `--played-only`
+  writes just the option played, one record per decision with 2+ options
+  (state, option, margin; about 0.76 KB, no history tokens).
+- **Learner** (the GPU): a replay buffer of the newest `--buffer` records (4M,
+  about 3 GB), and MSE steps of Q(state, played option) against margin / 100,
+  about `--replay` (4) samples per new record. It trains while the next chunk
+  plays, so the actor is one chunk behind. Q is dueling by default: the trunk's
+  value head plus the policy head, so the head only learns how options
+  differ. The exported `.tnet` is an ordinary `net:` model whose logits are
+  those advantages, so `net:` plays argmax Q.
+- **Warm start**: `--init` takes any `train.py` checkpoint. Its logits are read
+  as advantages of logit × `--init-tau` (20) points. Without `--init` the net
+  starts fresh and chunk 0 is played by h2 (`--actor0`).
+- Each chunk logs the current model's fit to the new data before training on
+  it ("fresh-data R²" of Q and of the state value). A Q that knows the
+  options should beat the state value. Every `--eval-every` chunks the export
+  plays `--opponents` in the arena and is kept as `snapNNNNN.tnet`/`.pt`. Logs
+  go to `log.txt` and `log.jsonl`.
+- **Pause and resume**: stop it at any time (Ctrl+C, or kill python and tichu).
+  Re-running the same command resumes from the last finished chunk
+  (`learner.pt`) and refills the buffer from the chunk files it keeps on disk.
+
+Speed on the desktop: 53–58 rounds/s of self-play, about 750k records per
+20k-round chunk (6–6.5 min), and about 25 s of training per chunk. The
+learner is idle most of the time.
+
+First test (Nov 2026), warm start from `runs/v4/start` (lr 2e-4, 1000 deals
+each):
+
+| after | vs start net | vs h2 |
+|---|---|---|
+| 2 chunks (40k rounds) | −14.8 ± 6.3 | +42.7 ± 7.0 |
+| 4 chunks (80k rounds) | −20.2 ± 6.3 | +49.4 ± 7.2 |
+
+Fresh-data R² of Q was 0.38 against 0.41 for the state value: at this volume,
+the advantages still add more noise than they explain. DouZero needed far more
+games than this.
+
 ## Running the loop
 
 ```sh
