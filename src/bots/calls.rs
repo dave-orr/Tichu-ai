@@ -7,7 +7,7 @@
 //! decompose`; the Phoenix joins a combination only if that removes two
 //! singles). Count:
 //! - *winners*, each a way to get the lead back: Dragon, a loose Phoenix,
-//!   bombs, and combinations almost sure to top their type (pair of Aces, a
+//!   bombs (two each: a bomb also stops an opponent at any time), and combinations almost sure to top their type (pair of Aces, a
 //!   straight to the Ace or of 8+ cards, stairs to the Ace, a triple Q+, a
 //!   full house on K+). Single Aces count, less one per Dragon/Phoenix that
 //!   might be with an opponent. Single Kings count, less one per Ace that
@@ -69,7 +69,15 @@ fn top_of_type(c: &Combo) -> bool {
     }
 }
 
+/// How many winners a bomb counts as in the Small Tichu evaluation.
+pub const BOMB_WINNERS: f32 = 2.0;
+
 pub fn tichu_eval(view: &PlayerView) -> TichuEval {
+    tichu_eval_with(view, BOMB_WINNERS)
+}
+
+/// `tichu_eval` with each bomb counted as `bomb_winners` winners.
+pub fn tichu_eval_with(view: &PlayerView, bomb_winners: f32) -> TichuEval {
     let d = decompose(&view.hand);
     let unseen = view.unseen();
     let with_partner: Vec<Card> =
@@ -92,7 +100,8 @@ pub fn tichu_eval(view: &PlayerView) -> TichuEval {
     let ace_winners = aces.saturating_sub(missing_specials);
     let king_winners = kings.saturating_sub(unseen_aces);
     let winner_combos = top + ace_winners + king_winners;
-    let mut winners = winner_combos as f32;
+    let bombs = d.combos.iter().filter(|c| c.is_bomb()).count();
+    let mut winners = winner_combos as f32 + bombs as f32 * (bomb_winners - 1.0);
     if view.hand.contains(&MAH_JONG) {
         winners += 1.0;
     }
@@ -135,6 +144,11 @@ pub fn call_adjustment(view: &PlayerView) -> f32 {
 
 /// v2 Small Tichu. None = not deciding yet (ask again next turn).
 pub fn small_tichu_v2(view: &PlayerView, threshold: f32) -> Option<bool> {
+    small_tichu_v2_with(view, threshold, BOMB_WINNERS)
+}
+
+/// `small_tichu_v2` with each bomb counted as `bomb_winners` winners.
+pub fn small_tichu_v2_with(view: &PlayerView, threshold: f32, bomb_winners: f32) -> Option<bool> {
     let me = view.seat;
     let my_turn = view.turn == me && !view.wish_pending && view.trick_countdown.is_none() && view.dragon_giveaway_by.is_none();
     if !my_turn {
@@ -143,7 +157,7 @@ pub fn small_tichu_v2(view: &PlayerView, threshold: f32) -> Option<bool> {
     if view.players[view.partner()].tichu != TichuCall::None {
         return Some(false);
     }
-    let eval = tichu_eval(view);
+    let eval = tichu_eval_with(view, bomb_winners);
     if let Some(t) = &view.current_trick {
         let beats = eval.decomposition.normal_singles().any(|c| c.rank > t.rank);
         if t.kind == ComboKind::Single && !beats {
@@ -197,23 +211,30 @@ pub enum CallPolicy {
     Never,
     /// The original heuristic-bot rules.
     V1,
-    /// The v2 rules with this Small Tichu threshold; v2 Grand too if `grand`.
-    V2 { threshold: f32, grand: bool },
+    /// The v2 rules with this Small Tichu threshold, each bomb counted as
+    /// `bomb` winners; v2 Grand too if `grand`.
+    V2 { threshold: f32, grand: bool, bomb: f32 },
     /// v2 Grand Tichu only; never Small.
     GrandOnly,
 }
 
 impl CallPolicy {
     /// "none", "v1", "g" (v2 Grand only), a number T (v2 Small with
-    /// threshold T plus v2 Grand), or "sT" (v2 Small only).
+    /// threshold T plus v2 Grand), or "sT" (v2 Small only). T may end in
+    /// "bN": count each bomb as N winners (default `BOMB_WINNERS`; "0b1"
+    /// is the rule before bombs counted double).
     pub fn parse(s: &str) -> Option<CallPolicy> {
+        let (s, bomb) = match s.split_once('b') {
+            Some((t, b)) => (t, b.parse().ok()?),
+            None => (s, BOMB_WINNERS),
+        };
         match s {
             "none" => Some(CallPolicy::Never),
             "v1" => Some(CallPolicy::V1),
             "g" => Some(CallPolicy::GrandOnly),
             _ => match s.strip_prefix('s') {
-                Some(t) => Some(CallPolicy::V2 { threshold: t.parse().ok()?, grand: false }),
-                None => Some(CallPolicy::V2 { threshold: s.parse().ok()?, grand: true }),
+                Some(t) => Some(CallPolicy::V2 { threshold: t.parse().ok()?, grand: false, bomb }),
+                None => Some(CallPolicy::V2 { threshold: s.parse().ok()?, grand: true, bomb }),
             },
         }
     }
@@ -236,8 +257,10 @@ impl Bot for CallsBot {
         let p = match self.policy {
             CallPolicy::Never => "none".to_string(),
             CallPolicy::V1 => "v1".to_string(),
-            CallPolicy::V2 { threshold, grand: true } => format!("{threshold}"),
-            CallPolicy::V2 { threshold, grand: false } => format!("s{threshold}"),
+            CallPolicy::V2 { threshold, grand, bomb } => {
+                let b = if bomb == BOMB_WINNERS { String::new() } else { format!("b{bomb}") };
+                format!("{}{threshold}{b}", if grand { "" } else { "s" })
+            }
             CallPolicy::GrandOnly => "g".to_string(),
         };
         format!("calls:{p}:{}", self.inner.name())
@@ -254,7 +277,7 @@ impl Bot for CallsBot {
         match self.policy {
             CallPolicy::Never | CallPolicy::GrandOnly => false,
             CallPolicy::V1 => small_tichu_v1(view),
-            CallPolicy::V2 { threshold, .. } => small_tichu_v2(view, threshold).unwrap_or(false),
+            CallPolicy::V2 { threshold, bomb, .. } => small_tichu_v2_with(view, threshold, bomb).unwrap_or(false),
         }
     }
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
@@ -262,11 +285,11 @@ impl Bot for CallsBot {
     }
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
         // While a v2 Small Tichu decision is deferred, pass if allowed.
-        if let CallPolicy::V2 { threshold: t, .. } = self.policy {
+        if let CallPolicy::V2 { threshold: t, bomb, .. } = self.policy {
             let eligible = !view.me().has_played_first_card
                 && view.me().tichu == TichuCall::None
                 && !view.players.iter().any(|p| p.is_out());
-            if eligible && can_pass && small_tichu_v2(view, t).is_none() {
+            if eligible && can_pass && small_tichu_v2_with(view, t, bomb).is_none() {
                 return None;
             }
         }

@@ -448,8 +448,13 @@ fn explain_search(
     let top = order[0];
     let reply = if pick == 0 {
         let best = (0..mean.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
-        let why = if best == 0 {
-            "The search agrees".to_string()
+        let ties = (1..mean.len()).filter(|&j| mean[j] == mean[0]).count();
+        let why = if best == 0 || mean[best] <= mean[0] {
+            if ties > 0 {
+                format!("The search agrees ({ties} other option{} came out exactly level)", if ties > 1 { "s" } else { "" })
+            } else {
+                "The search agrees".to_string()
+            }
         } else {
             let (d, se) = vs_top(best);
             format!(

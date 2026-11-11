@@ -27,7 +27,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("pimcN[@x][/F]", "search bot: N sampled deals x heuristic rollouts per candidate play; @x = rollout noise; flags F: h = h2 rollouts, i = hand inference, b = search bombs, s = search wish and Dragon gift (pimc20, pimc20@0.1, pimc10/hibs); passes with the v2 rules"),
     ("oracleN[@x]", "CHEATS (diagnostic): pimc that searches the real hands (oracle1, oracle20@0.1)"),
     ("eg:BOT", "BOT, but two-player endgames are solved exactly (e.g. eg:heuristic, eg:pimc20)"),
-    ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, g = v2 Grand only (calls:1:pimc20)"),
+    ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, TbN = bombs count N winners (default 2; 0b1 = the old count), g = v2 Grand only (calls:1:pimc20)"),
     ("nocalls:BOT", "same as calls:none:BOT"),
     ("pass2[~F]:BOT", "BOT with v2 passing (F = only these rules: o opponents, m Mah Jong vs Grand, p partner; e.g. pass2~o:h2): low singletons odd left / even right, Mah Jong before a Grand, partner gets my best card unless a gift would make me a Tichu hand"),
     ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; h2 for calls, passes, bombs out of turn"),
