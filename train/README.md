@@ -285,8 +285,17 @@ each):
 | 2 chunks (40k rounds) | −14.8 ± 6.3 | +42.7 ± 7.0 |
 | 4 chunks (80k rounds) | −20.2 ± 6.3 | +49.4 ± 7.2 |
 
-Fresh-data R² of Q was 0.38 against 0.41 for the state value: at this volume,
-the advantages still add more noise than they explain. DouZero needed far more
+With lr 2e-4 the fresh-data R² of Q was 0.38 against 0.41 for the state
+value: the advantages added more noise than they explained. With `--lr 5e-5`
+Q pulls ahead (0.44 against 0.43 after 4 chunks) and the spread of Q − V
+falls from 65 to 48 points:
+
+| lr 5e-5, after | vs start net | vs h2 |
+|---|---|---|
+| 2 chunks | −21.6 ± 6.4 | +48.0 ± 6.9 |
+| 4 chunks | −15.1 ± 6.6 | +48.5 ± 6.8 |
+
+Both are still below the start net after 80k rounds. DouZero needed far more
 games than this.
 
 ## Running the loop
