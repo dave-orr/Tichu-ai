@@ -42,6 +42,8 @@ usage:
       --q-max M       with --q: keep sampling (up to M) until the best option is clearly ahead
       --anchor K      with --q and a net rollout: search only the net's top K options and
                       keep its choice unless another is clearly ahead
+      --played-only   record only the option played (one-option records, no history
+                      tokens): Deep Monte Carlo data for train/dmc.py
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -74,7 +76,7 @@ impl Args {
         while i < raw.len() {
             let s = &raw[i];
             if let Some(f) = s.strip_prefix("--") {
-                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only" | "exact-endgame");
+                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only" | "exact-endgame" | "played-only");
                 let v = if takes_value { i += 1; raw.get(i).cloned() } else { None };
                 if takes_value && v.is_none() {
                     eprintln!("--{f} needs a value");
@@ -201,6 +203,7 @@ fn main() {
                 infer: args.num("infer").unwrap_or(0),
                 q_max: args.num("q-max").unwrap_or(0),
                 anchor: args.num("anchor").unwrap_or(0),
+                played_only: args.has("played-only"),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");

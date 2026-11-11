@@ -12,6 +12,10 @@
 //! The bot still makes every other decision (calls, passing, out-of-turn
 //! bombs, wishes, the Dragon). Decisions with a single option are skipped.
 //!
+//! With `played_only` (`--played-only`) each record holds just the option
+//! that was played, as a one-option record with label 0, and blocks carry
+//! no history tokens: the compact data `train/dmc.py` learns from.
+//!
 //! File layout (little endian): a 24-byte header — `b"TCHR"`, format
 //! version, `FEATURE_VERSION`, `STATE_DIM`, `ACTION_DIM`, `TOKEN_DIM` (u32
 //! each) — then one block per seat per round that has records: the seat's
@@ -81,6 +85,11 @@ pub struct SelfplayConfig {
     /// this-many options and keep its choice unless another is clearly
     /// ahead (`Teacher::anchor`). 0 = search every option.
     pub anchor: usize,
+    /// Record only the option actually played (with `explore`, possibly a
+    /// random one) as a one-option record with label 0, and no history
+    /// tokens: the data for Deep Monte Carlo training (`train/dmc.py`),
+    /// which regresses the played option's value onto the round's margin.
+    pub played_only: bool,
 }
 
 /// The policy net of a `net:PATH` / `net@T:PATH` bot name.
@@ -388,6 +397,7 @@ struct Recorder {
     teacher: Teacher,
     rollout: [Box<dyn Bot>; 4],
     explore: f64,
+    played_only: bool,
     recs: Vec<Rec>,
     out: Rc<RefCell<Vec<Block>>>,
 }
@@ -435,6 +445,15 @@ impl Bot for Recorder {
         let choice = cands.options[act];
         let mut state = Vec::with_capacity(STATE_DIM);
         encode_state(view, &mut state);
+        if self.played_only {
+            let played = Candidates {
+                options: vec![choice],
+                features: cands.features[act * ACTION_DIM..(act + 1) * ACTION_DIM].to_vec(),
+                group_of: vec![],
+            };
+            self.recs.push(Rec { state, cands: played, label: 0, q: None, prefix: 0 });
+            return choice;
+        }
         let prefix = encode_history(view, &mut vec![]);
         self.recs.push(Rec { state, cands, label, q, prefix });
         choice
@@ -448,7 +467,7 @@ impl Bot for Recorder {
         let team = view.my_team();
         let margin = (result.total(team) - result.total(1 - team)) as f32;
         let mut tokens = vec![];
-        let n_tokens = encode_history(view, &mut tokens);
+        let n_tokens = if self.played_only { 0 } else { encode_history(view, &mut tokens) };
         assert!(self.recs.iter().all(|r| r.prefix <= n_tokens), "history isn't a prefix of the round's");
         let recs = std::mem::take(&mut self.recs);
         self.out.borrow_mut().push(Block { seat: view.seat as u8, tokens, n_tokens, recs, margin });
@@ -607,6 +626,7 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                             },
                             rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
+                            played_only: cfg.played_only,
                             recs: vec![],
                             out: out.clone(),
                         })

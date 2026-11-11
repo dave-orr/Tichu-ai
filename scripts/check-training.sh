@@ -43,6 +43,16 @@ if "$PY" -c "import torch" 2>/dev/null; then
     ./target/release/tichu arena "vpimc2:$dir/m.tnet" heuristic --rounds 2 --threads 2 | grep -q "margin per deal"
   done
   echo "train.py models (with and without a GRU) load and play in Rust"
+  # Deep Monte Carlo: played-only self-play, the learner, export, arena, resume.
+  ./target/release/tichu selfplay --out "$dir/played.bin" --rounds 4 --played-only --explore 0.2 --seed 3 --threads 2 2>/dev/null
+  "$PY" -c "import sys; sys.path.insert(0, 'train'); from dmc import read_played; s, a, y, d = read_played(sys.argv[1]); assert len(s) > 20 and s.shape[1] == 704 and a.shape[1] == 48 and abs(y).max() <= 800, (s.shape, a.shape)" "$dir/played.bin"
+  dmc=(train/dmc.py --dir "$dir/dmc" --chunk-rounds 12 --hidden 32 --head 16 --buffer 2000 --eval-every 2 --eval-rounds 4 --opponents random --threads 2 --device cpu)
+  "$PY" "${dmc[@]}" --chunks 2 >/dev/null
+  "$PY" "${dmc[@]}" --chunks 3 >/dev/null
+  grep -q "resuming at chunk 2" "$dir/dmc/log.txt"
+  grep -q "chunk 2: vs random" "$dir/dmc/log.txt"
+  ./target/release/tichu arena "net:$dir/dmc/latest.tnet" random --rounds 6 --threads 2 | grep -q "margin per deal"
+  echo "dmc.py runs, resumes, and its models load and play in Rust"
 else
   echo "PyTorch not installed: skipped the train.py -> .tnet check"
 fi

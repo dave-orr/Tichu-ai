@@ -283,6 +283,7 @@ fn selfplay_records_parse_and_are_reproducible() {
         infer: 0,
         q_max: 0,
         anchor: 0,
+        played_only: false,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -313,6 +314,68 @@ fn selfplay_records_parse_and_are_reproducible() {
 }
 
 #[test]
+fn selfplay_played_only_records_hold_the_played_option() {
+    let cfg = SelfplayConfig {
+        bot: "h2".into(),
+        rounds: 6,
+        seed: 4,
+        threads: 2,
+        q_samples: 0,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 0,
+        played_only: false,
+    };
+    let (full_buf, _) = selfplay_file(&cfg);
+    let (buf, n) = selfplay_file(&SelfplayConfig { played_only: true, ..cfg.clone() });
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    // No history tokens: a record is exactly header + state + one option.
+    assert_eq!(buf.len(), 24 + recs.iter().map(|r| r.bytes.len()).sum::<usize>() + 11 * blocks(&buf));
+    let key = |r: &Rec| (r.round, r.seat);
+    let mut full = parse_records(&full_buf);
+    full.sort_by_key(key);
+    let mut recs = recs;
+    recs.sort_by_key(key);
+    assert_eq!(full.len(), recs.len());
+    for (f, r) in full.iter().zip(&recs) {
+        assert_eq!((r.n, r.label, r.margin), (1, 0, f.margin));
+        assert!(r.q.is_none());
+        let s = 11;
+        assert_eq!(r.bytes[s..s + STATE_DIM], f.bytes[s..s + STATE_DIM], "same state");
+        let a = s + STATE_DIM;
+        assert_eq!(
+            r.bytes[a..a + ACTION_DIM],
+            f.bytes[a + f.label * ACTION_DIM..a + (f.label + 1) * ACTION_DIM],
+            "the one option is the played (= labelled, without explore) one"
+        );
+    }
+    // With exploration, still one option per record.
+    let (buf, _) = selfplay_file(&SelfplayConfig { played_only: true, explore: 0.3, ..cfg });
+    assert!(parse_records(&buf).iter().all(|r| r.n == 1 && r.label == 0));
+}
+
+/// Number of blocks in a record file.
+fn blocks(buf: &[u8]) -> usize {
+    let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+    let u16_at = |p: usize| u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
+    let (mut p, mut k) = (24, 0);
+    while p < buf.len() {
+        let (nt, nr) = (u16_at(p + 5), u32_at(p + 7) as usize);
+        p += 11 + nt * TOKEN_DIM;
+        for _ in 0..nr {
+            let n = u16_at(p + 1);
+            p += 11 + STATE_DIM + n * ACTION_DIM + if buf[p] & 1 == 1 { 4 * n } else { 0 };
+        }
+        k += 1;
+    }
+    k
+}
+
+#[test]
 fn selfplay_q_labels_are_written() {
     let cfg = SelfplayConfig {
         bot: "heuristic".into(),
@@ -326,6 +389,7 @@ fn selfplay_q_labels_are_written() {
         infer: 0,
         q_max: 0,
         anchor: 0,
+        played_only: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -354,6 +418,7 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         infer: 3,
         q_max: 0,
         anchor: 0,
+        played_only: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -379,6 +444,7 @@ fn selfplay_adaptive_samples_run_and_are_deterministic() {
         infer: 0,
         q_max: 8,
         anchor: 0,
+        played_only: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -410,6 +476,7 @@ fn selfplay_anchored_labels_search_only_the_nets_top_options() {
         infer: 0,
         q_max: 0,
         anchor: 2,
+        played_only: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
