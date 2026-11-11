@@ -61,8 +61,9 @@ from train import TichuNet, write_tnet  # noqa: E402
 
 def read_played(path):
     """A `selfplay --played-only` file -> (states [N, S] u8, actions [N, A]
-    u8, margin [N] f32, dims). Vectorised per block: every record has one
-    option, no Q and no history tokens."""
+    u8, margin [N] f32, out_first [N] int64 (who went out first: 0 an
+    opponent, 1 this seat, 2 its partner), dims). Vectorised per block: every
+    record has one option, no Q and no history tokens."""
     buf = open(path, "rb").read()
     magic, version, fv, S, A, D = HEADER.unpack_from(buf, 0)
     if magic != b"TCHR" or version != FORMAT_VERSION:
@@ -79,11 +80,12 @@ def read_played(path):
         raise ValueError(f"{path}: truncated")
     rows = np.concatenate(parts) if parts else np.zeros((0, R), np.uint8)
     n_opts = rows[:, 1].astype(np.int64) | (rows[:, 2].astype(np.int64) << 8)
-    if not ((rows[:, 0] == 0).all() and (n_opts == 1).all()):
+    if not (((rows[:, 0] & 1) == 0).all() and (n_opts == 1).all()):
         raise ValueError(f"{path}: not a --played-only file (records with several options or Q)")
     margin = np.ascontiguousarray(rows[:, 7:11]).view("<f4").ravel().astype(np.float32)
     dims = dict(feature_version=fv, state_dim=S, action_dim=A, token_dim=D)
-    return rows[:, REC.size:REC.size + S], rows[:, REC.size + S:], margin, dims
+    out_first = ((rows[:, 0] >> 1) & 3).astype(np.int64)
+    return rows[:, REC.size:REC.size + S], rows[:, REC.size + S:], margin, out_first, dims
 
 
 def arch_of(sd):
@@ -115,16 +117,17 @@ class Buffer:
         self.s = torch.empty((cap, S), dtype=torch.uint8, device=dev)
         self.a = torch.empty((cap, A), dtype=torch.uint8, device=dev)
         self.y = torch.empty(cap, dtype=torch.float32, device=dev)
+        self.f = torch.empty(cap, dtype=torch.int64, device=dev)
 
-    def add(self, s, a, y):
+    def add(self, s, a, y, f):
         n = len(s)
         if n > self.cap:
-            s, a, y, n = s[-self.cap:], a[-self.cap:], y[-self.cap:], self.cap
+            s, a, y, f, n = s[-self.cap:], a[-self.cap:], y[-self.cap:], f[-self.cap:], self.cap
         dev = self.s.device
         T = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)  # noqa: E731
-        s, a, y = T(s), T(a), T(y)
+        s, a, y, f = T(s), T(a), T(y), T(f)
         first = min(n, self.cap - self.head)
-        for dst, src in ((self.s, s), (self.a, a), (self.y, y)):
+        for dst, src in ((self.s, s), (self.a, a), (self.y, y), (self.f, f)):
             dst[self.head:self.head + first] = src[:first]
             dst[:n - first] = src[first:]
         self.head = (self.head + n) % self.cap
@@ -132,19 +135,46 @@ class Buffer:
 
     def sample(self, n, gen):
         i = torch.randint(self.size, (n,), device=self.s.device, generator=gen)
-        return self.s[i], self.a[i], self.y[i]
+        return self.s[i], self.a[i], self.y[i], self.f[i]
 
 
 def q_and_values(model, s, a, dueling):
     """For each (state, option) row: Q, the policy head's output (the
     exported logit), the exported value and the trunk's value head, all in
-    --value-scale units. Dueling: Q = trunk value + policy head, so the head
-    only has to learn how options differ."""
+    --value-scale units, and the trunk's output. Dueling: Q = trunk value +
+    policy head, so the head only has to learn how options differ. (TichuNet's
+    forward without a GRU, keeping the trunk.)"""
     s = s.float() / 255.0
     a = a.float() / 255.0
-    v, adv, tv = model(s, a[:, None, :], s.new_zeros(len(s), 0, 0), torch.zeros(len(s), dtype=torch.long, device=s.device))
-    adv = adv[:, 0]
-    return (tv + adv if dueling else adv), adv, v, tv
+    h = model.forward_trunk(s, s.new_zeros(len(s), 0))
+    tv = model._head(model.value, h).squeeze(-1)
+    adv = model._head(model.policy, torch.cat([h, a], dim=-1)).squeeze(-1)
+    v = model.forward_value_net(s) if model.value_net is not None else tv
+    return (tv + adv if dueling else adv), adv, v, tv, h
+
+
+class FirstOut(torch.nn.Module):
+    """Who goes out first, from the trunk: logits for (an opponent, me, my
+    partner). For learning Tichu calls later; saved in learner.pt and
+    `*.first.pt`, not in the .tnet."""
+
+    def __init__(self, hidden, units=64):
+        super().__init__()
+        self.hidden, self.units = hidden, units
+        self.net = torch.nn.Sequential(torch.nn.Linear(hidden, units), torch.nn.ReLU(), torch.nn.Linear(units, 3))
+
+    def forward(self, h):
+        return self.net(h)
+
+
+def first_out_skill(logits, f):
+    """(log loss, base-rate log loss, P(me first) Brier score, its base rate)."""
+    ll = F.cross_entropy(logits, f).item()
+    freq = torch.bincount(f, minlength=3).float() / len(f)
+    base = -(freq * freq.clamp_min(1e-9).log()).sum().item()
+    p_me = logits.softmax(-1)[:, 1]
+    me = (f == 1).float()
+    return ll, base, ((p_me - me) ** 2).mean().item(), me.mean().item()
 
 
 def main():
@@ -162,6 +192,8 @@ def main():
     ap.add_argument("--wd", type=float, default=1e-4)
     ap.add_argument("--value-weight", type=float, default=0.25, help="weight of the state-value losses (exported value and trunk head)")
     ap.add_argument("--value-scale", type=float, default=100.0)
+    ap.add_argument("--first-weight", type=float, default=0.1,
+                    help="weight of the who-goes-out-first loss (a head on the trunk, for learning calls later)")
     ap.add_argument("--dueling", type=int, default=1,
                     help="1: Q = trunk value head + policy head (the head learns only how options differ); 0: Q = policy head")
     ap.add_argument("--init-tau", type=float, default=20.0,
@@ -222,19 +254,26 @@ def main():
     else:
         arch = dict(hidden=args.hidden, depth=args.depth, head=args.head, value_net=args.value_net, dueling=args.dueling)
     dims = resume["dims"] if resume is not None else None
-    model = opt = buf = None
+    model = opt = buf = first_head = None
 
     def build(dims_):
-        nonlocal model, opt, buf
+        nonlocal model, opt, buf, first_head
         model = TichuNet(dims_["state_dim"], dims_["action_dim"], arch["hidden"], arch["depth"], arch["head"],
                          dims_["token_dim"], 0, arch["value_net"]).to(dev)
         if resume is not None:
             model.load_state_dict(resume["model"])
         elif args.init:
             model.load_state_dict(init_sd)
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
-        if resume is not None:
+        first_head = FirstOut(arch["hidden"]).to(dev)
+        params = list(model.parameters()) + list(first_head.parameters())
+        opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.wd)
+        if resume is not None and "first" in resume:
+            first_head.load_state_dict(resume["first"])
             opt.load_state_dict(resume["opt"])
+        elif resume is not None:
+            # A learner.pt from before the first-out head: keep the model,
+            # start the head and the optimizer afresh.
+            say("learner.pt has no first-out head: starting it (and the optimizer) fresh")
         buf = Buffer(args.buffer, dims_["state_dim"], dims_["action_dim"], dev)
 
     st = resume["state"] if resume is not None else dict(chunk=0, steps=0, budget=0.0, records=0, example=None)
@@ -251,7 +290,7 @@ def main():
         with torch.no_grad():
             s = torch.tensor(ex["state"], dtype=torch.uint8, device=dev)[None]
             a = torch.tensor(ex["action"], dtype=torch.uint8, device=dev)[None]
-            _, adv, v, _ = q_and_values(model, s, a, arch["dueling"])
+            _, adv, v, _, _ = q_and_values(model, s, a, arch["dueling"])
         model.train()
         check = dict(state=ex["state"], actions=ex["action"], tokens=[],
                      value=float(v[0]) * args.value_scale, logits=[float(adv[0])])
@@ -266,28 +305,32 @@ def main():
 
     def save():
         tmp = state_path + ".part"
-        torch.save(dict(arch=arch, dims=dims, model=model.state_dict(), opt=opt.state_dict(), state=st), tmp)
+        torch.save(dict(arch=arch, dims=dims, model=model.state_dict(), first=first_head.state_dict(),
+                        opt=opt.state_dict(), state=st), tmp)
         os.replace(tmp, state_path)
         torch.save(model.state_dict(), os.path.join(d, "latest.pt"))
+        torch.save(dict(hidden=first_head.hidden, units=first_head.units, state=first_head.state_dict()),
+                   os.path.join(d, "latest.first.pt"))
 
     train_time = [0.0]
-    last_loss = [float("nan"), float("nan")]
+    last_loss = [float("nan"), float("nan"), float("nan")]
 
     def train_steps(n):
         t0 = time.time()
         model.train()
         for _ in range(n):
-            s, a, y = buf.sample(args.batch, gen)
-            q, _, v, tv = q_and_values(model, s, a, arch["dueling"])
+            s, a, y, f = buf.sample(args.batch, gen)
+            q, _, v, tv, h = q_and_values(model, s, a, arch["dueling"])
             ql = F.mse_loss(q, y)
             vl = F.mse_loss(tv, y) + (F.mse_loss(v, y) if model.value_net is not None else 0)
-            loss = ql + args.value_weight * vl
+            fl = F.cross_entropy(first_head(h), f)
+            loss = ql + args.value_weight * vl + args.first_weight * fl
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             st["steps"] += 1
             if st["steps"] % 50 == 0:
-                last_loss[:] = [ql.item(), vl.item()]
+                last_loss[:] = [ql.item(), vl.item(), fl.item()]
         train_time[0] += time.time() - t0
 
     def train_while(proc):
@@ -340,8 +383,8 @@ def main():
             chosen.append(f)
             loaded += (os.path.getsize(f) - HEADER.size) // (REC.size + dims["state_dim"] + dims["action_dim"])
         for f in reversed(chosen):
-            s, a, y, _ = read_played(f)
-            buf.add(s, a, y / args.value_scale)
+            s, a, y, fo, _ = read_played(f)
+            buf.add(s, a, y / args.value_scale, fo)
         say(f"buffer refilled from {len(chosen)} chunk files: {buf.size} records")
 
     for f in glob.glob(os.path.join(d, "*.part")):
@@ -368,7 +411,7 @@ def main():
         if rc != 0:
             raise SystemExit(f"selfplay for chunk {k} failed ({rc}); see {os.path.join(d, 'selfplay.txt')}")
         os.replace(chunk_path(k) + ".part", chunk_path(k))
-        s, a, y, dims_k = read_played(chunk_path(k))
+        s, a, y, fo, dims_k = read_played(chunk_path(k))
         if dims is None:
             dims = dims_k
             build(dims)
@@ -383,12 +426,15 @@ def main():
             sub = np.linspace(0, len(s) - 1, min(len(s), 200_000)).astype(np.int64)
             ss, aa = torch.from_numpy(s[sub]).to(dev), torch.from_numpy(a[sub]).to(dev)
             yy = torch.from_numpy(y[sub]).to(dev)
-            qs, vs = [], []
+            ff = torch.from_numpy(fo[sub]).to(dev)
+            qs, vs, fs = [], [], []
             for i in range(0, len(sub), 8192):
-                q_, _, v_, _ = q_and_values(model, ss[i:i + 8192], aa[i:i + 8192], arch["dueling"])
+                q_, _, v_, _, h_ = q_and_values(model, ss[i:i + 8192], aa[i:i + 8192], arch["dueling"])
                 qs.append(q_)
                 vs.append(v_)
-            q_, v_ = torch.cat(qs), torch.cat(vs)
+                fs.append(first_head(h_))
+            q_, v_, fl_ = torch.cat(qs), torch.cat(vs), torch.cat(fs)
+            f_ll, f_base, f_brier, f_rate = first_out_skill(fl_, ff)
             var = yy.var().item()
             q_r2 = 1 - F.mse_loss(q_, yy).item() / var
             v_r2 = 1 - F.mse_loss(v_, yy).item() / var
@@ -396,17 +442,20 @@ def main():
         model.train()
         i0 = len(s) // 2
         st["example"] = dict(state=s[i0].tolist(), action=a[i0].tolist())
-        buf.add(s, a, y)
+        buf.add(s, a, y, fo)
         st["records"] += len(s)
         st["budget"] += args.replay * len(s) / args.batch
         st["chunk"] = k + 1
         rounds_s = args.chunk_rounds / sp_secs
         say(f"chunk {k}: {len(s)} records ({rounds_s:.1f} rounds/s, actor {os.path.basename(actor)}); "
             f"fresh-data R² Q {q_r2:.3f}, value {v_r2:.3f}, sd(Q − V) {adv_sd:.1f} pts; "
-            f"margin sd {np.sqrt(var) * args.value_scale:.0f} pts; steps {st['steps']} "
-            f"(loss Q {last_loss[0]:.3f}, V {last_loss[1]:.3f}; {train_time[0]:.0f}s training); buffer {buf.size}")
+            f"margin sd {np.sqrt(var) * args.value_scale:.0f} pts; first out: log loss {f_ll:.3f} vs {f_base:.3f} "
+            f"base rate, P(me) Brier {f_brier:.3f} (I'm first {f_rate:.0%}); steps {st['steps']} "
+            f"(loss Q {last_loss[0]:.3f}, V {last_loss[1]:.3f}, first {last_loss[2]:.3f}; "
+            f"{train_time[0]:.0f}s training); buffer {buf.size}")
         jot(event="chunk", chunk=k, records=len(s), rounds_per_s=rounds_s, q_r2=q_r2, v_r2=v_r2, adv_sd=adv_sd,
-            steps=st["steps"], loss_q=last_loss[0], loss_v=last_loss[1], train_secs=train_time[0],
+            first_ll=f_ll, first_base_ll=f_base, first_brier=f_brier, first_rate=f_rate,
+            steps=st["steps"], loss_q=last_loss[0], loss_v=last_loss[1], loss_first=last_loss[2], train_secs=train_time[0],
             buffer=buf.size, elapsed=time.time() - run_t0)
         train_time[0] = 0.0
         # Old chunk files: only what a resume needs to refill the buffer.
@@ -424,6 +473,7 @@ def main():
             snap = os.path.join(d, f"snap{k:05d}.tnet")
             shutil.copyfile(actor_path(k), snap)
             shutil.copyfile(os.path.join(d, "latest.pt"), os.path.splitext(snap)[0] + ".pt")
+            shutil.copyfile(os.path.join(d, "latest.first.pt"), os.path.splitext(snap)[0] + ".first.pt")
             arena(k, snap)
         if k >= args.chunks:
             break

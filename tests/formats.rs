@@ -217,6 +217,7 @@ struct Rec {
     n: usize,
     label: usize,
     margin: f32,
+    flags: u8,
     q: Option<Vec<f32>>,
     bytes: Vec<u8>,
 }
@@ -257,7 +258,7 @@ fn parse_records(buf: &[u8]) -> Vec<Rec> {
             assert!(p <= buf.len(), "truncated record");
             let mut bytes = buf[start..p].to_vec();
             bytes.extend_from_slice(&tokens[..prefix * TOKEN_DIM]);
-            out.push(Rec { round, seat, n, label, margin, q, bytes });
+            out.push(Rec { round, seat, n, label, margin, flags, q, bytes });
         }
     }
     out
@@ -303,6 +304,21 @@ fn selfplay_records_parse_and_are_reproducible() {
             assert_eq!(b.margin, want);
         }
     }
+    // Who went out first: one seat per round, seen by its partner, not by
+    // the opponents; and the same for every record of a seat.
+    for round in 0..cfg.rounds as u32 {
+        let of = |seat: u8| recs.iter().find(|r| r.round == round && r.seat == seat).map(|r| r.flags & 6);
+        let firsts: Vec<u8> = (0..4).filter(|&s| of(s) == Some(selfplay::FLAG_OUT_FIRST)).collect();
+        assert!(firsts.len() <= 1, "round {round}: several seats out first");
+        if let Some(&f) = firsts.first() {
+            assert!(of((f + 2) % 4).is_none_or(|x| x == selfplay::FLAG_PARTNER_OUT_FIRST));
+            assert!(of((f + 1) % 4).is_none_or(|x| x == 0) && of((f + 3) % 4).is_none_or(|x| x == 0));
+        }
+        for r in recs.iter().filter(|r| r.round == round) {
+            assert_eq!(Some(r.flags & 6), of(r.seat));
+        }
+    }
+    assert!(recs.iter().any(|r| r.flags & 6 == selfplay::FLAG_OUT_FIRST));
     // Threads only change the order rounds are written in.
     let (four, _) = selfplay_file(&SelfplayConfig { threads: 4, ..cfg.clone() });
     let by_round = |recs: Vec<Rec>| {

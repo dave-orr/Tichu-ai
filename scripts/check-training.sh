@@ -45,7 +45,7 @@ if "$PY" -c "import torch" 2>/dev/null; then
   echo "train.py models (with and without a GRU) load and play in Rust"
   # Deep Monte Carlo: played-only self-play, the learner, export, arena, resume.
   ./target/release/tichu selfplay --out "$dir/played.bin" --rounds 4 --played-only --explore 0.2 --seed 3 --threads 2 2>/dev/null
-  "$PY" -c "import sys; sys.path.insert(0, 'train'); from dmc import read_played; s, a, y, d = read_played(sys.argv[1]); assert len(s) > 20 and s.shape[1] == 704 and a.shape[1] == 48 and abs(y).max() <= 800, (s.shape, a.shape)" "$dir/played.bin"
+  "$PY" -c "import sys; sys.path.insert(0, 'train'); from dmc import read_played; s, a, y, f, d = read_played(sys.argv[1]); assert set(f.tolist()) <= {0, 1, 2} and (f == 1).any() and len(s) > 20 and s.shape[1] == 704 and a.shape[1] == 48 and abs(y).max() <= 800, (s.shape, a.shape)" "$dir/played.bin"
   dmc=(train/dmc.py --dir "$dir/dmc" --chunk-rounds 12 --hidden 32 --head 16 --buffer 2000 --eval-every 2 --eval-rounds 4 --opponents random --threads 2 --device cpu)
   "$PY" "${dmc[@]}" --chunks 2 >/dev/null
   "$PY" "${dmc[@]}" --chunks 3 >/dev/null

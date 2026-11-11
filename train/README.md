@@ -269,6 +269,14 @@ python train/dmc.py --dir runs/dmc --init runs/v4/start.pt --chunks 200
   options should beat the state value. Every `--eval-every` chunks the export
   plays `--opponents` in the arena and is kept as `snapNNNNN.tnet`/`.pt`. Logs
   go to `log.txt` and `log.jsonl`.
+- **Who goes out first**: every record's flags say whether its seat (2) or
+  its partner (4) went out first (`tichu_data` reads them as `out_first`).
+  The learner trains a small head on the trunk to predict it (opponent / me /
+  partner, `--first-weight`), for learning Tichu calls once the card play is
+  good: call when P(me first) is high enough. It is saved in `learner.pt` and
+  `*.first.pt`, not in the `.tnet`, and logged per chunk as fresh-data log
+  loss against the base rate (in a 6k-round smoke run, 0.74 against 1.04 after
+  two chunks).
 - **Pause and resume**: stop it at any time (Ctrl+C, or kill python and tichu).
   Re-running the same command resumes from the last finished chunk
   (`learner.pt`) and refills the buffer from the chunk files it keeps on disk.

@@ -19,6 +19,7 @@ class Records:
     n_opts  [N] int64         candidates per record
     label   [N] int64         index of the label among its candidates
     margin  [N] float32       final round margin for the record's team
+    out_first [N] int8        who went out first: 1 this seat, 2 its partner, 0 an opponent
     q       [M] float32       per-candidate Q (NaN where the file has none)
     group   [N] int64         round id, unique across files (for splits)
     tokens  [T, D] uint8      history tokens, one sequence per seat per round
@@ -38,7 +39,7 @@ class Records:
         shift = lambda key: np.cumsum([0] + [len(p[key]) for p in parts[:-1]])  # noqa: E731
         self.act_off = np.concatenate([p["act_off"] + s for p, s in zip(parts, shift("actions"))])
         self.tok_off = np.concatenate([p["tok_off"] + s for p, s in zip(parts, shift("tokens"))])
-        for k in ("n_opts", "label", "margin", "q", "group", "tok_len"):
+        for k in ("n_opts", "label", "margin", "q", "group", "tok_len", "out_first"):
             setattr(self, k, np.concatenate([p[k] for p in parts]))
 
     def __len__(self):
@@ -89,6 +90,7 @@ def read_file(path, file_index=0):
         states=states, actions=actions, act_off=act_off, n_opts=n_opts, q=q, tokens=tokens,
         label=np.array([m[3] for m in meta], dtype=np.int64),
         margin=np.array([m[4] for m in meta], dtype=np.float32),
+        out_first=np.array([(m[1] >> 1) & 3 for m in meta], dtype=np.int8),
         group=np.array([m[0] for m in meta], dtype=np.int64) + (file_index << 32),
         tok_off=np.array([m[6] for m in meta], dtype=np.int64),
         tok_len=np.array([m[7] for m in meta], dtype=np.int64),

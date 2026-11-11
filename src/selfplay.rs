@@ -25,7 +25,8 @@
 //! ```text
 //! block:  u32 round id | u8 seat | u16 n tokens | u32 n records
 //!         n tokens × TOKEN_DIM bytes | records
-//! record: u8 flags (1 = has Q) | u16 n options | u16 label | u16 prefix
+//! record: u8 flags (1 = has Q, 2 = this seat went out first,
+//!                   4 = its partner did) | u16 n options | u16 label | u16 prefix
 //!         f32 margin (my team − theirs, round points)
 //!         STATE_DIM bytes | n × ACTION_DIM bytes | (has Q) n × f32 Q
 //! ```
@@ -118,7 +119,14 @@ struct Block {
     n_tokens: usize,
     recs: Vec<Rec>,
     margin: f32,
+    /// Record flag bits for who went out first (`FLAG_OUT_FIRST`, `FLAG_PARTNER_OUT_FIRST`).
+    out_flags: u8,
 }
+
+/// Record flag: the record's seat went out first.
+pub const FLAG_OUT_FIRST: u8 = 2;
+/// Record flag: the record's seat's partner went out first.
+pub const FLAG_PARTNER_OUT_FIRST: u8 = 4;
 
 /// Mean round margin for `view.seat`'s team after each option, over
 /// `samples` guessed deals, with `rollout` playing all four seats. With
@@ -470,7 +478,15 @@ impl Bot for Recorder {
         let n_tokens = if self.played_only { 0 } else { encode_history(view, &mut tokens) };
         assert!(self.recs.iter().all(|r| r.prefix <= n_tokens), "history isn't a prefix of the round's");
         let recs = std::mem::take(&mut self.recs);
-        self.out.borrow_mut().push(Block { seat: view.seat as u8, tokens, n_tokens, recs, margin });
+        let first = result.out_order[0];
+        let out_flags = if first == view.seat {
+            FLAG_OUT_FIRST
+        } else if first == (view.seat + 2) % 4 {
+            FLAG_PARTNER_OUT_FIRST
+        } else {
+            0
+        };
+        self.out.borrow_mut().push(Block { seat: view.seat as u8, tokens, n_tokens, recs, margin, out_flags });
     }
 }
 
@@ -581,7 +597,7 @@ fn write_block(buf: &mut Vec<u8>, round: u32, b: &Block) {
     buf.extend_from_slice(&(b.recs.len() as u32).to_le_bytes());
     buf.extend_from_slice(&b.tokens);
     for rec in &b.recs {
-        buf.push(rec.q.is_some() as u8);
+        buf.push(rec.q.is_some() as u8 | b.out_flags);
         buf.extend_from_slice(&(rec.cands.len() as u16).to_le_bytes());
         buf.extend_from_slice(&(rec.label as u16).to_le_bytes());
         buf.extend_from_slice(&(rec.prefix as u16).to_le_bytes());
