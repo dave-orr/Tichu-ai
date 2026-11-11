@@ -45,6 +45,12 @@ usage:
       --played-only   record only the option played (one-option records, no history
                       tokens): Deep Monte Carlo data for train/dmc.py
       --seed S, --threads T
+  tichu calllabel --out FILE [options]    Tichu / Grand Tichu call records for train/calls.py
+      --bot NAME      bot in all four seats and the rollouts (default h2)
+      --rounds N      rounds to play (default 1000)
+      --later-small P label each Small Tichu offer after a seat's first with probability P
+                      (default 0.25)
+      --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
 
@@ -217,6 +223,34 @@ fn main() {
                         println!("{s}");
                     }
                 }
+                Err(e) => {
+                    eprintln!("{out}: {e}");
+                    exit(1)
+                }
+            }
+        }
+        "calllabel" => {
+            let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());
+            let Some(out) = flag("out") else {
+                eprintln!("calllabel needs --out FILE");
+                exit(2);
+            };
+            let bot = flag("bot").unwrap_or_else(|| "h2".into());
+            let _ = factory(&bot);
+            let cfg = tichu_engine::calllabel::CallLabelConfig {
+                bot,
+                rounds: args.num("rounds").unwrap_or(1000),
+                seed,
+                threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
+                later_small: args.num("later-small").unwrap_or(0.25),
+            };
+            let file = std::fs::File::create(&out).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                exit(1)
+            });
+            let start = std::time::Instant::now();
+            match tichu_engine::calllabel::run(&cfg, &mut std::io::BufWriter::new(file)) {
+                Ok((g, s)) => println!("wrote {g} grand + {s} small records to {out} ({:.1}s)", start.elapsed().as_secs_f64()),
                 Err(e) => {
                     eprintln!("{out}: {e}");
                     exit(1)

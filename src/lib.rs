@@ -7,6 +7,7 @@
 //! - `arena`: seeded, duplicate, multithreaded head-to-head evaluation
 //! - `endgame`: exact solver for two-player endgames
 //! - `features`, `selfplay`: inputs for learned bots and training-data export
+//! - `calllabel`: counterfactual call/no-call records for learned calls
 //! - `trace`: JSON round traces (used to diff against the TS engine)
 //! - `llm`: language-model players and a resumable match runner
 //! - `replay`: game logs and the visual replay viewer
@@ -14,6 +15,7 @@
 pub mod arena;
 pub mod bot;
 pub mod bots;
+pub mod calllabel;
 pub mod combinations;
 pub mod deck;
 pub mod endgame;
