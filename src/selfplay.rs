@@ -305,7 +305,9 @@ impl Teacher {
         let argmax = |q: &[f32]| (0..q.len()).max_by(|&a, &b| q[a].total_cmp(&q[b])).unwrap();
         if self.exact_endgame {
             if let Some(q) = exact_q(view, plays, cands, ENDGAME_BUDGET, rng) {
-                return (argmax(&q), q);
+                let best = argmax(&q);
+                explain_exact(view, plays, cands, &q, best);
+                return (best, q);
             }
         }
         let Some(net) = &self.anchor else {
@@ -327,12 +329,154 @@ impl Teacher {
         let best = (0..sub.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
         let pick = if best != 0 && clearly_ahead(&rows, best, 0) { best } else { 0 };
         TeacherStats::record(&rows, &mean, best, pick);
+        explain_search(view, plays, cands, &logits, &order, &rows, &mean, pick);
         let mut q = vec![f32::NAN; cands.len()];
         for (j, &k) in order.iter().enumerate() {
             q[k] = mean[j] as f32;
         }
         (order[pick], q)
     }
+}
+
+thread_local! {
+    /// Decision notes, collected only while `explain_start` has switched
+    /// them on (`tichu arena --log`), for the replay viewer.
+    static EXPLAIN: RefCell<Option<Vec<serde_json::Value>>> = const { RefCell::new(None) };
+}
+
+/// Start collecting decision notes on this thread.
+pub fn explain_start() {
+    EXPLAIN.with(|e| *e.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop collecting decision notes on this thread.
+pub fn explain_stop() {
+    EXPLAIN.with(|e| *e.borrow_mut() = None);
+}
+
+/// The notes collected since the last call, as replay events
+/// (`{"type": "llm", ...}`, so the viewer shows them as reasoning).
+pub fn explain_take() -> Vec<serde_json::Value> {
+    EXPLAIN.with(|e| e.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default())
+}
+
+fn explaining() -> bool {
+    EXPLAIN.with(|e| e.borrow().is_some())
+}
+
+fn option_text(plays: &[Combo], o: Option<usize>) -> String {
+    match o {
+        None => "pass".into(),
+        Some(i) => crate::llm::render::describe(&plays[i]),
+    }
+}
+
+fn push_note(view: &PlayerView, menu: Vec<String>, answer: usize, reply: String) {
+    let menu: Vec<String> = menu.into_iter().enumerate().map(|(k, l)| format!("{}: {l}", k + 1)).collect();
+    let prompt = format!("Search bot decision for S{} ({} options shown)\nDECISION\n{}", view.seat, menu.len(), menu.join("\n"));
+    let ev = serde_json::json!({
+        "type": "llm", "seat": view.seat, "kind": "play",
+        "answer": answer + 1, "prompt": prompt, "reply": reply,
+    });
+    EXPLAIN.with(|e| {
+        if let Some(v) = e.borrow_mut().as_mut() {
+            v.push(ev);
+        }
+    });
+}
+
+fn explain_exact(view: &PlayerView, plays: &[Combo], cands: &Candidates, q: &[f32], best: usize) {
+    if !explaining() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..q.len()).collect();
+    order.sort_by(|&a, &b| q[b].total_cmp(&q[a]));
+    let menu: Vec<String> =
+        order.iter().map(|&k| format!("{}  exact {:+.0}", option_text(plays, cands.options[k]), q[k])).collect();
+    let pick = order.iter().position(|&k| k == best).unwrap();
+    let alts = order.iter().filter(|&&k| q[k] < q[best]).count();
+    let reply = format!(
+        "**Two-player endgame, solved exactly.** Best play is worth **{:+.0}** to my team's round margin. {}",
+        q[best],
+        if alts == 0 { "Every option is equally good here.".to_string() } else { format!("{alts} of the {} options do worse.", q.len()) }
+    );
+    push_note(view, menu, pick, reply);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn explain_search(
+    view: &PlayerView,
+    plays: &[Combo],
+    cands: &Candidates,
+    logits: &[f32],
+    order: &[usize],
+    rows: &[Vec<f64>],
+    mean: &[f64],
+    pick: usize,
+) {
+    if !explaining() {
+        return;
+    }
+    let mx = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let z: f32 = logits.iter().map(|l| (l - mx).exp()).sum();
+    let prob = |k: usize| 100.0 * (logits[k] - mx).exp() / z;
+    let m = rows.len().max(1) as f64;
+    // Each option against the net's top choice, paired by guessed deal.
+    let vs_top = |j: usize| -> (f64, f64) {
+        let d: Vec<f64> = rows.iter().map(|r| r[j] - r[0]).collect();
+        let dm = d.iter().sum::<f64>() / m;
+        let var = if m > 1.0 { d.iter().map(|x| (x - dm) * (x - dm)).sum::<f64>() / (m - 1.0) } else { 0.0 };
+        (dm, (var / m).sqrt())
+    };
+    let mut menu = Vec::new();
+    for (j, &k) in order.iter().enumerate() {
+        let tail = if j == 0 {
+            String::new()
+        } else {
+            let (d, se) = vs_top(j);
+            format!(", {d:+.1} ± {:.1} vs net's pick", 2.0 * se)
+        };
+        menu.push(format!("{}  net {:.0}%, search {:+.1}{tail}", option_text(plays, cands.options[k]), prob(k), mean[j]));
+    }
+    let rest: Vec<usize> = (0..cands.len()).filter(|k| !order.contains(k)).collect();
+    for &k in rest.iter().take(5) {
+        menu.push(format!("{}  net {:.0}% (not searched)", option_text(plays, cands.options[k]), prob(k)));
+    }
+    if rest.len() > 5 {
+        menu.push(format!("... {} more options, net {:.0}% together", rest.len() - 5, rest[5..].iter().map(|&k| prob(k)).sum::<f32>()));
+    }
+    let top = order[0];
+    let reply = if pick == 0 {
+        let best = (0..mean.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
+        let why = if best == 0 {
+            "The search agrees".to_string()
+        } else {
+            let (d, se) = vs_top(best);
+            format!(
+                "The search rated **{}** {d:+.1} better, but that's within the noise (± {:.1}), so it keeps the net's move",
+                option_text(plays, cands.options[order[best]]),
+                2.0 * se
+            )
+        };
+        format!(
+            "The net's choice: **{}** ({:.0}%). {why}. {} guessed deals, {} options searched.",
+            option_text(plays, cands.options[top]),
+            prob(top),
+            rows.len(),
+            order.len()
+        )
+    } else {
+        let (d, se) = vs_top(pick);
+        format!(
+            "**Search overrides the net.** The net preferred **{}** ({:.0}%), but **{}** came out {d:+.1} ± {:.1} points better over {} guessed deals.",
+            option_text(plays, cands.options[top]),
+            prob(top),
+            option_text(plays, cands.options[order[pick]]),
+            2.0 * se,
+            rows.len()
+        )
+    };
+    push_note(view, menu, pick, reply);
 }
 
 /// Whether the best option's lead over the runner-up, paired by deal, is

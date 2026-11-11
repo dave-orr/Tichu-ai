@@ -134,7 +134,11 @@ with the options it was offered and the full prompt.
 Game logs come from:
 
 - `tichu arena A B --log DIR [--log-deals N]` (round mode): the first N
-  deals (default 20), both seatings, in `DIR/deal-NNNN.json`.
+  deals (default 20), both seatings, in `DIR/deal-NNNN.json`. Search players
+  (`search:`, `labelN/...:net:`) add a note for each play decision: the
+  net's probability and the searched value of each option, whether the
+  search overrode the net, and exact values in solved two-player endgames.
+  The viewer shows these as reasoning.
 - `examples/llm_match.rs`: `games/deal-NNNN.json` in the match directory
   (Claude's games and the baseline bot's).
 
