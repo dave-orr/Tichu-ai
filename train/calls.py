@@ -21,7 +21,7 @@ MODEL_VERSION = 1
 
 
 def read_records(paths):
-    feats, kinds, rounds, heur, res, round_res = [], [], [], [], [], []
+    feats, kinds, rounds, heur, res, round_res, ctx, has_ctx = [], [], [], [], [], [], [], []
     dims = None
     for k, path in enumerate(paths):
         data = open(path, "rb").read()
@@ -30,8 +30,10 @@ def read_records(paths):
         if dims is None:
             dims = (fv, sd, ed)
         assert dims == (fv, sd, ed), f"{path}: feature layout differs"
-        rec = 1 + 4 + 1 + 1 + 8 + sd + ed
+        nres = 6 if fmt >= 2 else 4
+        rec = 1 + 4 + 1 + 1 + 2 * nres + sd + ed
         p = 20
+        start = len(kinds)
         n = len(data)
         buf = np.frombuffer(data, dtype=np.uint8)
         while p < n:
@@ -44,9 +46,14 @@ def read_records(paths):
             kinds.append(kind)
             rounds.append(rid)
             heur.append(data[p + 6])
-            res.append(struct.unpack_from("<4h", data, p + 7))
-            feats.append(buf[p + 15 : p + rec])
+            r = struct.unpack_from(f"<{nres}h", data, p + 7)
+            res.append(r[:4])
+            ctx.append(r[4:6] if nres == 6 else (0, 0))
+            feats.append(buf[p + 7 + 2 * nres : p + rec])
             p += rec
+        # Files played from 0-0 get game scores attached in training.
+        scored = any(c != (0, 0) for c in ctx[start:])
+        has_ctx.extend([scored] * (len(kinds) - start))
     return dict(
         dims=dims,
         x=np.stack(feats),
@@ -55,6 +62,8 @@ def read_records(paths):
         heur=np.array(heur, np.int8),
         res=np.array(res, np.int32),  # mine/theirs without, mine/theirs with
         rounds=np.array(round_res, np.int32),
+        ctx=np.array(ctx, np.int32).reshape(-1, 2),
+        has_ctx=np.array(has_ctx, bool),
     )
 
 
@@ -145,6 +154,7 @@ def main():
     ap.add_argument("--val", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--write-states", help="write sampled game states (for calllabel --scores) and exit")
     args = ap.parse_args()
 
     import torch
@@ -157,7 +167,8 @@ def main():
     d = read_records(args.data)
     fv, sd, ed = d["dims"]
     n = len(d["kind"])
-    print(f"{n} records ({(d['kind'] == 0).sum()} grand, {(d['kind'] == 1).sum()} small), "
+    print(f"{n} records ({(d['kind'] == 0).sum()} grand, {(d['kind'] == 1).sum()} small, "
+          f"{d['has_ctx'].sum()} played at game scores), "
           f"{len(d['rounds'])} rounds, {time.time() - t0:.1f}s")
 
     win = WinTable(d["rounds"])
@@ -165,9 +176,18 @@ def main():
     print(f"win table: P(win | 0-0) {100 * win.value_after(np.array([0]), np.array([0]))[0]:.1f}%, "
           f"{len(states)} game states, {time.time() - t0:.1f}s")
 
-    def contexts(m):
+    if args.write_states:
+        with open(args.write_states, "w") as f:
+            for u, t in states[rng.permutation(len(states))[:50000]]:
+                f.write(f"{u} {t}\n")
+        print(f"wrote {args.write_states}")
+        return
+
+    def contexts(m, idx):
         c = states[rng.integers(len(states), size=m)]
         c[rng.random(m) < args.zero_frac] = 0
+        fixed = d["has_ctx"][idx]
+        c[fixed] = d["ctx"][idx][fixed]
         return c
 
     # Hold out whole rounds.
@@ -180,7 +200,7 @@ def main():
     kind = torch.tensor(d["kind"].astype(np.int64), device=dev)
     res = d["res"]
     # Fixed validation contexts (and 0-0) for comparable numbers.
-    va_ctx = contexts(len(va))
+    va_ctx = contexts(len(va), va)
     va_y = labels(win, res[va], va_ctx)
     va_y0 = labels(win, res[va], np.zeros((len(va), 2), int))
 
@@ -252,7 +272,7 @@ def main():
         tot = 0.0
         for i in range(0, len(perm), args.batch):
             idx = perm[i : i + args.batch]
-            ctx = contexts(len(idx))
+            ctx = contexts(len(idx), idx)
             y = torch.tensor(labels(win, res[idx], ctx), dtype=torch.float32, device=dev)
             loss = ((model(inputs(idx, ctx), kind[idx]) - y) ** 2).mean()
             opt.zero_grad()

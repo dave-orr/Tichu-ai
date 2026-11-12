@@ -13,8 +13,11 @@
 //! - Small Tichu: "call now" against "never call this round".
 //!
 //! The main round goes on with `bot`'s own decisions, so the decision states
-//! come from ordinary play. Rounds start at 0-0; `train/calls.py` attaches
-//! game scores afterwards (play doesn't depend on the score).
+//! come from ordinary play. Rounds start at 0-0, and `train/calls.py`
+//! attaches game scores afterwards (card play doesn't depend on the score),
+//! unless `scores` gives game scores to start rounds from. Use those when
+//! the bots' calls depend on the score (e.g. `callnet:` bots), so the other
+//! seats' calls in the rollouts fit the score.
 //!
 //! File layout (little endian): a 20-byte header (`b"TCAL"`, format
 //! version, `FEATURE_VERSION`, `STATE_DIM`, `CALL_EXTRA_DIM`, u32 each),
@@ -25,7 +28,9 @@
 //! kind 2:    i16 team 0 total | i16 team 1 total     (the main round)
 //! kind 0, 1: u8 heuristic (0 = undecided, 1 = no, 2 = call)
 //!            i16 mine, theirs without the call | i16 mine, theirs with it
-//!            STATE_DIM + CALL_EXTRA_DIM feature bytes
+//!            i16 my team's game score, theirs (before the round)
+//!            STATE_DIM + CALL_EXTRA_DIM feature bytes (encoded at 0-0;
+//!            the score goes to the model separately)
 //! ```
 
 use std::cell::RefCell;
@@ -47,7 +52,7 @@ use crate::sim::{play_dealt_round, play_from};
 use crate::types::*;
 use crate::view::PlayerView;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 pub const CALL_EXTRA_DIM: usize = 32;
 /// Inputs of a call model: state bytes, extra bytes (each / 255), then
 /// is-Grand, my score / 1000, theirs / 1000.
@@ -133,6 +138,9 @@ pub struct CallLabelConfig {
     /// Chance of labelling each Small Tichu offer after the first one a
     /// seat gets (later offers are many and alike).
     pub later_small: f64,
+    /// Game scores (team 0, team 1) to start rounds from, one picked at
+    /// random per round. Empty = 0-0.
+    pub scores: Vec<[i32; 2]>,
 }
 
 struct Recorder {
@@ -168,11 +176,15 @@ impl Recorder {
         out.extend_from_slice(&self.round.to_le_bytes());
         out.push(view.seat as u8);
         out.push(heuristic);
-        for v in [without[0], without[1], with[0], with[1]] {
+        let team = view.my_team();
+        let score = [view.scores[team] as i16, view.scores[1 - team] as i16];
+        for v in [without[0], without[1], with[0], with[1], score[0], score[1]] {
             out.extend_from_slice(&v.to_le_bytes());
         }
-        encode_state(view, &mut out);
-        encode_call_extra(view, &mut out);
+        let mut v0 = view.clone();
+        v0.scores = [0, 0];
+        encode_state(&v0, &mut out);
+        encode_call_extra(&v0, &mut out);
     }
 }
 
@@ -289,6 +301,9 @@ pub fn run(cfg: &CallLabelConfig, w: &mut impl Write) -> std::io::Result<(usize,
                     });
                     let mut rng = StdRng::seed_from_u64(seed);
                     let mut state = GameState::new(Settings { clockwise: rng.gen_bool(0.5), ..Settings::default() });
+                    if !cfg.scores.is_empty() {
+                        state.scores = cfg.scores[rng.gen_range(0..cfg.scores.len())];
+                    }
                     state.start_round(shuffled_deck(&mut rng));
                     let mut buf = vec![];
                     if let Ok(r) = play_dealt_round(&mut state, &mut bots, None) {
@@ -307,7 +322,7 @@ pub fn run(cfg: &CallLabelConfig, w: &mut impl Write) -> std::io::Result<(usize,
             });
         }
         drop(tx);
-        let rec = 1 + 4 + 1 + 1 + 8 + STATE_DIM + CALL_EXTRA_DIM;
+        let rec = 1 + 4 + 1 + 1 + 12 + STATE_DIM + CALL_EXTRA_DIM;
         let mut rounds = 0;
         for buf in rx {
             // Count records by walking the buffer.

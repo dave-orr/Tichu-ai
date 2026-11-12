@@ -50,6 +50,8 @@ usage:
       --rounds N      rounds to play (default 1000)
       --later-small P label each Small Tichu offer after a seat's first with probability P
                       (default 0.25)
+      --scores FILE   start each round from a game score drawn from FILE (lines
+                      'team0 team1'; train/calls.py --write-states makes one)
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -243,6 +245,20 @@ fn main() {
                 seed,
                 threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
                 later_small: args.num("later-small").unwrap_or(0.25),
+                scores: match flag("scores") {
+                    None => vec![],
+                    Some(path) => std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("{path}: {e}");
+                            exit(1)
+                        })
+                        .lines()
+                        .filter_map(|l| {
+                            let mut it = l.split_whitespace().map(|x| x.parse::<i32>());
+                            Some([it.next()?.ok()?, it.next()?.ok()?])
+                        })
+                        .collect(),
+                },
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");
