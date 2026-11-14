@@ -95,8 +95,12 @@ rounds reach one, and the median solve takes 0.3 ms.
 The real server is asynchronous. The simulator turns that into fixed decision
 points:
 
-- Grand Tichu and passing are simultaneous. Every seat decides from a view
-  taken before anyone's choice is applied.
+- Grand Tichu is asked one seat at a time, starting from a seat that
+  depends on the deal, and each answer is applied before the next seat is
+  asked. A later seat sees an earlier Grand call, as on the real server,
+  where somebody always decides first.
+- Passing is simultaneous. Every seat decides from a view taken before
+  anyone's choice is applied.
 - Small Tichu is offered to all four seats when play begins, then before
   each of a seat's own turns while it's still allowed.
 - Bombs are offered after every play or bomb (to the other active seats, in

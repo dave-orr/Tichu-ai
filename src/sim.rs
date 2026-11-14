@@ -5,8 +5,11 @@
 //! that holds a beating bomb is asked (in play order), and again during the
 //! trick countdown, when the trick winner is asked too. Small Tichu is offered
 //! to all four seats when play begins, then before each of a seat's turns.
-//! Grand Tichu and passing are simultaneous: every seat decides from a view
-//! taken before anyone's choice is applied.
+//! Grand Tichu is asked one seat at a time, starting from a seat that
+//! depends on the deal, and each answer is applied before the next seat is
+//! asked, so a later seat sees an earlier Grand call (as on the real
+//! server, where somebody always decides first). Passing is simultaneous:
+//! every seat decides from a view taken before anyone's choice is applied.
 
 use rand::Rng;
 
@@ -121,6 +124,13 @@ fn bomb_round(
     }
 }
 
+/// The seat asked first about Grand Tichu: a function of the deal, so it
+/// varies from round to round but is the same in both duplicate seatings.
+pub fn grand_order_start(state: &GameState) -> Seat {
+    let h: usize = state.players.iter().flat_map(|p| p.hand.iter()).enumerate().map(|(i, c)| (i + 1) * c.index()).sum();
+    h % 4
+}
+
 /// Play the round already dealt in `state` to completion.
 pub fn play_dealt_round(
     state: &mut GameState,
@@ -143,9 +153,11 @@ pub fn play_from(
     for _step in 0..5000 {
         match state.pending() {
             Pending::GrandTichu(seats) => {
-                let calls: Vec<(Seat, bool)> =
-                    seats.iter().map(|&s| (s, ask(bots, s, state).grand_tichu(&state.view(s)))).collect();
-                for (seat, call) in calls {
+                let first = grand_order_start(state);
+                let mut order = seats.clone();
+                order.sort_by_key(|&s| (s + 4 - first) % 4);
+                for seat in order {
+                    let call = ask(bots, seat, state).grand_tichu(&state.view(seat));
                     apply(state, Action::GrandTichu { seat, call }, &mut obs)?;
                 }
             }
