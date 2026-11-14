@@ -306,6 +306,24 @@ falls from 65 to 48 points:
 Both are still below the start net after 80k rounds. DouZero needed far more
 games than this.
 
+### dmc1: overnight run (Nov 2026)
+
+95 chunks (1.9M rounds, 71M records, 9.5 h) from `runs/v4/start`, `--lr
+5e-5`, everything else default. Every 5 chunks, 1000 deals each:
+
+| chunk | 5 | 15 | 25 | 35 | 45 | 55 | 65 | 75 | 85 | 95 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| vs start net | −11.2 | −14.4 | −10.1 | −8.2 | −11.8 | −8.4 | −7.3 | −5.6 | −9.1 | −1.4 |
+| vs h2 | +51.9 | +54.0 | +57.1 | +54.2 | +49.9 | +58.8 | +55.1 | +63.0 | +60.7 | +58.6 |
+
+(± about 6 vs the start net and 7 vs h2.) The final net over 4000 deals, seed
+777: **+2.1 ± 3.1 vs the start net, +8.4 ± 3.1 vs v3 gen2** (the start net
+was +7.7 vs gen2). So search-free training climbed back from the warm start's
+early drop to level with the best search-trained net, and was still rising
+slowly when it stopped. Fresh-data R² of Q rose to 0.52, above the state
+value's 0.51, and the first-out head reached log loss 0.48 against 1.03 for
+the base rate.
+
 ## Running the loop
 
 ```sh
