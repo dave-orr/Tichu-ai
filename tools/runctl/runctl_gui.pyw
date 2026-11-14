@@ -7,6 +7,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import messagebox, ttk
 
@@ -243,8 +244,12 @@ class App:
             m.add_command(label=label, command=lambda c=choice: self.pause_all(c))
         pa["menu"] = m
         pa.pack(side="right")
-        self.msg = ttk.Label(root, text="", foreground="#cf222e", padding=(10, 0))
-        self.msg.pack(fill="x")
+        self.errbar = ttk.Frame(root, padding=(10, 0))
+        self.errbar.pack(fill="x")
+        self.msg = ttk.Label(self.errbar, text="", foreground="#cf222e", wraplength=600, justify="left")
+        self.msg.pack(side="left", fill="x", expand=True)
+        self.copy_btn = ttk.Button(self.errbar, text="Copy error", command=self.copy_error)
+        self.err_detail = ""
 
         # scrollable list
         outer = ttk.Frame(root)
@@ -278,15 +283,31 @@ class App:
         self.task_sig = None
         self.refresh()
 
+    def show_error(self, text, detail=None):
+        """Show (or with text="" clear) the red message line; detail is what Copy error copies."""
+        self.msg.config(text=text)
+        self.err_from_refresh = False
+        self.err_detail = (detail or text) if text else ""
+        if text:
+            self.copy_btn.pack(side="right")
+        else:
+            self.copy_btn.pack_forget()
+
+    def copy_error(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.err_detail)
+        self.copy_btn.config(text="Copied")
+        self.root.after(1500, lambda: self.copy_btn.config(text="Copy error"))
+
     def act(self, fn):
         try:
             fn()
-            self.msg.config(text="")
+            self.show_error("")
         except SystemExit as e:
-            self.msg.config(text=str(e))
+            self.show_error(str(e))
         except Exception as e:
-            self.msg.config(text=f"{type(e).__name__}: {e}")
-        self.refresh(reschedule=False)
+            self.show_error(f"{type(e).__name__}: {e}", traceback.format_exc())
+        self.refresh(reschedule=False, keep_error=True)
 
     def set_hold(self):
         st = runctl.load_state()
@@ -308,7 +329,8 @@ class App:
         except (OSError, TypeError):
             return False
 
-    def refresh(self, reschedule=True):
+    def refresh(self, reschedule=True, keep_error=False):
+        errors = []
         try:
             runctl.tick()
             gs, st = runctl.status()
@@ -338,11 +360,19 @@ class App:
                 if prev and g["procs"] and now > prev[1]:
                     pct = max(0.0, (cpu_s - prev[0]) / (now - prev[1]) / NCPU * 100)
                 self.prev_cpu[g["key"]] = (cpu_s, now)
-                self.rows[g["key"]].update(g, pct)
+                try:  # one bad row mustn't blank the others
+                    self.rows[g["key"]].update(g, pct)
+                except Exception as e:
+                    errors.append((f"{g['name']}: {type(e).__name__}: {e}", traceback.format_exc()))
             self.update_sysinfo()
             self.update_tasks()
         except Exception as e:
-            self.msg.config(text=f"refresh failed: {type(e).__name__}: {e}")
+            errors.append((f"refresh failed: {type(e).__name__}: {e}", traceback.format_exc()))
+        if errors:
+            self.show_error("  |  ".join(t for t, _ in errors), "\n\n".join(d for _, d in errors))
+            self.err_from_refresh = True
+        elif not keep_error and getattr(self, "err_from_refresh", False):
+            self.show_error("")
         if reschedule:
             self.root.after(REFRESH_MS, self.refresh)
 
@@ -386,7 +416,7 @@ class App:
     def toggle_task(self, name, enable):
         r = subprocess.run(["schtasks", "/change", "/tn", name, "/enable" if enable else "/disable"],
                            capture_output=True, text=True, creationflags=NO_WINDOW)
-        self.msg.config(text="" if r.returncode == 0 else (r.stderr or r.stdout).strip())
+        self.show_error("" if r.returncode == 0 else (r.stderr or r.stdout).strip())
         self.tasks.kick.set()
 
 

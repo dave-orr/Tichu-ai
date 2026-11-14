@@ -273,6 +273,8 @@ def _parent(procs, p):
 
 
 def _mentions(cmd, d):
+    if not d or not cmd:
+        return False
     c = cmd.replace("/", "\\").lower()
     dl = norm(d).lower()
     if dl in c:
@@ -301,11 +303,11 @@ def groups(procs=None, cfg=None):
         trees.setdefault(r["pid"], []).append(p)
     runs = known_runs(cfg)
     out = [dict(key=norm(d), name=n, dir=d, procs=[]) for n, d in runs]
-    by_key = {g["key"]: g for g in out}
+    known = list(out)  # only real run dirs; "other" groups appended below have no dir to match
     for rootpid, members in sorted(trees.items()):
         members.sort(key=lambda p: p["ctime"])
         hit = None
-        for g in out:
+        for g in known:
             if any(_mentions(p["cmd"], g["dir"]) for p in members):
                 hit = g
                 break
