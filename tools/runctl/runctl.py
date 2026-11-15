@@ -272,6 +272,28 @@ def _parent(procs, p):
     return q
 
 
+def _dir_forms(d):
+    """Ways a command line can spell run dir d: absolute, and runs\<name> for dirs under runs."""
+    dl = norm(d).lower()
+    parent, name = os.path.split(dl)
+    forms = [re.escape(dl)]
+    if os.path.basename(parent) == "runs":
+        forms.append(r"(?<![\w\\.:-])runs\\" + re.escape(name))
+    return "(?:" + "|".join(forms) + ")"
+
+
+def _owns(cmd, d):
+    """True if cmd is d's launcher, d's run.cmd, or a job with --dir d."""
+    if not d or not cmd:
+        return False
+    c = cmd.replace("/", "\\").lower()
+    p = _dir_forms(d)
+    end = r"\\?\"?(?=$|\s)"
+    return bool(re.search(p + r"\\run\.cmd\b", c)
+                or re.search(r"runctl\.py\"?\s+launch\s+\"?" + p + end, c)
+                or re.search(r"--dir[\s=]+\"?" + p + end, c))
+
+
 def _mentions(cmd, d):
     if not d or not cmd:
         return False
@@ -306,11 +328,12 @@ def groups(procs=None, cfg=None):
     known = list(out)  # only real run dirs; "other" groups appended below have no dir to match
     for rootpid, members in sorted(trees.items()):
         members.sort(key=lambda p: p["ctime"])
-        hit = None
-        for g in known:
-            if any(_mentions(p["cmd"], g["dir"]) for p in members):
-                hit = g
-                break
+        # A run is identified by its launcher, run.cmd or --dir; the oldest process decides.
+        # Only if none says so, any mention of a run dir counts (a command line can also mention
+        # other runs' files, e.g. v4's iterate.py reads runs3\gen1.bin).
+        hit = next((g for p in members for g in known if _owns(p["cmd"], g["dir"])), None)
+        if hit is None:
+            hit = next((g for p in members for g in known if _mentions(p["cmd"], g["dir"])), None)
         if hit is not None:
             hit["procs"].extend(members)
         else:
