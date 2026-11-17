@@ -324,6 +324,13 @@ slowly when it stopped. Fresh-data R² of Q rose to 0.52, above the state
 value's 0.51, and the first-out head reached log loss 0.48 against 1.03 for
 the base rate.
 
+Extended to 190 chunks (3.8M rounds, 143M records): every 1000-deal check
+from chunk 95 on stayed between −6.9 and +3.6 vs the start net. Final net,
+4000 deals, seed 777: **+0.3 ± 3.0 vs the start net, +8.8 ± 3.0 vs v3 gen2,
++2.9 ± 2.8 vs its own chunk-95 snapshot**. Fresh-data R² stayed at 0.52. So
+at this net size and settings DMC plateaus at the level of the best
+search-trained net: it reaches it without search, but doesn't pass it.
+
 ## Running the loop
 
 ```sh
