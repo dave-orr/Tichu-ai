@@ -306,6 +306,65 @@ falls from 65 to 48 points:
 Both are still below the start net after 80k rounds. DouZero needed far more
 games than this.
 
+## Learned Tichu and Grand Tichu calls
+
+`tichu calllabel` and `train/calls.py` learn the calls instead of the v2
+rules in `src/bots/calls.rs`.
+
+```sh
+tichu calllabel --bot net:runs/v4/start.tnet --rounds 5000 --out calls.bin
+python train/calls.py --data calls.bin --out calls.tcall
+tichu arena callnet:calls.tcall:net:runs/v4/start.tnet net:runs/v4/start.tnet --games 600
+```
+
+- **Labels.** At every call decision (each seat's Grand, and every Small
+  offer while a seat may still call) the labeller plays the deal out twice
+  from that exact state, with the call and without it, with the same bots.
+  The difference is what the call was worth in that deal. Rollouts see the
+  real hands; the record holds only the seat's view. Grand compares "Grand"
+  against "no Grand, then the bot's own Small policy"; Small compares "call
+  now" against "never this round". About 9 decisions per round, so a label
+  round costs ~19 rounds of play (5000 rounds ≈ 20–30 min on 12 threads).
+- **Win chance, not points.** `calls.py` builds P(win | game score) from the
+  recorded rounds and labels each call by how much it changed my team's
+  chance of winning the game (percentage points). Rounds played at 0-0 get a
+  realistic game score attached at random each epoch. With `--scores FILE`
+  (`calls.py --write-states FILE` makes one) rounds start from game scores
+  instead, which is needed when the bots' calls depend on the score.
+- **Model.** One MLP: a shared trunk and a Grand head and a Small head. Inputs
+  are the 704 state bytes, 32 call features (the v2 winners/losers count,
+  which v2 Grand rule applies, hand shape, the wish against my hand: do I
+  hold the wished rank, would it break a bomb or long combination), is-Grand,
+  and both scores / 1000. `calls.py` also prints an offline check on held-out
+  rounds: the mean win-chance gain per decision of the model's calls, of the
+  v2 rules' calls, and of hindsight.
+- **Bot.** `callnet[@T][~F]:PATH:BOT` calls when the predicted gain is above T
+  points (default 0). `~g` / `~s` use the model for only Grand / only Small,
+  so two models can be stacked:
+  `callnet~g:A.tcall:callnet~s:B.tcall:BOT`.
+- **Simulator change.** The simulator used to ask all four seats about Grand
+  at once, so partners never saw each other's call and an aggressive model
+  often doubled up. It now asks one seat at a time (from a seat that depends
+  on the deal), as on the real server, where somebody always decides first.
+
+Runs (Nov 2026; models in runs/calls1..3 on the desktop, not in git; net:runs/v4/start.tnet play on both sides, against the v2
+calls; full games are 600 duplicate pairs, about ±3%):
+
+| model | labels | at 0-0 (2000 deals) | full games |
+|---|---|---|---|
+| m1 Small only | calls1: 40k rounds at 0-0, v2 calls elsewhere | +4.2 ± 3.1 | 52.5% |
+| m1 | same | +4.2 ± 4.5 | 47.1% (old sim), 53.3% |
+| m2 | + calls2: 40k rounds at game scores, m1 in all seats | | 52.8% |
+| m3 | calls3: 40k rounds, game scores, m2 in all seats, Grand one at a time | | 54.2% |
+| m3 Grand + m1 Small | (stacked) | | 56.1% (600), 56.1% ± 1.8 on 1500 fresh games |
+
+The learned calls are far more aggressive than v2 (Tichu success 40–60%
+against v2's 65%, Grand ~54% against 63%), especially when behind, and they
+lose points per round while winning more games. Labels are one deal each and
+noisy (R² 0.02–0.05), so more labelling should still help, and labels should
+be redone when card play improves (they measure a call's worth given how
+these bots play).
+
 ## Running the loop
 
 ```sh
