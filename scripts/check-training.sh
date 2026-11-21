@@ -23,8 +23,9 @@ from tichu_data import Records
 
 label, q = sys.argv[1:3]
 r = Records([label, q])
-assert (r.state_dim, r.action_dim) == (560, 40), (r.state_dim, r.action_dim)
+assert (r.state_dim, r.action_dim, r.token_dim) == (704, 48, 48), (r.state_dim, r.action_dim, r.token_dim)
 assert len(r) > 400, len(r)
+assert (r.tok_off + r.tok_len <= len(r.tokens)).all() and (r.tok_len > 0).mean() > 0.9
 assert (r.n_opts >= 2).all() and (r.label < r.n_opts).all() and (r.label >= 0).all()
 assert r.act_off[-1] + r.n_opts[-1] == len(r.actions)
 assert np.isnan(r.q[: int(Records([label]).n_opts.sum())]).all(), "label-only file has Q"
@@ -35,10 +36,23 @@ print(f"tichu_data: {len(r)} records read")
 PYEOF
 
 if "$PY" -c "import torch" 2>/dev/null; then
-  "$PY" train/train.py "$dir/label.bin" "$dir/q.bin" --out "$dir/m.tnet" --hidden 32 --head 16 --epochs 1 --device cpu >/dev/null
-  ./target/release/tichu arena "net:$dir/m.tnet" random --rounds 6 --threads 2 | grep -q "margin per deal"
-  ./target/release/tichu arena "vpimc2:$dir/m.tnet" heuristic --rounds 2 --threads 2 | grep -q "margin per deal"
-  echo "train.py model loads and plays in Rust"
+  # With the GRU over history tokens, and without.
+  for seq in 8 0; do
+    "$PY" train/train.py "$dir/label.bin" "$dir/q.bin" --out "$dir/m.tnet" --hidden 32 --head 16 --seq-hidden $seq --epochs 1 --device cpu >/dev/null
+    ./target/release/tichu arena "net:$dir/m.tnet" random --rounds 6 --threads 2 | grep -q "margin per deal"
+    ./target/release/tichu arena "vpimc2:$dir/m.tnet" heuristic --rounds 2 --threads 2 | grep -q "margin per deal"
+  done
+  echo "train.py models (with and without a GRU) load and play in Rust"
+  # Deep Monte Carlo: played-only self-play, the learner, export, arena, resume.
+  ./target/release/tichu selfplay --out "$dir/played.bin" --rounds 4 --played-only --explore 0.2 --seed 3 --threads 2 2>/dev/null
+  "$PY" -c "import sys; sys.path.insert(0, 'train'); from dmc import read_played; s, a, y, f, d = read_played(sys.argv[1]); assert set(f.tolist()) <= {0, 1, 2} and (f == 1).any() and len(s) > 20 and s.shape[1] == 704 and a.shape[1] == 48 and abs(y).max() <= 800, (s.shape, a.shape)" "$dir/played.bin"
+  dmc=(train/dmc.py --dir "$dir/dmc" --chunk-rounds 12 --hidden 32 --head 16 --buffer 2000 --eval-every 2 --eval-rounds 4 --opponents random --threads 2 --device cpu)
+  "$PY" "${dmc[@]}" --chunks 2 >/dev/null
+  "$PY" "${dmc[@]}" --chunks 3 >/dev/null
+  grep -q "resuming at chunk 2" "$dir/dmc/log.txt"
+  grep -q "chunk 2: vs random" "$dir/dmc/log.txt"
+  ./target/release/tichu arena "net:$dir/dmc/latest.tnet" random --rounds 6 --threads 2 | grep -q "margin per deal"
+  echo "dmc.py runs, resumes, and its models load and play in Rust"
 else
   echo "PyTorch not installed: skipped the train.py -> .tnet check"
 fi

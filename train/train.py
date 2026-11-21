@@ -7,6 +7,13 @@ The policy target is the recorded label by default (imitation). With
 `--policy q`, files that carry PIMC Q-values are distilled instead: the
 target is softmax(Q / --tau) over the candidates. The value head regresses
 the final round margin (in units of --value-scale points).
+
+Positions from one round share its margin, so a value head on the shared
+trunk memorizes rounds (train R² ~0.8, validation ~0.1 by the end). The
+exported value is therefore a separate small net over the state features
+(`--value-net` units, dropout, strong weight decay), kept at its best
+validation MSE. The trunk's own value head stays as an auxiliary loss
+(`--value-weight`), which helps the policy a little, and isn't exported.
 """
 
 import argparse
@@ -26,16 +33,35 @@ from tichu_data import Records  # noqa: E402
 
 
 class TichuNet(nn.Module):
-    """Shared trunk over the state; value head; per-candidate policy head on
+    """Shared trunk over the state (and, with `seq_hidden`, a GRU over the
+    round's history tokens); value head; per-candidate policy head on
     trunk ⊕ action. Mirrors `Net` in src/bots/net.rs (ReLU after every layer
     but the last of each head, and after the trunk)."""
 
-    def __init__(self, state_dim, action_dim, hidden=256, depth=2, head=128):
+    def __init__(self, state_dim, action_dim, hidden=256, depth=2, head=128, token_dim=0, seq_hidden=0,
+                 value_net=0, value_dropout=0.3):
         super().__init__()
-        dims = [state_dim] + [hidden] * depth
+        self.value_dropout = value_dropout
+        self.value_net = nn.ModuleList(
+            [nn.Linear(state_dim, value_net), nn.Linear(value_net, value_net), nn.Linear(value_net, 1)]
+        ) if value_net else None
+        self.seq_hidden = seq_hidden
+        self.gru = nn.GRU(token_dim, seq_hidden, batch_first=True) if seq_hidden else None
+        dims = [state_dim + seq_hidden] + [hidden] * depth
         self.trunk = nn.ModuleList(nn.Linear(a, b) for a, b in zip(dims, dims[1:]))
         self.value = nn.ModuleList([nn.Linear(hidden, head // 2), nn.Linear(head // 2, 1)])
         self.policy = nn.ModuleList([nn.Linear(hidden + action_dim, head), nn.Linear(head, 1)])
+
+    def encode_seq(self, toks, lens):
+        """toks [B, L, D] (zero-padded), lens [B] -> the GRU state after each
+        sequence's last token, zeros for an empty one [B, H]."""
+        if self.gru is None:
+            return toks.new_zeros(toks.shape[0], 0)
+        if toks.shape[1] == 0:
+            return toks.new_zeros(toks.shape[0], self.seq_hidden)
+        out, _ = self.gru(toks)
+        last = out[torch.arange(len(lens), device=toks.device), (lens - 1).clamp(min=0)]
+        return last * (lens > 0).unsqueeze(-1).to(last.dtype)
 
     @staticmethod
     def _head(layers, x):
@@ -45,18 +71,30 @@ class TichuNet(nn.Module):
                 x = F.relu(x)
         return x
 
-    def forward_trunk(self, s):
+    def forward_trunk(self, s, seq):
+        s = torch.cat([s, seq], dim=-1)
         for l in self.trunk:
             s = F.relu(l(s))
         return s
 
-    def forward(self, s, a):
-        """s [B, S], a [B, K, A] -> value [B], logits [B, K]."""
-        h = self.forward_trunk(s)
-        v = self._head(self.value, h).squeeze(-1)
+    def forward_value_net(self, s):
+        x = s
+        for i, l in enumerate(self.value_net):
+            x = l(x)
+            if i + 1 < len(self.value_net):
+                x = F.dropout(F.relu(x), self.value_dropout, self.training)
+        return x.squeeze(-1)
+
+    def forward(self, s, a, toks, lens):
+        """s [B, S], a [B, K, A], toks [B, L, D], lens [B] -> value [B],
+        logits [B, K], trunk value [B]. Without a value net both values are
+        the trunk's."""
+        h = self.forward_trunk(s, self.encode_seq(toks, lens))
+        tv = self._head(self.value, h).squeeze(-1)
         hk = h.unsqueeze(1).expand(-1, a.shape[1], -1)
         logits = self._head(self.policy, torch.cat([hk, a], dim=-1)).squeeze(-1)
-        return v, logits
+        v = self.forward_value_net(s) if self.value_net is not None else tv
+        return v, logits, tv
 
 
 def write_tnet(model, path, args, data, check):
@@ -64,31 +102,54 @@ def write_tnet(model, path, args, data, check):
     header = dict(
         format=1, feature_version=int(data.feature_version),
         state_dim=int(data.state_dim), action_dim=int(data.action_dim),
-        trunk=layers(model.trunk), value=layers(model.value), policy=layers(model.policy),
+        trunk=layers(model.trunk), policy=layers(model.policy),
+        value=layers(model.value_net if model.value_net is not None else model.value),
+        value_input="state" if model.value_net is not None else "trunk",
+        seq=dict(token_dim=int(data.token_dim), hidden=model.seq_hidden) if model.gru is not None else None,
         value_scale=args.value_scale, check=check,
         trained=dict(data=args.data, policy=args.policy, records=len(data), epochs=args.epochs),
     )
     hb = json.dumps(header).encode()
     with open(path, "wb") as f:
         f.write(b"TNET" + struct.pack("<I", len(hb)) + hb)
-        for ml in (model.trunk, model.value, model.policy):
+        value = model.value_net if model.value_net is not None else model.value
+        for ml in (model.trunk, value, model.policy):
             for l in ml:
                 f.write(l.weight.detach().cpu().float().numpy().astype("<f4").tobytes())
                 f.write(l.bias.detach().cpu().float().numpy().astype("<f4").tobytes())
+        if model.gru is not None:
+            for name in ("weight_ih_l0", "weight_hh_l0", "bias_ih_l0", "bias_hh_l0"):
+                f.write(getattr(model.gru, name).detach().cpu().float().numpy().astype("<f4").tobytes())
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("data", nargs="+", help="record files from `tichu selfplay`")
     ap.add_argument("--out", required=True, help="output .tnet path")
+    ap.add_argument("--prior", help="--policy q: a .pt checkpoint (same architecture) whose policy the "
+                                    "target keeps: softmax(prior log-policy + Q advantage / tau), with "
+                                    "unsearched options at advantage 0, instead of softmax(Q / tau)")
     ap.add_argument("--init", help="start from this .pt checkpoint (saved next to every .tnet)")
-    ap.add_argument("--policy", choices=["label", "q"], default="label")
+    ap.add_argument("--policy", choices=["label", "q", "adv"], default="label",
+                    help="label: imitate; q: cross-entropy to softmax(Q/tau); adv: regress the "
+                         "logits (centred over the searched options) onto Q/tau, which stays "
+                         "unbiased when Q is a noisy few-sample mean")
     ap.add_argument("--tau", type=float, default=20.0, help="Q temperature in points (--policy q)")
-    ap.add_argument("--value-weight", type=float, default=1.0)
+    ap.add_argument("--label-mix", type=float, default=0.0,
+                    help="--policy q: put this much of the target on the played label (the "
+                         "anchored teacher's gated choice) and the rest on softmax(Q/tau)")
+    ap.add_argument("--value-weight", type=float, default=0.25, help="weight of the trunk's (auxiliary) value loss")
+    ap.add_argument("--value-net", type=int, default=128, help="units of the separate value net (0 = export the trunk's head)")
+    ap.add_argument("--value-dropout", type=float, default=0.3)
+    ap.add_argument("--value-wd", type=float, default=1e-2)
+    ap.add_argument("--value-q-from", type=float, default=40.0, help="history tokens where the Q blend starts")
+    ap.add_argument("--value-q-mix", type=float, default=0.0,
+                    help="value target = (1-x)·final margin + x·search Q of the labelled option, where records have Q")
     ap.add_argument("--value-scale", type=float, default=100.0)
     ap.add_argument("--hidden", type=int, default=256)
     ap.add_argument("--depth", type=int, default=2)
     ap.add_argument("--head", type=int, default=128)
+    ap.add_argument("--seq-hidden", type=int, default=0, help="GRU size over the history tokens (0 = no GRU; 64 was tried)")
     ap.add_argument("--epochs", type=float, default=10)
     ap.add_argument("--batch", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -105,7 +166,7 @@ def main():
     has_q = ~np.isnan(data.q)
     print(f"{len(data)} records, {len(data.actions)} candidates "
           f"({has_q.mean():.0%} with Q), loaded in {time.time() - t0:.1f}s", flush=True)
-    if args.policy == "q" and not has_q.any():
+    if args.policy in ("q", "adv") and not has_q.any():
         sys.exit("--policy q needs files written with `tichu selfplay --q N`")
 
     # Split by round so positions from one round don't straddle train/val.
@@ -117,11 +178,25 @@ def main():
 
     # Everything lives on the device as uint8; batches are gathered there.
     T = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)  # noqa: E731
-    states, actions = T(data.states), T(data.actions)
+    states, actions, tokens = T(data.states), T(data.actions), T(data.tokens)
+    tok_off, tok_len = T(data.tok_off), T(data.tok_len)
     act_off, n_opts, label = T(data.act_off), T(data.n_opts), T(data.label)
     margin = T(data.margin / args.value_scale)
     q = T(np.nan_to_num(data.q, nan=0.0))
+    # Anchored labels search only the policy's top options; the rest have
+    # NaN Q and get no target mass.
+    opt_has_q = T(has_q)
     rec_has_q = T(np.add.reduceat(has_q, data.act_off) > 0)
+    # Value target: the round's final margin, blended with the search's
+    # estimate of the position (Q of the labelled option) where there is one.
+    q_label = np.nan_to_num(data.q[data.act_off + data.label], nan=0.0)
+    rec_q = np.add.reduceat(has_q, data.act_off) > 0
+    # The search's Q is poor early in the round (too extreme, R² < 0 vs the
+    # outcome) and good late (exact endgames), so the blend ramps in with
+    # the history length: 0 before --value-q-from tokens, full 40 later.
+    ramp = np.clip((data.tok_len - args.value_q_from) / 40.0, 0.0, 1.0)
+    mix = np.where(rec_q, args.value_q_mix * ramp, 0.0)
+    vtarget = T(((1 - mix) * data.margin + mix * q_label).astype(np.float32) / args.value_scale)
 
     def batch(idx):
         idx = torch.as_tensor(idx, device=dev)
@@ -132,38 +207,88 @@ def main():
         rows = torch.where(mask, act_off[idx][:, None] + ar[None, :], 0)
         s = states[idx].float() / 255.0
         a = actions[rows].float() / 255.0
-        return idx, s, a, mask, rows
+        lens = tok_len[idx]
+        L = int(lens.max()) if args.seq_hidden else 0
+        tr = torch.arange(L, device=dev)
+        tmask = tr[None, :] < lens[:, None]
+        trows = torch.where(tmask, tok_off[idx][:, None] + tr[None, :], 0)
+        toks = tokens[trows].float() / 255.0 * tmask[..., None]
+        return idx, s, a, mask, rows, toks, lens
 
-    model = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head).to(dev)
+    model = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head,
+                     data.token_dim, args.seq_hidden, args.value_net, args.value_dropout).to(dev)
     if args.init:
         model.load_state_dict(torch.load(args.init, map_location=dev))
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
+    prior = None
+    if args.prior:
+        prior = TichuNet(data.state_dim, data.action_dim, args.hidden, args.depth, args.head,
+                         data.token_dim, args.seq_hidden, args.value_net, args.value_dropout).to(dev)
+        prior.load_state_dict(torch.load(args.prior, map_location=dev))
+        prior.eval()
+    vparams = list(model.value_net.parameters()) if model.value_net is not None else []
+    vids = {id(p) for p in vparams}
+    groups = [dict(params=[p for p in model.parameters() if id(p) not in vids], weight_decay=args.wd)]
+    if vparams:
+        groups.append(dict(params=vparams, weight_decay=args.value_wd))
+    opt = torch.optim.AdamW(groups, lr=args.lr)
     steps = max(1, int(args.epochs * len(train_idx) / args.batch))
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=args.lr, total_steps=steps, pct_start=0.05)
 
-    def losses(idx):
-        idx, s, a, mask, rows = batch(idx)
-        v, logits = model(s, a)
+    def losses(idx, train=True):
+        idx, s, a, mask, rows, toks, lens = batch(idx)
+        v, logits, tv = model(s, a, toks, lens)
+        raw = logits
         logits = logits.masked_fill(~mask, -1e9)
         logp = F.log_softmax(logits, dim=-1)
-        if args.policy == "q":
-            qt = q[rows].masked_fill(~mask, -1e9) / args.tau
-            target = F.softmax(qt, dim=-1)
+        if args.policy == "adv":
+            m = (mask & opt_has_q[rows]).float()
+            k = m.sum(-1).clamp(min=1)
+            qc = q[rows] / args.tau
+            qc = (qc - (qc * m).sum(-1, keepdim=True) / k[:, None]) * m
+            lc = (raw - (raw * m).sum(-1, keepdim=True) / k[:, None]) * m
+            pl = ((lc - qc) ** 2).sum(-1) / k
+            # Options the search skipped (anchored labels) get no Q: just keep
+            # the policy's mass on the searched set.
+            pl = pl - torch.logsumexp(logp.masked_fill(m == 0, -1e9), dim=-1)
+            pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
+        elif args.policy == "q":
+            if prior is not None:
+                # The search nudges the prior instead of replacing it: Q's
+                # advantage over the prior-weighted mean of the searched
+                # options, added to the prior's log-policy.
+                with torch.no_grad():
+                    _, pl0, _ = prior(s, a, toks, lens)
+                    pl0 = F.log_softmax(pl0.masked_fill(~mask, -1e9), dim=-1)
+                    has = mask & opt_has_q[rows]
+                    qq = torch.where(has, q[rows], torch.zeros_like(q[rows]))
+                    w = pl0.exp() * has
+                    vmix = (w * qq).sum(-1, keepdim=True) / w.sum(-1, keepdim=True).clamp_min(1e-9)
+                    adv = torch.where(has, qq - vmix, torch.zeros_like(qq))
+                    target = F.softmax((pl0 + adv / args.tau).masked_fill(~mask, -1e9), dim=-1)
+            else:
+                qt = q[rows].masked_fill(~(mask & opt_has_q[rows]), -1e9) / args.tau
+                target = F.softmax(qt, dim=-1)
+            if args.label_mix > 0:
+                onehot = F.one_hot(label[idx].long(), target.shape[1]).float()
+                target = (1 - args.label_mix) * target + args.label_mix * onehot
             pl = -(target * logp).sum(-1)
             pl = torch.where(rec_has_q[idx], pl, -logp.gather(1, label[idx][:, None]).squeeze(1))
         else:
             pl = -logp.gather(1, label[idx][:, None]).squeeze(1)
-        vl = F.mse_loss(v, margin[idx], reduction="none")
+        # Train toward the blended target; always report against the margin.
+        y = vtarget[idx] if train else margin[idx]
+        vl = F.mse_loss(v, y)
+        tvl = F.mse_loss(tv, y) if model.value_net is not None else vl
         acc = (logits.argmax(-1) == label[idx]).float()
-        return pl.mean(), vl.mean(), acc.mean()
+        return pl.mean(), vl, acc.mean(), tvl
 
     @torch.no_grad()
     def evaluate():
         model.eval()
-        tot = np.zeros(3)
+        tot = np.zeros(4)
         chunks = np.array_split(val_idx, max(1, len(val_idx) // 4096))
         for c in chunks:
-            tot += np.array([x.item() for x in losses(c)]) * len(c)
+            tot += np.array([x.item() for x in losses(c, train=False)]) * len(c)
         model.train()
         return tot / max(1, len(val_idx))
 
@@ -172,34 +297,67 @@ def main():
           f"(value MSE to beat); {steps} steps on {dev}", flush=True)
     t0, step = time.time(), 0
     log_every = max(1, steps // 20)
+    eval_every = max(1, steps // 60)
+    best_value = (float("inf"), None, 0)
     while step < steps:
         perm = rng.permutation(train_idx)
         for i in range(0, len(perm) - args.batch + 1, args.batch):
-            pl, vl, _ = losses(perm[i:i + args.batch])
-            loss = pl + args.value_weight * vl
+            pl, vl, _, tvl = losses(perm[i:i + args.batch])
+            loss = pl + args.value_weight * tvl + (vl if model.value_net is not None else 0)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             sched.step()
             step += 1
+            if model.value_net is not None and (step % eval_every == 0 or step == steps):
+                vp, vv, va, tv = evaluate()
+                if vv < best_value[0]:
+                    best_value = (vv, {k: t.detach().clone() for k, t in model.value_net.state_dict().items()}, step)
             if step % log_every == 0 or step == steps:
-                vp, vv, va = evaluate()
+                vp, vv, va, tv = evaluate()
                 print(f"step {step}/{steps}  train pol {pl.item():.3f} val {vp:.3f} | "
-                      f"value mse {vv:.3f} (R² {1 - vv / var:.3f}) | label acc {va:.1%} | "
-                      f"{time.time() - t0:.0f}s", flush=True)
+                      f"value mse {vv:.3f} (R² {1 - vv / var:.3f}, trunk's {1 - tv / var:.3f}) | "
+                      f"label acc {va:.1%} | {time.time() - t0:.0f}s", flush=True)
             if step >= steps:
                 break
+
+    if best_value[1] is not None:
+        model.value_net.load_state_dict(best_value[1])
+        print(f"value net: kept step {best_value[2]}, val mse {best_value[0]:.3f} "
+              f"(R² {1 - best_value[0] / var:.3f})", flush=True)
+
+    # Where in the round the exported value is good: R² by history length.
+    with torch.no_grad():
+        model.eval()
+        pred = []
+        for c in np.array_split(val_idx, max(1, len(val_idx) // 4096)):
+            _, s_, a_, _, _, toks_, lens_ = batch(c)
+            pred.append(model(s_, a_, toks_, lens_)[0].cpu().numpy())
+        model.train()
+    pred, y = np.concatenate(pred), data.margin[val_idx] / args.value_scale
+    tl = data.tok_len[val_idx]
+    parts = []
+    for lo, hi in ((0, 20), (20, 60), (60, 10**9)):
+        m = (tl >= lo) & (tl < hi)
+        if m.sum() > 1:
+            parts.append(f"{lo}-{hi if hi < 10**9 else ''} tokens R² {1 - np.mean((pred[m] - y[m]) ** 2) / np.var(y[m]):.3f}")
+    print("value by stage: " + ", ".join(parts), flush=True)
 
     # A worked example in the header: the Rust loader recomputes it and
     # refuses the model if the two implementations disagree.
     model.eval().cpu()
-    i = int(val_idx[0])
+    # A record with some history, so the check covers the GRU too.
+    i = int(next((j for j in val_idx if data.tok_len[j] >= 5), val_idx[0]))
     o, n = int(data.act_off[i]), int(data.n_opts[i])
+    t0, tl = int(data.tok_off[i]), (int(data.tok_len[i]) if args.seq_hidden else 0)
+    tk = data.tokens[t0:t0 + tl]
     with torch.no_grad():
         s = torch.from_numpy(data.states[i:i + 1]).float() / 255.0
         a = torch.from_numpy(data.actions[o:o + n][None]).float() / 255.0
-        v, lg = model(s, a)
+        toks = torch.from_numpy(tk[None]).float() / 255.0
+        v, lg, _ = model(s, a, toks, torch.tensor([tl]))
     check = dict(state=data.states[i].tolist(), actions=data.actions[o:o + n].reshape(-1).tolist(),
+                 tokens=tk.reshape(-1).tolist(),
                  value=float(v[0]) * args.value_scale, logits=[float(x) for x in lg[0]])
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     write_tnet(model, args.out, args, data, check)

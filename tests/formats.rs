@@ -158,6 +158,7 @@ impl Bot for FirstChoice {
         encode_state(v, &mut bytes);
         let c = Candidates::new(v, plays, can_pass);
         bytes.extend_from_slice(&c.features);
+        encode_history(v, &mut bytes);
         let h = self.hash.get();
         self.hash.set(fnv1a(&bytes) ^ h.rotate_left(5));
         let choice = if plays.is_empty() || (can_pass && v.played_cards.len() % 3 != 0) { None } else { Some(v.played_cards.len() % plays.len()) };
@@ -187,7 +188,7 @@ impl Bot for FirstChoice {
 /// garbage) and update the hash below.
 #[test]
 fn feature_encoding_is_pinned_to_its_version() {
-    assert_eq!((FEATURE_VERSION, STATE_DIM, ACTION_DIM), (1, 560, 40), "dims changed: bump FEATURE_VERSION and update this test");
+    assert_eq!((FEATURE_VERSION, STATE_DIM, ACTION_DIM), (2, 704, 48), "dims changed: bump FEATURE_VERSION and update this test");
     let hash = std::rc::Rc::new(std::cell::Cell::new(0u64));
     let mut rng = StdRng::seed_from_u64(2024);
     for i in 0..60 {
@@ -204,7 +205,7 @@ fn feature_encoding_is_pinned_to_its_version() {
     );
 }
 
-const FEATURE_HASH: u64 = 0x4a80_bbc3_ed37_4195;
+const FEATURE_HASH: u64 = 0x0e14_a191_eb00_72d8;
 
 // ---------------------------------------------------------------------------
 // Self-play records
@@ -216,36 +217,49 @@ struct Rec {
     n: usize,
     label: usize,
     margin: f32,
+    flags: u8,
     q: Option<Vec<f32>>,
     bytes: Vec<u8>,
 }
 
-/// Parses a record file the way train/tichu_data.py does.
+/// Parses a record file the way train/tichu_data.py does. Each record's
+/// `bytes` are its own plus the history tokens it saw.
 fn parse_records(buf: &[u8]) -> Vec<Rec> {
     let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+    let u16_at = |p: usize| u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
     assert_eq!(&buf[0..4], b"TCHR");
     assert_eq!(
-        [u32_at(4), u32_at(8), u32_at(12), u32_at(16)],
-        [selfplay::FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32]
+        [u32_at(4), u32_at(8), u32_at(12), u32_at(16), u32_at(20)],
+        [selfplay::FORMAT_VERSION, FEATURE_VERSION, STATE_DIM as u32, ACTION_DIM as u32, TOKEN_DIM as u32]
     );
     let mut out = vec![];
-    let mut p = 20;
+    let mut p = 24;
     while p < buf.len() {
-        let start = p;
         let round = u32_at(p);
         let seat = buf[p + 4];
-        let flags = buf[p + 5];
-        let n = u16::from_le_bytes([buf[p + 6], buf[p + 7]]) as usize;
-        let label = u16::from_le_bytes([buf[p + 8], buf[p + 9]]) as usize;
-        let margin = f32::from_le_bytes(buf[p + 10..p + 14].try_into().unwrap());
-        p += 14 + STATE_DIM + n * ACTION_DIM;
-        let q = (flags & 1 == 1).then(|| {
-            let q = (0..n).map(|k| f32::from_le_bytes(buf[p + 4 * k..p + 4 * k + 4].try_into().unwrap())).collect();
-            p += 4 * n;
-            q
-        });
-        assert!(p <= buf.len(), "truncated record");
-        out.push(Rec { round, seat, n, label, margin, q, bytes: buf[start..p].to_vec() });
+        let n_tokens = u16_at(p + 5);
+        let n_recs = u32_at(p + 7) as usize;
+        let tokens = &buf[p + 11..p + 11 + n_tokens * TOKEN_DIM];
+        p += 11 + n_tokens * TOKEN_DIM;
+        for _ in 0..n_recs {
+            let start = p;
+            let flags = buf[p];
+            let n = u16_at(p + 1);
+            let label = u16_at(p + 3);
+            let prefix = u16_at(p + 5);
+            let margin = f32::from_le_bytes(buf[p + 7..p + 11].try_into().unwrap());
+            assert!(prefix <= n_tokens, "record saw {prefix} of {n_tokens} tokens");
+            p += 11 + STATE_DIM + n * ACTION_DIM;
+            let q = (flags & 1 == 1).then(|| {
+                let q = (0..n).map(|k| f32::from_le_bytes(buf[p + 4 * k..p + 4 * k + 4].try_into().unwrap())).collect();
+                p += 4 * n;
+                q
+            });
+            assert!(p <= buf.len(), "truncated record");
+            let mut bytes = buf[start..p].to_vec();
+            bytes.extend_from_slice(&tokens[..prefix * TOKEN_DIM]);
+            out.push(Rec { round, seat, n, label, margin, flags, q, bytes });
+        }
     }
     out
 }
@@ -266,6 +280,11 @@ fn selfplay_records_parse_and_are_reproducible() {
         q_samples: 0,
         rollout: "heuristic".into(),
         explore: 0.1,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 0,
+        played_only: false,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -285,6 +304,21 @@ fn selfplay_records_parse_and_are_reproducible() {
             assert_eq!(b.margin, want);
         }
     }
+    // Who went out first: one seat per round, seen by its partner, not by
+    // the opponents; and the same for every record of a seat.
+    for round in 0..cfg.rounds as u32 {
+        let of = |seat: u8| recs.iter().find(|r| r.round == round && r.seat == seat).map(|r| r.flags & 6);
+        let firsts: Vec<u8> = (0..4).filter(|&s| of(s) == Some(selfplay::FLAG_OUT_FIRST)).collect();
+        assert!(firsts.len() <= 1, "round {round}: several seats out first");
+        if let Some(&f) = firsts.first() {
+            assert!(of((f + 2) % 4).is_none_or(|x| x == selfplay::FLAG_PARTNER_OUT_FIRST));
+            assert!(of((f + 1) % 4).is_none_or(|x| x == 0) && of((f + 3) % 4).is_none_or(|x| x == 0));
+        }
+        for r in recs.iter().filter(|r| r.round == round) {
+            assert_eq!(Some(r.flags & 6), of(r.seat));
+        }
+    }
+    assert!(recs.iter().any(|r| r.flags & 6 == selfplay::FLAG_OUT_FIRST));
     // Threads only change the order rounds are written in.
     let (four, _) = selfplay_file(&SelfplayConfig { threads: 4, ..cfg.clone() });
     let by_round = |recs: Vec<Rec>| {
@@ -293,6 +327,68 @@ fn selfplay_records_parse_and_are_reproducible() {
         v
     };
     assert_eq!(by_round(recs), by_round(parse_records(&four)));
+}
+
+#[test]
+fn selfplay_played_only_records_hold_the_played_option() {
+    let cfg = SelfplayConfig {
+        bot: "h2".into(),
+        rounds: 6,
+        seed: 4,
+        threads: 2,
+        q_samples: 0,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 0,
+        played_only: false,
+    };
+    let (full_buf, _) = selfplay_file(&cfg);
+    let (buf, n) = selfplay_file(&SelfplayConfig { played_only: true, ..cfg.clone() });
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    // No history tokens: a record is exactly header + state + one option.
+    assert_eq!(buf.len(), 24 + recs.iter().map(|r| r.bytes.len()).sum::<usize>() + 11 * blocks(&buf));
+    let key = |r: &Rec| (r.round, r.seat);
+    let mut full = parse_records(&full_buf);
+    full.sort_by_key(key);
+    let mut recs = recs;
+    recs.sort_by_key(key);
+    assert_eq!(full.len(), recs.len());
+    for (f, r) in full.iter().zip(&recs) {
+        assert_eq!((r.n, r.label, r.margin), (1, 0, f.margin));
+        assert!(r.q.is_none());
+        let s = 11;
+        assert_eq!(r.bytes[s..s + STATE_DIM], f.bytes[s..s + STATE_DIM], "same state");
+        let a = s + STATE_DIM;
+        assert_eq!(
+            r.bytes[a..a + ACTION_DIM],
+            f.bytes[a + f.label * ACTION_DIM..a + (f.label + 1) * ACTION_DIM],
+            "the one option is the played (= labelled, without explore) one"
+        );
+    }
+    // With exploration, still one option per record.
+    let (buf, _) = selfplay_file(&SelfplayConfig { played_only: true, explore: 0.3, ..cfg });
+    assert!(parse_records(&buf).iter().all(|r| r.n == 1 && r.label == 0));
+}
+
+/// Number of blocks in a record file.
+fn blocks(buf: &[u8]) -> usize {
+    let u32_at = |p: usize| u32::from_le_bytes(buf[p..p + 4].try_into().unwrap());
+    let u16_at = |p: usize| u16::from_le_bytes([buf[p], buf[p + 1]]) as usize;
+    let (mut p, mut k) = (24, 0);
+    while p < buf.len() {
+        let (nt, nr) = (u16_at(p + 5), u32_at(p + 7) as usize);
+        p += 11 + nt * TOKEN_DIM;
+        for _ in 0..nr {
+            let n = u16_at(p + 1);
+            p += 11 + STATE_DIM + n * ACTION_DIM + if buf[p] & 1 == 1 { 4 * n } else { 0 };
+        }
+        k += 1;
+    }
+    k
 }
 
 #[test]
@@ -305,6 +401,11 @@ fn selfplay_q_labels_are_written() {
         q_samples: 2,
         rollout: "heuristic".into(),
         explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 0,
+        played_only: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -316,5 +417,90 @@ fn selfplay_q_labels_are_written() {
         // The labeler plays the best Q.
         let best = q.iter().cloned().fold(f32::MIN, f32::max);
         assert_eq!(q[r.label], best);
+    }
+}
+
+#[test]
+fn selfplay_exact_endgame_and_infer_options_run() {
+    let cfg = SelfplayConfig {
+        bot: "heuristic".into(),
+        rounds: 3,
+        seed: 5,
+        threads: 2,
+        q_samples: 2,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: true,
+        infer: 3,
+        q_max: 0,
+        anchor: 0,
+        played_only: false,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    for r in &recs {
+        let q = r.q.as_ref().expect("--q records carry Q-values");
+        assert_eq!(q.len(), r.n);
+        assert!(q.iter().all(|x| x.is_finite()));
+    }
+}
+
+#[test]
+fn selfplay_adaptive_samples_run_and_are_deterministic() {
+    let cfg = SelfplayConfig {
+        bot: "heuristic".into(),
+        rounds: 3,
+        seed: 6,
+        threads: 1,
+        q_samples: 2,
+        rollout: "heuristic".into(),
+        explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 8,
+        anchor: 0,
+        played_only: false,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    for r in &recs {
+        let q = r.q.as_ref().expect("--q records carry Q-values");
+        assert!(q.iter().all(|x| x.is_finite()));
+    }
+    let (four, _) = selfplay_file(&SelfplayConfig { threads: 4, ..cfg.clone() });
+    let by_round = |recs: Vec<Rec>| {
+        let mut v: Vec<(u32, Vec<u8>)> = recs.into_iter().map(|r| (r.round, r.bytes)).collect();
+        v.sort_by_key(|x| x.0);
+        v
+    };
+    assert_eq!(by_round(recs), by_round(parse_records(&four)));
+}
+
+#[test]
+fn selfplay_anchored_labels_search_only_the_nets_top_options() {
+    let cfg = SelfplayConfig {
+        bot: "heuristic".into(),
+        rounds: 2,
+        seed: 7,
+        threads: 2,
+        q_samples: 3,
+        rollout: format!("net:{}", common::random_tnet()),
+        explore: 0.0,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 2,
+        played_only: false,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    assert!(n > 0);
+    for r in &recs {
+        let q = r.q.as_ref().expect("--q records carry Q-values");
+        assert_eq!(q.iter().filter(|x| x.is_finite()).count(), 2, "{q:?}");
+        assert!(q[r.label].is_finite(), "the label is a searched option");
     }
 }

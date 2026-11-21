@@ -25,8 +25,15 @@ ROOT = os.path.dirname(HERE)
 
 def run(cmd, log):
     print("+ " + " ".join(cmd), flush=True)
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", cwd=ROOT)
-    log.write(out.stdout)
+    # Children print "R²" and "±": make them write UTF-8 whatever the console
+    # code page (Windows defaults to cp1252), and never die on a bad byte.
+    env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", cwd=ROOT, env=env)
+    log.write(out.stdout or "")
+    if out.returncode != 0:
+        log.write(out.stderr or "")
+        log.flush()
+        raise SystemExit(f"command failed ({out.returncode}): {' '.join(cmd)}\n{(out.stderr or '')[-2000:]}")
     log.flush()
     return out.stdout
 
@@ -43,7 +50,13 @@ def main():
     ap.add_argument("--epochs", type=float, default=8)
     ap.add_argument("--arena-rounds", type=int, default=4000)
     ap.add_argument("--tichu", default=os.path.join(ROOT, "target", "release", "tichu.exe" if os.name == "nt" else "tichu"))
+    ap.add_argument("--prior0", default="", help="train with train.py --prior: this .pt for generation 0, then each "
+                                                 "generation's predecessor (the net that labelled its newest data)")
+    ap.add_argument("--data0", default="", help="comma-separated record files from an earlier run, oldest first, "
+                                                "that count as the generations before 0 in the training window")
     ap.add_argument("--train-args", default="", help="extra arguments for train.py")
+    ap.add_argument("--selfplay-args", default="", help="extra arguments for `tichu selfplay`")
+    ap.add_argument("--opponents", default="", help="extra arena opponents for every generation, comma-separated bot names")
     args = ap.parse_args()
     d = os.path.abspath(args.dir)
     os.makedirs(d, exist_ok=True)
@@ -58,12 +71,18 @@ def main():
         log.write(f"\n== generation {g} (rollouts: {rollout})\n")
         if not os.path.exists(data(g)):
             run([args.tichu, "selfplay", "--bot", args.base, "--q", str(args.q), "--rollout", rollout, "--rounds", str(args.rounds),
-                 "--seed", str(1000 + g), "--out", data(g) + ".part"], log)
+                 "--seed", str(1000 + g), "--out", data(g) + ".part", *args.selfplay_args.split()], log)
             os.replace(data(g) + ".part", data(g))
-        files = [data(k) for k in range(max(0, g - args.window + 1), g + 1)]
+        earlier = [f for f in args.data0.split(",") if f]
+        files = (earlier + [data(k) for k in range(g + 1)])[-args.window:]
+        prior = []
+        if args.prior0:
+            prior = ["--prior", args.prior0 if g == 0 else os.path.splitext(model(g - 1))[0] + ".pt"]
         run([sys.executable, os.path.join(HERE, "train.py"), *files, "--policy", "q",
-             "--epochs", str(args.epochs), "--out", model(g), *args.train_args.split()], log)
-        opponents = ["heuristic", args.base] + ([f"net:{model(g - 1)}"] if g > 0 else [])
+             "--epochs", str(args.epochs), "--out", model(g), *prior, *args.train_args.split()], log)
+        # The previous generation, and gen0 as a fixed yardstick for drift.
+        opponents = ["heuristic", args.base] + [f"net:{model(k)}" for k in sorted({g - 1, 0}) if 0 <= k < g]
+        opponents += [o for o in args.opponents.split(",") if o]
         for opp in opponents:
             out = run([args.tichu, "arena", f"net:{model(g)}", opp, "--rounds", str(args.arena_rounds),
                        "--seed", str(77 + g)], log)

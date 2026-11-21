@@ -37,6 +37,21 @@ usage:
       --q N           label with an N-sample PIMC search instead, and write its Q-values
       --rollout NAME  rollout policy for --q (default heuristic; e.g. net:models/q10.tnet)
       --explore P     play a random option with probability P (the label is still recorded)
+      --exact-endgame with --q: label two-player endgames with the solver's exact values
+      --infer K       with --q: weight guessed deals by the others' plays (K candidates each)
+      --q-max M       with --q: keep sampling (up to M) until the best option is clearly ahead
+      --anchor K      with --q and a net rollout: search only the net's top K options and
+                      keep its choice unless another is clearly ahead
+      --played-only   record only the option played (one-option records, no history
+                      tokens): Deep Monte Carlo data for train/dmc.py
+      --seed S, --threads T
+  tichu calllabel --out FILE [options]    Tichu / Grand Tichu call records for train/calls.py
+      --bot NAME      bot in all four seats and the rollouts (default h2)
+      --rounds N      rounds to play (default 1000)
+      --later-small P label each Small Tichu offer after a seat's first with probability P
+                      (default 0.25)
+      --scores FILE   start each round from a game score drawn from FILE (lines
+                      'team0 team1'; train/calls.py --write-states makes one)
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -69,7 +84,7 @@ impl Args {
         while i < raw.len() {
             let s = &raw[i];
             if let Some(f) = s.strip_prefix("--") {
-                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only");
+                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only" | "exact-endgame" | "played-only");
                 let v = if takes_value { i += 1; raw.get(i).cloned() } else { None };
                 if takes_value && v.is_none() {
                     eprintln!("--{f} needs a value");
@@ -192,6 +207,11 @@ fn main() {
                 q_samples: args.num("q").unwrap_or(0),
                 rollout: flag("rollout").unwrap_or_else(|| "heuristic".into()),
                 explore: args.num("explore").unwrap_or(0.0),
+                exact_endgame: args.has("exact-endgame"),
+                infer: args.num("infer").unwrap_or(0),
+                q_max: args.num("q-max").unwrap_or(0),
+                anchor: args.num("anchor").unwrap_or(0),
+                played_only: args.has("played-only"),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");
@@ -199,7 +219,54 @@ fn main() {
             });
             let start = std::time::Instant::now();
             match tichu_engine::selfplay::run(&cfg, &mut std::io::BufWriter::new(file)) {
-                Ok(n) => println!("wrote {n} records to {out} ({:.1}s)", start.elapsed().as_secs_f64()),
+                Ok(n) => {
+                    println!("wrote {n} records to {out} ({:.1}s)", start.elapsed().as_secs_f64());
+                    if let Some(s) = tichu_engine::selfplay::teacher_stats() {
+                        println!("{s}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{out}: {e}");
+                    exit(1)
+                }
+            }
+        }
+        "calllabel" => {
+            let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());
+            let Some(out) = flag("out") else {
+                eprintln!("calllabel needs --out FILE");
+                exit(2);
+            };
+            let bot = flag("bot").unwrap_or_else(|| "h2".into());
+            let _ = factory(&bot);
+            let cfg = tichu_engine::calllabel::CallLabelConfig {
+                bot,
+                rounds: args.num("rounds").unwrap_or(1000),
+                seed,
+                threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
+                later_small: args.num("later-small").unwrap_or(0.25),
+                scores: match flag("scores") {
+                    None => vec![],
+                    Some(path) => std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("{path}: {e}");
+                            exit(1)
+                        })
+                        .lines()
+                        .filter_map(|l| {
+                            let mut it = l.split_whitespace().map(|x| x.parse::<i32>());
+                            Some([it.next()?.ok()?, it.next()?.ok()?])
+                        })
+                        .collect(),
+                },
+            };
+            let file = std::fs::File::create(&out).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                exit(1)
+            });
+            let start = std::time::Instant::now();
+            match tichu_engine::calllabel::run(&cfg, &mut std::io::BufWriter::new(file)) {
+                Ok((g, s)) => println!("wrote {g} grand + {s} small records to {out} ({:.1}s)", start.elapsed().as_secs_f64()),
                 Err(e) => {
                     eprintln!("{out}: {e}");
                     exit(1)

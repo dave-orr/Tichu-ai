@@ -11,16 +11,22 @@
 //! - `vpimcN:PATH` is PIMC whose rollouts stop at my next turn and score
 //!   that position with the value head, instead of playing to the end.
 //!
-//! Model file (`.tnet`, written by `train/export.py`): `b"TNET"`, u32 header
+//! With a sequence encoder (`"seq"` in the header), a one-layer GRU reads
+//! the round's history tokens (`features::encode_history`) and its last
+//! hidden state is appended to the state features at the trunk's input.
+//!
+//! Model file (`.tnet`, written by `train/train.py`): `b"TNET"`, u32 header
 //! length, a JSON header (dims, feature version, layer shapes), then each
 //! layer's weight (`[out][in]`) and bias as little-endian f32, in the order
-//! trunk, value, policy.
+//! trunk, value, policy; then, with a GRU, PyTorch's `weight_ih_l0`
+//! (`[3H][TOKEN_DIM]`, gates r, z, n), `weight_hh_l0` (`[3H][H]`),
+//! `bias_ih_l0` and `bias_hh_l0`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use rand::rngs::StdRng;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use serde::Deserialize;
 
 use crate::bot::Bot;
@@ -74,17 +80,81 @@ fn mlp(layers: &[Layer], x: &[f32]) -> Vec<f32> {
     cur
 }
 
+/// A one-layer GRU over history tokens (PyTorch's `nn.GRU` equations).
+struct Gru {
+    hidden: usize,
+    /// Transposed from PyTorch's `[3H][in]`: `w_ih[i * 3H + g]`,
+    /// `w_hh[j * 3H + g]` (gates r, z, n), as in `Layer`.
+    w_ih: Vec<f32>,
+    w_hh: Vec<f32>,
+    b_ih: Vec<f32>,
+    b_hh: Vec<f32>,
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+/// `[rows][cols]` row-major → `[cols][rows]`.
+fn transpose(w: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut t = vec![0.0; w.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            t[c * rows + r] = w[r * cols + c];
+        }
+    }
+    t
+}
+
+impl Gru {
+    /// One step: `h` ← GRU(token, h).
+    fn step(&self, token: &[u8], h: &mut [f32]) {
+        let hd = self.hidden;
+        let mut gi = self.b_ih.clone();
+        add_rows(&mut gi, &self.w_ih, 3 * hd, 0, token.iter().map(|&t| t as f32 / 255.0));
+        let mut gh = self.b_hh.clone();
+        add_rows(&mut gh, &self.w_hh, 3 * hd, 0, h.iter().copied());
+        for j in 0..hd {
+            let r = sigmoid(gi[j] + gh[j]);
+            let z = sigmoid(gi[hd + j] + gh[hd + j]);
+            let n = (gi[2 * hd + j] + r * gh[2 * hd + j]).tanh();
+            h[j] = (1.0 - z) * n + z * h[j];
+        }
+    }
+}
+
+/// Hidden states after each token of the last sequence seen, so a bot that
+/// is asked about a growing history (or the same history again, as in
+/// rollouts from one position) only runs the new tokens.
+#[derive(Default)]
+pub struct SeqCache {
+    tokens: Vec<u8>,
+    states: Vec<Vec<f32>>,
+}
+
+#[derive(Deserialize)]
+struct SeqHeader {
+    token_dim: usize,
+    hidden: usize,
+}
+
 #[derive(Deserialize)]
 struct Header {
     feature_version: u32,
     state_dim: usize,
     action_dim: usize,
+    seq: Option<SeqHeader>,
     /// `[out, in]` per layer.
     trunk: Vec<[usize; 2]>,
     value: Vec<[usize; 2]>,
     policy: Vec<[usize; 2]>,
     /// The value head predicts margin / value_scale.
     value_scale: f32,
+    /// "state": the value layers are a separate net over the state features
+    /// (trained apart from the trunk and early-stopped); otherwise they
+    /// read the trunk's output.
+    #[serde(default)]
+    value_input: Option<String>,
     /// One position with the trainer's outputs, recomputed on load.
     check: Option<Check>,
 }
@@ -93,6 +163,8 @@ struct Header {
 struct Check {
     state: Vec<u8>,
     actions: Vec<u8>,
+    #[serde(default)]
+    tokens: Vec<u8>,
     value: f32,
     logits: Vec<f32>,
 }
@@ -101,8 +173,10 @@ pub struct Net {
     trunk: Vec<Layer>,
     value: Vec<Layer>,
     policy: Vec<Layer>,
+    gru: Option<Gru>,
     value_scale: f32,
     hidden: usize,
+    value_on_state: bool,
 }
 
 pub fn to_inputs(bytes: &[u8]) -> Vec<f32> {
@@ -147,23 +221,50 @@ impl Net {
         let trunk = read(&header.trunk)?;
         let value = read(&header.value)?;
         let policy = read(&header.policy)?;
-        let hidden = trunk.last().map_or(STATE_DIM, |l| l.out);
+        let gru = match &header.seq {
+            None => None,
+            Some(s) => {
+                if s.token_dim != TOKEN_DIM {
+                    return Err(format!("{path}: tokens of {} bytes, this build has {TOKEN_DIM}", s.token_dim));
+                }
+                let h = s.hidden;
+                let mut take = |n: usize| -> Result<Vec<f32>, String> {
+                    let v: Vec<f32> = floats.by_ref().take(n).collect();
+                    if v.len() == n { Ok(v) } else { Err(format!("{path}: truncated GRU weights")) }
+                };
+                let (w_ih, w_hh) = (take(3 * h * TOKEN_DIM)?, take(3 * h * h)?);
+                Some(Gru {
+                    hidden: h,
+                    w_ih: transpose(&w_ih, 3 * h, TOKEN_DIM),
+                    w_hh: transpose(&w_hh, 3 * h, h),
+                    b_ih: take(3 * h)?,
+                    b_hh: take(3 * h)?,
+                })
+            }
+        };
+        let value_on_state = match header.value_input.as_deref() {
+            None | Some("trunk") => false,
+            Some("state") => true,
+            Some(x) => return Err(format!("{path}: unknown value_input {x:?}")),
+        };
+        let seq_dim = gru.as_ref().map_or(0, |g| g.hidden);
+        let hidden = trunk.last().map_or(STATE_DIM + seq_dim, |l| l.out);
         let chain_ok = |ls: &[Layer], first: usize| {
             ls.first().is_some_and(|l| l.inp == first)
                 && ls.windows(2).all(|w| w[0].out == w[1].inp)
                 && ls.last().is_some_and(|l| l.out == 1)
         };
-        if trunk.first().is_some_and(|l| l.inp != STATE_DIM)
+        if trunk.first().is_some_and(|l| l.inp != STATE_DIM + seq_dim)
             || trunk.windows(2).any(|w| w[0].out != w[1].inp)
-            || !chain_ok(&value, hidden)
+            || !chain_ok(&value, if value_on_state { STATE_DIM } else { hidden })
             || !chain_ok(&policy, hidden + ACTION_DIM)
         {
             return Err(format!("{path}: layer shapes don't chain"));
         }
-        let net = Net { trunk, value, policy, value_scale: header.value_scale, hidden };
+        let net = Net { trunk, value, policy, gru, value_scale: header.value_scale, hidden, value_on_state };
         if let Some(c) = &header.check {
-            let h = net.trunk(&c.state);
-            let (v, l) = (net.value(&h), net.logits(&h, &c.actions));
+            let h = net.trunk(&c.state, &net.encode_seq(&c.tokens));
+            let (v, l) = (net.value(&c.state, &h), net.logits(&h, &c.actions));
             let close = |a: f32, b: f32| (a - b).abs() <= 1e-3 * (1.0 + b.abs());
             if !close(v, c.value) || l.len() != c.logits.len() || l.iter().zip(&c.logits).any(|(a, b)| !close(*a, *b)) {
                 return Err(format!("{path}: outputs differ from the trainer's (value {v} vs {})", c.value));
@@ -184,8 +285,40 @@ impl Net {
         Ok(n)
     }
 
-    pub fn trunk(&self, state: &[u8]) -> Vec<f32> {
-        let x = to_inputs(state);
+    /// The GRU's last hidden state over `tokens` (zeros for none; empty
+    /// without a GRU).
+    pub fn encode_seq(&self, tokens: &[u8]) -> Vec<f32> {
+        let Some(g) = &self.gru else { return vec![] };
+        let mut h = vec![0.0; g.hidden];
+        tokens.chunks_exact(TOKEN_DIM).for_each(|t| g.step(t, &mut h));
+        h
+    }
+
+    /// `encode_seq`, reusing `cache` from earlier calls where the tokens
+    /// share a prefix.
+    pub fn encode_seq_cached(&self, tokens: &[u8], cache: &mut SeqCache) -> Vec<f32> {
+        let Some(g) = &self.gru else { return vec![] };
+        let common = cache
+            .tokens
+            .chunks_exact(TOKEN_DIM)
+            .zip(tokens.chunks_exact(TOKEN_DIM))
+            .take_while(|(a, b)| a == b)
+            .count();
+        cache.tokens.truncate(common * TOKEN_DIM);
+        cache.states.truncate(common);
+        let mut h = cache.states.last().cloned().unwrap_or_else(|| vec![0.0; g.hidden]);
+        for t in tokens[common * TOKEN_DIM..].chunks_exact(TOKEN_DIM) {
+            g.step(t, &mut h);
+            cache.tokens.extend_from_slice(t);
+            cache.states.push(h.clone());
+        }
+        h
+    }
+
+    /// The trunk over the state features and the GRU's state (`encode_seq`).
+    pub fn trunk(&self, state: &[u8], seq: &[f32]) -> Vec<f32> {
+        let mut x = to_inputs(state);
+        x.extend_from_slice(seq);
         let mut h = mlp(&self.trunk, &x);
         if !self.trunk.is_empty() {
             h.iter_mut().for_each(|v| *v = v.max(0.0));
@@ -193,9 +326,11 @@ impl Net {
         h
     }
 
-    /// Expected round margin (points) for my team.
-    pub fn value(&self, h: &[f32]) -> f32 {
-        mlp(&self.value, h)[0] * self.value_scale
+    /// Expected round margin (points) for my team, from the state features
+    /// and the trunk's output for them.
+    pub fn value(&self, state: &[u8], h: &[f32]) -> f32 {
+        let v = if self.value_on_state { mlp(&self.value, &to_inputs(state)) } else { mlp(&self.value, h) };
+        v[0] * self.value_scale
     }
 
     /// One logit per candidate (`actions` holds `ACTION_DIM` bytes each).
@@ -217,10 +352,22 @@ impl Net {
             .collect()
     }
 
-    pub fn value_of(&self, view: &PlayerView) -> f32 {
+    /// The policy's logits for `cands` at `view` (no memo: walks the log).
+    pub fn option_logits(&self, view: &PlayerView, cands: &Candidates) -> Vec<f32> {
+        let walk = HistoryWalk::of(view);
         let mut s = Vec::with_capacity(STATE_DIM);
-        encode_state(view, &mut s);
-        self.value(&self.trunk(&s))
+        encode_state_with(view, &walk, &mut s);
+        self.logits(&self.trunk(&s, &self.encode_seq(walk.tokens())), &cands.features)
+    }
+
+    pub fn value_of(&self, view: &PlayerView) -> f32 {
+        let walk = HistoryWalk::of(view);
+        let mut s = Vec::with_capacity(STATE_DIM);
+        encode_state_with(view, &walk, &mut s);
+        if self.value_on_state {
+            return self.value(&s, &[]);
+        }
+        self.value(&s, &self.trunk(&s, &self.encode_seq(walk.tokens())))
     }
 }
 
@@ -228,23 +375,69 @@ impl Net {
 pub struct NetBot {
     net: Arc<Net>,
     base: H2Bot,
+    memo: NetMemo,
+    /// > 0: sample from softmax(logits / temperature) instead (`net@T:PATH`).
+    temperature: f32,
+    rng: StdRng,
+}
+
+/// What a net bot carries from one decision to the next: its walk of the
+/// log and the GRU's states over it. Rollouts from one position keep asking
+/// about histories that share a long prefix.
+#[derive(Default)]
+pub struct NetMemo {
+    walk: HistoryWalk,
+    seq: SeqCache,
 }
 
 impl NetBot {
     pub fn new(net: Arc<Net>) -> Self {
-        NetBot { net, base: H2Bot::new() }
+        NetBot { net, base: H2Bot::new(), memo: NetMemo::default(), temperature: 0.0, rng: StdRng::seed_from_u64(0) }
     }
 
-    pub fn choose(net: &Net, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+    pub fn sampling(net: Arc<Net>, temperature: f32, seed: u64) -> Self {
+        NetBot { temperature, rng: StdRng::seed_from_u64(seed), ..NetBot::new(net) }
+    }
+
+    pub fn choose(net: &Net, view: &PlayerView, plays: &[Combo], can_pass: bool, memo: &mut NetMemo) -> Option<usize> {
+        Self::choose_with(net, view, plays, can_pass, memo, 0.0, None)
+    }
+
+    /// The top choice, or with `temperature` > 0 and an `rng`, a sample
+    /// from softmax(logits / temperature).
+    pub fn choose_with(
+        net: &Net,
+        view: &PlayerView,
+        plays: &[Combo],
+        can_pass: bool,
+        memo: &mut NetMemo,
+        temperature: f32,
+        rng: Option<&mut StdRng>,
+    ) -> Option<usize> {
         let cands = Candidates::new(view, plays, can_pass);
         if cands.len() == 1 {
             return cands.options[0];
         }
+        memo.walk.update(view);
         let mut s = Vec::with_capacity(STATE_DIM);
-        encode_state(view, &mut s);
-        let logits = net.logits(&net.trunk(&s), &cands.features);
+        encode_state_with(view, &memo.walk, &mut s);
+        let seq = net.encode_seq_cached(memo.walk.tokens(), &mut memo.seq);
+        let logits = net.logits(&net.trunk(&s, &seq), &cands.features);
         let best = (0..logits.len()).max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap();
-        cands.options[best]
+        match rng {
+            Some(rng) if temperature > 0.0 => {
+                let w: Vec<f64> = logits.iter().map(|l| (((l - logits[best]) / temperature) as f64).exp()).collect();
+                let mut x = rng.gen::<f64>() * w.iter().sum::<f64>();
+                for (k, wk) in w.iter().enumerate() {
+                    x -= wk;
+                    if x <= 0.0 {
+                        return cands.options[k];
+                    }
+                }
+                cands.options[best]
+            }
+            _ => cands.options[best],
+        }
     }
 }
 
@@ -277,7 +470,8 @@ impl Bot for NetBot {
     }
     rule_bot_rest!();
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
-        Self::choose(&self.net, view, plays, can_pass)
+        let t = self.temperature;
+        Self::choose_with(&self.net, view, plays, can_pass, &mut self.memo, t, Some(&mut self.rng))
     }
 }
 
@@ -325,7 +519,7 @@ impl Bot for ValuePimcBot {
         let team = view.my_team();
         let mut totals = vec![0.0f64; cands.len()];
         for _ in 0..self.samples {
-            let base = GameState::from_view(view, view.sample_hands(&mut self.rng));
+            let base = GameState::from_view_with_history(view, view.sample_hands(&mut self.rng));
             for (k, opt) in cands.options.iter().enumerate() {
                 let mut g = base.clone();
                 let action = match opt {
@@ -361,6 +555,11 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
     };
     if let Some(path) = name.strip_prefix("net:") {
         return Some(Box::new(NetBot::new(load(path)?)));
+    }
+    if let Some(rest) = name.strip_prefix("net@") {
+        let (t, path) = rest.split_once(':')?;
+        let t: f32 = t.parse().ok().filter(|t: &f32| *t > 0.0 && t.is_finite())?;
+        return Some(Box::new(NetBot::sampling(load(path)?, t, seed)));
     }
     let (head, path) = name.split_once(':')?;
     let n: usize = head.strip_prefix("vpimc")?.parse().ok()?;
@@ -432,9 +631,57 @@ mod tests {
         let mut ha = hid.clone();
         ha.extend(to_inputs(&a));
         let want_l = fwd(&dense[2], &ha, false)[0];
-        let got_h = net.trunk(&s);
-        assert!((net.value(&got_h) - want_v).abs() < 1e-3);
+        let got_h = net.trunk(&s, &[]);
+        assert!((net.value(&s, &got_h) - want_v).abs() < 1e-3);
         assert!((net.logits(&got_h, &a)[0] - want_l).abs() < 1e-4);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// A random model with a GRU loads and plays, and the cached sequence
+    /// encoding matches a fresh one as histories grow and branch.
+    #[test]
+    fn random_gru_model_plays_and_caches() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let (h, k, g) = (16, 8, 12);
+        let shapes = [vec![[h, STATE_DIM + g]], vec![[k, h], [1, k]], vec![[k, h + ACTION_DIM], [1, k]]];
+        let header = serde_json::json!({
+            "feature_version": FEATURE_VERSION, "state_dim": STATE_DIM, "action_dim": ACTION_DIM,
+            "trunk": shapes[0], "value": shapes[1], "policy": shapes[2], "value_scale": 100.0,
+            "seq": {"token_dim": TOKEN_DIM, "hidden": g},
+        });
+        let hb = serde_json::to_vec(&header).unwrap();
+        let mut file = b"TNET".to_vec();
+        file.extend_from_slice(&(hb.len() as u32).to_le_bytes());
+        file.extend_from_slice(&hb);
+        let n_layers: usize = shapes.iter().flatten().map(|&[o, i]| o * i + o).sum();
+        let n_gru = 3 * g * TOKEN_DIM + 3 * g * g + 6 * g;
+        for _ in 0..n_layers + n_gru {
+            file.extend_from_slice(&rng.gen_range(-0.3f32..0.3).to_le_bytes());
+        }
+        let path = std::env::temp_dir().join(format!("tichu-test-gru-{}.tnet", std::process::id()));
+        std::fs::write(&path, &file).unwrap();
+        let net = Net::cached(path.to_str().unwrap()).unwrap();
+
+        let mut state = GameState::new(Settings::default());
+        state.start_round(shuffled_deck(&mut rng));
+        let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| Box::new(NetBot::new(net.clone())) as Box<dyn Bot>);
+        play_dealt_round(&mut state, &mut bots, None).unwrap();
+
+        let mut tokens = vec![];
+        let n = encode_history(&state.view(1), &mut tokens);
+        assert!(n > 10);
+        let mut cache = SeqCache::default();
+        for cut in [n / 2, n, n / 3, n, 0, n - 1] {
+            let mut t = tokens[..cut * TOKEN_DIM].to_vec();
+            if cut == n - 1 {
+                // A branch: same prefix, different last token.
+                t.extend(std::iter::repeat(255).take(TOKEN_DIM));
+            }
+            let fresh = net.encode_seq(&t);
+            let cached = net.encode_seq_cached(&t, &mut cache);
+            assert_eq!(fresh, cached, "cut {cut}");
+        }
+        assert!(net.encode_seq(&tokens).iter().any(|&x| x != 0.0));
         std::fs::remove_file(path).ok();
     }
 }
