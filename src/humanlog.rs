@@ -33,6 +33,9 @@ pub struct LogPlayer {
     pub tichu_call: TichuCall,
     pub out_order: u8,
     pub initial_hand: Vec<Card>,
+    /// The 8 cards seen before the Grand Tichu decision (newer logs only).
+    #[serde(default)]
+    pub first_eight: Option<Vec<Card>>,
     pub passed_left: Option<Card>,
     pub passed_partner: Option<Card>,
     pub passed_right: Option<Card>,
