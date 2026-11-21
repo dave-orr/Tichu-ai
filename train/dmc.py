@@ -190,6 +190,8 @@ def main():
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--wd", type=float, default=1e-4)
+    ap.add_argument("--warmup", type=int, default=0,
+                    help="ramp the learning rate up over this many steps (for a fresh optimizer on a grown net)")
     ap.add_argument("--value-weight", type=float, default=0.25, help="weight of the state-value losses (exported value and trunk head)")
     ap.add_argument("--value-scale", type=float, default=100.0)
     ap.add_argument("--first-weight", type=float, default=0.1,
@@ -325,6 +327,9 @@ def main():
             vl = F.mse_loss(tv, y) + (F.mse_loss(v, y) if model.value_net is not None else 0)
             fl = F.cross_entropy(first_head(h), f)
             loss = ql + args.value_weight * vl + args.first_weight * fl
+            if args.warmup:
+                for g in opt.param_groups:
+                    g["lr"] = args.lr * min(1.0, (st["steps"] + 1) / args.warmup)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
