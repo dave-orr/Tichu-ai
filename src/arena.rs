@@ -224,8 +224,13 @@ fn run_one(i: usize, cfg: &ArenaConfig, a: &BotFactory, b: &BotFactory, names: [
                 let deck = shuffled_deck(&mut deck_rng);
                 state.start_round(deck.clone());
                 let mut events = Vec::new();
-                let mut obs = |_: &GameState, a: &crate::engine::Action| events.push(replay::action_event(a));
+                crate::selfplay::explain_start();
+                let mut obs = |_: &GameState, a: &crate::engine::Action| {
+                    events.extend(crate::selfplay::explain_take());
+                    events.push(replay::action_event(a));
+                };
                 let r = play_dealt_round(&mut state, &mut bots, Some(&mut obs));
+                crate::selfplay::explain_stop();
                 if let Ok(r) = &r {
                     let players: Vec<&str> = (0..4).map(|s| names[(team_for_seat(s) != a_team) as usize]).collect();
                     logs.push(replay::game_log(i, swapped, &players, &cfg.settings, &deck, r, events));
