@@ -10,7 +10,11 @@
 //!
 //! - Grand Tichu: "call Grand" against "don't", after which the seat makes
 //!   its later Small Tichu decision with `bot`'s own policy.
-//! - Small Tichu: "call now" against "never call this round".
+//! - Small Tichu: "call now" against "wait": decline this offer and play
+//!   on with `bot`'s own policy, which may call at a later offer (if a card
+//!   is played first, the option is lost, and the result shows it). When
+//!   the offer comes on my own turn and I may pass, also "wait and pass":
+//!   pass this turn to keep the option, then go on with `bot`.
 //!
 //! The main round goes on with `bot`'s own decisions, so the decision states
 //! come from ordinary play. Rounds start at 0-0, and `train/calls.py`
@@ -29,6 +33,8 @@
 //! kind 0, 1: u8 heuristic (0 = undecided, 1 = no, 2 = call)
 //!            i16 mine, theirs without the call | i16 mine, theirs with it
 //!            i16 my team's game score, theirs (before the round)
+//!            i16 mine, theirs after waiting and passing | u8 1 if that
+//!            branch was played (Small, on my turn, passing legal)
 //!            STATE_DIM + CALL_EXTRA_DIM feature bytes (encoded at 0-0;
 //!            the score goes to the model separately)
 //! ```
@@ -45,14 +51,14 @@ use crate::bot::Bot;
 
 use crate::bots::calls;
 use crate::deck::shuffled_deck;
-use crate::engine::{Action, GameState};
+use crate::engine::{Action, GameState, Pending};
 use crate::features::{encode_state, FEATURE_VERSION, STATE_DIM};
 use crate::scoring::RoundResult;
-use crate::sim::{play_dealt_round, play_from};
+use crate::sim::{play_dealt_round, play_from, play_from_with};
 use crate::types::*;
 use crate::view::PlayerView;
 
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 pub const CALL_EXTRA_DIM: usize = 32;
 /// Inputs of a call model: state bytes, extra bytes (each / 255), then
 /// is-Grand, my score / 1000, theirs / 1000.
@@ -154,6 +160,49 @@ struct Recorder {
     out: Rc<RefCell<Vec<u8>>>,
 }
 
+/// A rollout stand-in for the deciding seat: declines the Small Tichu offer
+/// being labelled (then asks `inner` at later offers) and, with
+/// `pass_now`, passes its next turn.
+struct Waiting {
+    inner: Box<dyn Bot>,
+    declined: bool,
+    pass_now: bool,
+}
+
+impl Bot for Waiting {
+    fn name(&self) -> String {
+        self.inner.name()
+    }
+    fn grand_tichu(&mut self, view: &PlayerView) -> bool {
+        self.inner.grand_tichu(view)
+    }
+    fn small_tichu(&mut self, view: &PlayerView) -> bool {
+        if !self.declined {
+            self.declined = true;
+            return false;
+        }
+        self.inner.small_tichu(view)
+    }
+    fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
+        self.inner.pass_cards(view)
+    }
+    fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+        if std::mem::take(&mut self.pass_now) && can_pass {
+            return None;
+        }
+        self.inner.play(view, plays, can_pass)
+    }
+    fn bomb(&mut self, view: &PlayerView, bombs: &[Combo]) -> Option<usize> {
+        self.inner.bomb(view, bombs)
+    }
+    fn wish(&mut self, view: &PlayerView) -> Option<Rank> {
+        self.inner.wish(view)
+    }
+    fn dragon_recipient(&mut self, view: &PlayerView) -> Seat {
+        self.inner.dragon_recipient(view)
+    }
+}
+
 fn team_totals(r: &RoundResult, team: Team) -> [i16; 2] {
     [r.total(team) as i16, r.total(1 - team) as i16]
 }
@@ -170,7 +219,28 @@ impl Recorder {
         Some(team_totals(&r, seat % 2))
     }
 
-    fn record(&self, kind: u8, view: &PlayerView, heuristic: u8, without: [i16; 2], with: [i16; 2]) {
+    /// Play on from a Small Tichu offer to `seat`: with the call, or
+    /// waiting (passing this turn too with `pass_now`).
+    fn small_branch(&self, state: &GameState, seat: Seat, call: bool, pass_now: bool) -> Option<[i16; 2]> {
+        let mut s = state.clone();
+        // Inside the opening offer (nothing played yet) play_from repeats it.
+        let opening_done = !s.played_cards.is_empty();
+        if call {
+            s.apply(&Action::SmallTichu { seat }).ok()?;
+        }
+        let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|k| {
+            let b = crate::bots::by_name(&self.cfg.bot, self.rollout_seed.wrapping_add(k as u64)).expect("unknown bot");
+            if k == seat && !call {
+                Box::new(Waiting { inner: b, declined: false, pass_now }) as Box<dyn Bot>
+            } else {
+                b
+            }
+        });
+        let r = play_from_with(&mut s, &mut bots, None, true, opening_done).ok()?;
+        Some(team_totals(&r, seat % 2))
+    }
+
+    fn record(&self, kind: u8, view: &PlayerView, heuristic: u8, without: [i16; 2], with: [i16; 2], pass: Option<[i16; 2]>) {
         let mut out = self.out.borrow_mut();
         out.push(kind);
         out.extend_from_slice(&self.round.to_le_bytes());
@@ -178,9 +248,11 @@ impl Recorder {
         out.push(heuristic);
         let team = view.my_team();
         let score = [view.scores[team] as i16, view.scores[1 - team] as i16];
-        for v in [without[0], without[1], with[0], with[1], score[0], score[1]] {
+        let p = pass.unwrap_or([0, 0]);
+        for v in [without[0], without[1], with[0], with[1], score[0], score[1], p[0], p[1]] {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        out.push(pass.is_some() as u8);
         let mut v0 = view.clone();
         v0.scores = [0, 0];
         encode_state(&v0, &mut out);
@@ -207,7 +279,7 @@ impl Bot for Recorder {
             let yes = self.rollout(&st, Action::GrandTichu { seat, call: true }, seat, false);
             if let (Some(no), Some(yes)) = (no, yes) {
                 let h = if calls::grand_tichu_v2(view) { 2 } else { 1 };
-                self.record(0, view, h, no, yes);
+                self.record(0, view, h, no, yes, None);
             }
         }
         self.inner.grand_tichu(view)
@@ -218,24 +290,17 @@ impl Bot for Recorder {
             let label = self.small_offers == 1 || self.rng.gen_bool(self.cfg.later_small);
             if label && st.can_call_small_tichu(view.seat) {
                 let seat = view.seat;
-                // Without: play on from the offer with this seat declining
-                // now and at every later offer.
-                let no = {
-                    let mut s = st.clone();
-                    let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|k| {
-                        let name = if k == seat { format!("nocalls:{}", self.cfg.bot) } else { self.cfg.bot.clone() };
-                        crate::bots::by_name(&name, self.rollout_seed.wrapping_add(k as u64)).expect("unknown bot")
-                    });
-                    play_from(&mut s, &mut bots, None, true).ok().map(|r| team_totals(&r, seat % 2))
-                };
-                let yes = self.rollout(&st, Action::SmallTichu { seat }, seat, true);
+                let no = self.small_branch(&st, seat, false, false);
+                let yes = self.small_branch(&st, seat, true, false);
+                let can_pass = st.pending() == Pending::Turn(seat) && st.can_pass(seat);
+                let pass = if can_pass { self.small_branch(&st, seat, false, true) } else { None };
                 if let (Some(no), Some(yes)) = (no, yes) {
                     let h = match calls::small_tichu_v2(view, calls::DEFAULT_TICHU_THRESHOLD) {
                         None => 0,
                         Some(false) => 1,
                         Some(true) => 2,
                     };
-                    self.record(1, view, h, no, yes);
+                    self.record(1, view, h, no, yes, pass);
                 }
             }
         }
@@ -322,7 +387,7 @@ pub fn run(cfg: &CallLabelConfig, w: &mut impl Write) -> std::io::Result<(usize,
             });
         }
         drop(tx);
-        let rec = 1 + 4 + 1 + 1 + 12 + STATE_DIM + CALL_EXTRA_DIM;
+        let rec = 1 + 4 + 1 + 1 + 16 + 1 + STATE_DIM + CALL_EXTRA_DIM;
         let mut rounds = 0;
         for buf in rx {
             // Count records by walking the buffer.

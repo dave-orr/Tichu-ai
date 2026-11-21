@@ -119,21 +119,33 @@ impl CallNet {
     /// Predicted change in my team's game-win chance (percentage points) if
     /// I make this call now.
     pub fn gain(&self, view: &PlayerView, grand: bool) -> f32 {
+        self.outputs(view, grand)[0]
+    }
+
+    /// The head's outputs. Grand: [gain of calling]. Small: [gain of calling
+    /// now], and in models trained on wait labels, [.., gain of passing
+    /// this turn to keep the option], both against waiting and playing on.
+    pub fn outputs(&self, view: &PlayerView, grand: bool) -> Vec<f32> {
         let x = call_inputs(view, grand);
         let h = forward(&self.trunk, &x, true);
-        forward(&self.heads[if grand { 0 } else { 1 }], &h, false)[0]
+        forward(&self.heads[if grand { 0 } else { 1 }], &h, false)
     }
 }
 
 /// `callnet[@T][~F]:PATH:BOT`: BOT, with calls from the model at PATH.
 /// T: call when the predicted gain is above T points (default 0). Flags F:
 /// g = model Grand only (BOT's Small), s = model Small only (BOT's Grand).
+/// With a model whose Small head also prices passing to keep the option,
+/// the bot passes this turn instead (when it may) if that beats both
+/// calling now and playing on.
 pub struct CallNetBot {
     net: Arc<CallNet>,
     threshold: f32,
     grand: bool,
     small: bool,
     inner: Box<dyn Bot>,
+    /// Pass on this turn to keep the Small Tichu option.
+    defer: bool,
 }
 
 impl CallNetBot {
@@ -160,7 +172,7 @@ impl CallNetBot {
             _ => return None,
         };
         let net = CallNet::cached(path).map_err(|e| eprintln!("{e}")).ok()?;
-        Some(CallNetBot { net, threshold, grand, small, inner: crate::bots::by_name(inner, seed)? })
+        Some(CallNetBot { net, threshold, grand, small, inner: crate::bots::by_name(inner, seed)?, defer: false })
     }
 }
 
@@ -178,12 +190,21 @@ impl Bot for CallNetBot {
         if !self.small {
             return self.inner.small_tichu(view);
         }
-        self.net.gain(view, false) > self.threshold
+        let out = self.net.outputs(view, false);
+        let pass = out.get(1).copied().filter(|_| view.turn == view.seat).unwrap_or(f32::NEG_INFINITY);
+        if out[0] > self.threshold && out[0] >= pass {
+            return true;
+        }
+        self.defer = pass > self.threshold;
+        false
     }
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
         self.inner.pass_cards(view)
     }
     fn play(&mut self, view: &PlayerView, plays: &[Combo], can_pass: bool) -> Option<usize> {
+        if std::mem::take(&mut self.defer) && can_pass {
+            return None;
+        }
         self.inner.play(view, plays, can_pass)
     }
     fn bomb(&mut self, view: &PlayerView, bombs: &[Combo]) -> Option<usize> {
@@ -247,7 +268,7 @@ mod tests {
         for seed in 0..3 {
             let mut bots: [Box<dyn Bot>; 4] = [0, 1, 2, 3].map(|_| -> Box<dyn Bot> {
                 let inner = crate::bots::by_name("h2", 0).unwrap();
-                Box::new(CallNetBot { net: net.clone(), threshold: -1000.0, grand: true, small: true, inner })
+                Box::new(CallNetBot { net: net.clone(), threshold: -1000.0, grand: true, small: true, inner, defer: false })
             });
             let mut state = GameState::new(Settings::default());
             state.start_round(shuffled_deck(&mut StdRng::seed_from_u64(seed)));

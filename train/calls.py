@@ -6,6 +6,12 @@ each record gets a game score drawn from realistic game states, and the label
 is the change in my team's game-win chance (percentage points) that the call
 caused, using a win-probability table built from the recorded round results.
 
+Small Tichu records from format 3 on compare calling with waiting (decline
+now, maybe call later), and on my own turn also passing to keep the option;
+the Small head then has two outputs (call now, pass and wait), both against
+waiting and playing on. Older Small records ("call now" against "never")
+are left out when there are format-3 ones, unless --old-small.
+
     python calls.py --data a.bin [b.bin ...] --out model.tcall
 """
 
@@ -22,6 +28,7 @@ MODEL_VERSION = 1
 
 def read_records(paths):
     feats, kinds, rounds, heur, res, round_res, ctx, has_ctx = [], [], [], [], [], [], [], []
+    pres, has_pass, waitfmt = [], [], []
     dims = None
     for k, path in enumerate(paths):
         data = open(path, "rb").read()
@@ -30,8 +37,9 @@ def read_records(paths):
         if dims is None:
             dims = (fv, sd, ed)
         assert dims == (fv, sd, ed), f"{path}: feature layout differs"
-        nres = 6 if fmt >= 2 else 4
-        rec = 1 + 4 + 1 + 1 + 2 * nres + sd + ed
+        nres = 8 if fmt >= 3 else 6 if fmt >= 2 else 4
+        flag = 1 if fmt >= 3 else 0
+        rec = 1 + 4 + 1 + 1 + 2 * nres + flag + sd + ed
         p = 20
         start = len(kinds)
         n = len(data)
@@ -48,8 +56,11 @@ def read_records(paths):
             heur.append(data[p + 6])
             r = struct.unpack_from(f"<{nres}h", data, p + 7)
             res.append(r[:4])
-            ctx.append(r[4:6] if nres == 6 else (0, 0))
-            feats.append(buf[p + 7 + 2 * nres : p + rec])
+            ctx.append(r[4:6] if nres >= 6 else (0, 0))
+            pres.append(r[6:8] if nres == 8 else (0, 0))
+            has_pass.append(bool(flag and data[p + 7 + 2 * nres]))
+            waitfmt.append(fmt >= 3)
+            feats.append(buf[p + 7 + 2 * nres + flag : p + rec])
             p += rec
         # Files played from 0-0 get game scores attached in training.
         scored = any(c != (0, 0) for c in ctx[start:])
@@ -64,6 +75,9 @@ def read_records(paths):
         rounds=np.array(round_res, np.int32),
         ctx=np.array(ctx, np.int32).reshape(-1, 2),
         has_ctx=np.array(has_ctx, bool),
+        pres=np.array(pres, np.int32).reshape(-1, 2),  # mine/theirs after waiting and passing
+        has_pass=np.array(has_pass, bool),
+        waitfmt=np.array(waitfmt, bool),
     )
 
 
@@ -154,6 +168,7 @@ def main():
     ap.add_argument("--val", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--old-small", action="store_true", help="train the Small head on pre-format-3 records too")
     ap.add_argument("--write-states", help="write sampled game states (for calllabel --scores) and exit")
     args = ap.parse_args()
 
@@ -196,6 +211,14 @@ def main():
     is_val = np.array([r in val_rounds for r in d["round"]])
     tr, va = np.flatnonzero(~is_val), np.flatnonzero(is_val)
 
+    wait_mode = bool((d["waitfmt"] & (d["kind"] == 1)).any())
+    small_ok = (d["kind"] == 0) | d["waitfmt"] | (not wait_mode) | args.old_small
+    tr, va = tr[small_ok[tr]], va[small_ok[va]]
+    print(f"small head: {'call / pass vs wait' if wait_mode else 'call vs never'}, "
+          f"{d['has_pass'].sum()} records with a pass branch; {len(tr)} train, {len(va)} val")
+    # Labels of the pass branch: pass-and-wait against wait-and-play.
+    pres_full = np.concatenate([d["res"][:, :2], d["pres"]], 1)
+
     X = torch.tensor(d["x"], dtype=torch.uint8, device=dev)
     kind = torch.tensor(d["kind"].astype(np.int64), device=dev)
     res = d["res"]
@@ -203,6 +226,8 @@ def main():
     va_ctx = contexts(len(va), va)
     va_y = labels(win, res[va], va_ctx)
     va_y0 = labels(win, res[va], np.zeros((len(va), 2), int))
+    va_yp = labels(win, pres_full[va], va_ctx)
+    va_yp0 = labels(win, pres_full[va], np.zeros((len(va), 2), int))
 
     in_dim = sd + ed + 3
 
@@ -212,14 +237,18 @@ def main():
             h1, h2 = args.hidden
             self.trunk = nn.Sequential(nn.Linear(in_dim, h1), nn.ReLU(), nn.Linear(h1, h2), nn.ReLU())
             self.heads = nn.ModuleList(
-                [nn.Sequential(nn.Linear(h2, args.head), nn.ReLU(), nn.Linear(args.head, 1)) for _ in range(2)]
+                [nn.Sequential(nn.Linear(h2, args.head), nn.ReLU(), nn.Linear(args.head, o)) for o in (1, 2 if wait_mode else 1)]
             )
 
         def forward(self, x, k):
+            """(B, 2): call gain, and (Small, wait mode) pass gain."""
             h = self.trunk(x)
-            g = self.heads[0](h).squeeze(-1)
-            s = self.heads[1](h).squeeze(-1)
-            return torch.where(k == 0, g, s)
+            g = self.heads[0](h)
+            s = self.heads[1](h)
+            g = torch.cat([g, torch.zeros_like(g)], 1)
+            if s.shape[1] == 1:
+                s = torch.cat([s, torch.zeros_like(s)], 1)
+            return torch.where((k == 0).unsqueeze(1), g, s)
 
     def inputs(idx, ctx):
         x = X[idx].float() / 255.0
@@ -240,17 +269,30 @@ def main():
                 j = idx[i : i + 8192]
                 out.append(model(inputs(j, ctx[i : i + 8192]), kind[j]).cpu().numpy())
         model.train()
-        return np.concatenate(out) if out else np.zeros(0)
+        return np.concatenate(out) if out else np.zeros((0, 2))
 
     def report(tag):
         lines = []
-        for ctx, y, name in [(va_ctx, va_y, "game scores"), (np.zeros((len(va), 2), int), va_y0, "0-0")]:
-            p = predict(va, ctx)
+        for ctx, y, yp, name in [(va_ctx, va_y, va_yp, "game scores"), (np.zeros((len(va), 2), int), va_y0, va_yp0, "0-0")]:
+            pp = predict(va, ctx)
+            p = pp[:, 0]
             for k, kname in [(0, "grand"), (1, "small")]:
                 m = d["kind"][va] == k
                 if m.sum() == 0:
                     continue
                 yk, pk = y[m], p[m]
+                if k == 1 and wait_mode:
+                    hp = d["has_pass"][va][m]
+                    q1 = np.where(hp, pp[m, 1], -np.inf)
+                    ypk = yp[m]
+                    act = np.where((pk > 0) & (pk >= q1), 1, np.where(q1 > 0, 2, 0))
+                    v3 = np.where(act == 1, yk, np.where(act == 2, ypk, 0)).mean()
+                    best3 = np.maximum(np.maximum(yk, np.where(hp, ypk, -np.inf)), 0).mean()
+                    r2p = 1 - ((ypk[hp] - pp[m, 1][hp]) ** 2).mean() / max(ypk[hp].var(), 1e-9) if hp.any() else float("nan")
+                    lines.append(
+                        f"  small+pass @ {name}: pass R2 {r2p:.3f} | with passing: model {v3:+.3f} "
+                        f"(calls {100 * (act == 1).mean():.1f}%, passes {100 * (act == 2).mean():.1f}%), hindsight {best3:+.3f}"
+                    )
                 r2 = 1 - ((yk - pk) ** 2).mean() / yk.var()
                 h = d["heur"][va][m] == 2
                 # Offline value of each policy: mean gain of the calls it makes.
@@ -274,7 +316,10 @@ def main():
             idx = perm[i : i + args.batch]
             ctx = contexts(len(idx), idx)
             y = torch.tensor(labels(win, res[idx], ctx), dtype=torch.float32, device=dev)
-            loss = ((model(inputs(idx, ctx), kind[idx]) - y) ** 2).mean()
+            yp = torch.tensor(labels(win, pres_full[idx], ctx), dtype=torch.float32, device=dev)
+            mp = torch.tensor(d["has_pass"][idx], dtype=torch.float32, device=dev)
+            out = model(inputs(idx, ctx), kind[idx])
+            loss = ((out[:, 0] - y) ** 2 + mp * (out[:, 1] - yp) ** 2).mean()
             opt.zero_grad()
             loss.backward()
             opt.step()

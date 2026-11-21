@@ -146,10 +146,24 @@ pub fn play_dealt_round(
 pub fn play_from(
     state: &mut GameState,
     bots: &mut [Box<dyn Bot>; 4],
-    mut obs: Option<Observer>,
+    obs: Option<Observer>,
     ask_small_tichu: bool,
 ) -> Result<RoundResult, SimError> {
-    let mut asked_small = !ask_small_tichu;
+    play_from_with(state, bots, obs, ask_small_tichu, false)
+}
+
+/// `play_from`, for a state where the opening Small Tichu offer (to all
+/// four seats when play begins) has already been made if
+/// `opening_offer_done`: then seats are only offered Small Tichu before
+/// their own turns, as in the original round.
+pub fn play_from_with(
+    state: &mut GameState,
+    bots: &mut [Box<dyn Bot>; 4],
+    mut obs: Option<Observer>,
+    ask_small_tichu: bool,
+    opening_offer_done: bool,
+) -> Result<RoundResult, SimError> {
+    let mut asked_small = !ask_small_tichu || opening_offer_done;
     for _step in 0..5000 {
         match state.pending() {
             Pending::GrandTichu(seats) => {
