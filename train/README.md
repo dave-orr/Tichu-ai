@@ -218,6 +218,23 @@ generations of data; three generations with the old target +3.8 and +2.0;
 both together **+7.7 ± 2.9 and +6.8 ± 2.9**. `iterate.py --prior0 PT --window
 3 --data0 OLD.bin,...` runs the loop that way.
 
+### v4: `--prior`, window 3, from the +7.7 net (`start`)
+
+`--prior0 start.pt --window 3 --data0 v3/gen1.bin,v3/gen2.bin`, teacher as
+v3. 4000 deals per match:
+
+| gen | vs h2 | vs previous | vs start | vs v3 gen2 | label acc |
+|---|---|---|---|---|---|
+| 0 | +60.7 ± 3.4 | | +0.5 ± 2.7 | +11.6 ± 3.0 | 78.9% |
+| 1 | +60.6 ± 3.4 | +1.0 ± 2.7 | +2.5 ± 2.7 | +10.2 ± 2.9 | 80.2% |
+| 2 | +60.8 ± 3.4 | +1.4 ± 2.8 | +3.5 ± 2.8 | +11.7 ± 3.0 | 81.5% |
+| 3 | +61.6 ± 3.4 | +0.2 ± 2.5 | +4.4 ± 2.7 | +12.5 ± 2.9 | 82.4% |
+
+gen3 is the best net so far: +12.5 over v3's best and +61.6 over h2 (v3
+gen2: +52.7). Most of that came from the training changes (the start net);
+each further generation adds about a point. The teacher's numbers don't move
+(overrides 4.8–5.0%, reliability 0.74), and value R² stays at 0.39–0.43.
+
 Why the student lags the teacher: at 24 samples 29% of the variance of a
 label's Q difference is noise (60% at 6 samples, 9% at 96), and the teacher
 overrides the net in only 5% of decisions (`selfplay` prints these as

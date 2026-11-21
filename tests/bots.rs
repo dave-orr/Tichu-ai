@@ -60,7 +60,7 @@ fn malformed_names_are_rejected() {
     let bad = [
         "", "nope", "pimc", "pimcx", "pimc2@", "pimc2@1.5", "pimc2/z", "pimc2/hz", "oracle1/q", "oraclex",
         "h2~", "h2~nope=1", "h2~shed", "h2~shed=x", "calls:h2", "calls:zz:h2", "calls:1:nope", "nocalls:nope",
-        "eg:", "eg:nope", "net:/no/such/model.tnet", "vpimc2:/no/such/model.tnet", "vpimcx:/x", "random2", "pass2", "pass2:", "pass2:nope", "pass2~q:h2", "pass2z:h2", "label:h2", "label0:h2", "label2", "label2/z:h2", "label2/ix:h2", "label2/a:h2", "label2/p3:h2", "label2/p:h2", "label2:nope", "net@0:/x", "net@-1:/x", "net@x:/x",
+        "eg:", "eg:nope", "net:/no/such/model.tnet", "vpimc2:/no/such/model.tnet", "vpimcx:/x", "random2", "pass2", "pass2:", "pass2:nope", "pass2~q:h2", "pass2z:h2", "label:h2", "label0:h2", "label2", "label2/z:h2", "label2/ix:h2", "label2/a:h2", "label2/p3:h2", "search:/no/such/model.tnet", "search:", "label2/p:h2", "label2:nope", "net@0:/x", "net@-1:/x", "net@x:/x",
     ];
     for name in bad {
         // "h2~" (empty params) is fine to accept; everything else must fail.
