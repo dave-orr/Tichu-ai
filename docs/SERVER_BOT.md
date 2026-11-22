@@ -20,7 +20,7 @@ no GPU).
 ## Decision speed
 
 `cargo run --release --example decision_time -- best h2 40` times every
-decision on one thread. See the README section on `best` for the numbers.
+decision on one thread. See the README section on `best` for the numbers: about 0.12 s per play on average, 0.3 s at p99.
 Plays are the only slow decisions; calls, passes, bombs, wishes and Dragon
 gifts take under 0.1 s. Forced plays (one legal option) are instant.
 
