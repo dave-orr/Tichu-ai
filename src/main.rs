@@ -44,6 +44,9 @@ usage:
                       keep its choice unless another is clearly ahead
       --played-only   record only the option played (one-option records, no history
                       tokens): Deep Monte Carlo data for train/dmc.py
+      --critic P      with --played-only: on this share of decisions, play the round out
+                      from the real deal after each of the top --critic-k options (4),
+                      with --rollout in all seats, and record those margins as Q
       --seed S, --threads T
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
@@ -204,6 +207,8 @@ fn main() {
                 q_max: args.num("q-max").unwrap_or(0),
                 anchor: args.num("anchor").unwrap_or(0),
                 played_only: args.has("played-only"),
+                critic: args.num("critic").unwrap_or(0.0),
+                critic_k: args.num("critic-k").unwrap_or(4),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");

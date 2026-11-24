@@ -59,11 +59,16 @@ from tichu_data import BLOCK, FORMAT_VERSION, HEADER, REC  # noqa: E402
 from train import TichuNet, write_tnet  # noqa: E402
 
 
-def read_played(path):
+def read_played(path, critic_k=4):
     """A `selfplay --played-only` file -> (states [N, S] u8, actions [N, A]
     u8, margin [N] f32, out_first [N] int64 (who went out first: 0 an
-    opponent, 1 this seat, 2 its partner), dims). Vectorised per block: every
-    record has one option, no Q and no history tokens."""
+    opponent, 1 this seat, 2 its partner), dims, critic). Vectorised per
+    block: every record has one option, no Q and no history tokens.
+
+    `critic` holds the `--critic` records (blocks whose records carry Q):
+    states [M, S] u8, options [M, K, A] u8 (zero padded) and their Q [M, K]
+    f32 (NaN padded, my team's margin after playing each out on the real
+    deal), with K = `critic_k`."""
     buf = open(path, "rb").read()
     magic, version, fv, S, A, D = HEADER.unpack_from(buf, 0)
     if magic != b"TCHR" or version != FORMAT_VERSION:
@@ -71,9 +76,24 @@ def read_played(path):
     data = np.frombuffer(buf, dtype=np.uint8)
     R = REC.size + S + A
     parts, pos = [], HEADER.size
+    cs, ca, cq = [], [], []
     while pos < len(buf):
         _rnd, _seat, nt, nr = BLOCK.unpack_from(buf, pos)
         pos += BLOCK.size + nt * D
+        if nr and buf[pos] & 1:
+            for _ in range(nr):
+                _flags, n, _label, _prefix, _margin = REC.unpack_from(buf, pos)
+                body = pos + REC.size
+                k = min(n, critic_k)
+                cs.append(data[body:body + S])
+                opts = np.zeros((critic_k, A), np.uint8)
+                opts[:k] = data[body + S:body + S + k * A].reshape(k, A)
+                ca.append(opts)
+                q = np.full(critic_k, np.nan, np.float32)
+                q[:k] = np.frombuffer(buf, dtype="<f4", count=n, offset=body + S + n * A)[:k]
+                cq.append(q)
+                pos = body + S + n * A + 4 * n
+            continue
         parts.append(data[pos:pos + nr * R].reshape(nr, R))
         pos += nr * R
     if pos != len(buf):
@@ -85,7 +105,10 @@ def read_played(path):
     margin = np.ascontiguousarray(rows[:, 7:11]).view("<f4").ravel().astype(np.float32)
     dims = dict(feature_version=fv, state_dim=S, action_dim=A, token_dim=D)
     out_first = ((rows[:, 0] >> 1) & 3).astype(np.int64)
-    return rows[:, REC.size:REC.size + S], rows[:, REC.size + S:], margin, out_first, dims
+    critic = (np.stack(cs) if cs else np.zeros((0, S), np.uint8),
+              np.stack(ca) if ca else np.zeros((0, critic_k, A), np.uint8),
+              np.stack(cq) if cq else np.zeros((0, critic_k), np.float32))
+    return rows[:, REC.size:REC.size + S], rows[:, REC.size + S:], margin, out_first, dims, critic
 
 
 def arch_of(sd):
@@ -136,6 +159,60 @@ class Buffer:
     def sample(self, n, gen):
         i = torch.randint(self.size, (n,), device=self.s.device, generator=gen)
         return self.s[i], self.a[i], self.y[i], self.f[i]
+
+
+class CriticBuffer:
+    """The newest `cap` critic records on the device, as a ring."""
+
+    def __init__(self, cap, S, K, A, dev):
+        self.cap, self.size, self.head = cap, 0, 0
+        self.s = torch.empty((cap, S), dtype=torch.uint8, device=dev)
+        self.a = torch.empty((cap, K, A), dtype=torch.uint8, device=dev)
+        self.q = torch.empty((cap, K), dtype=torch.float32, device=dev)
+
+    def add(self, s, a, q):
+        n = min(len(s), self.cap)
+        if n == 0:
+            return
+        s, a, q = s[-n:], a[-n:], q[-n:]
+        dev = self.s.device
+        T = lambda x: torch.from_numpy(np.ascontiguousarray(x)).to(dev)  # noqa: E731
+        s, a, q = T(s), T(a), T(q)
+        first = min(n, self.cap - self.head)
+        for dst, src in ((self.s, s), (self.a, a), (self.q, q)):
+            dst[self.head:self.head + first] = src[:first]
+            dst[:n - first] = src[first:]
+        self.head = (self.head + n) % self.cap
+        self.size = min(self.cap, self.size + n)
+
+    def sample(self, n, gen):
+        i = torch.randint(self.size, (n,), device=self.s.device, generator=gen)
+        return self.s[i], self.a[i], self.q[i]
+
+
+def option_advantages(model, s, a):
+    """The policy head (the dueling advantage) for every option: s [B, S],
+    a [B, K, A] (uint8) -> [B, K]."""
+    s = s.float() / 255.0
+    a = a.float() / 255.0
+    h = model.forward_trunk(s, s.new_zeros(len(s), 0))
+    hk = h.unsqueeze(1).expand(-1, a.shape[1], -1)
+    return model._head(model.policy, torch.cat([hk, a], dim=-1)).squeeze(-1)
+
+
+def critic_loss(adv, q, scale):
+    """MSE between the advantages and the critic's margins (in --value-scale
+    units), both centred over each record's options; and the sums for an R²
+    (squared error, squared centred target, count of options)."""
+    m = ~torch.isnan(q)
+    mf = m.float()
+    k = mf.sum(-1, keepdim=True).clamp(min=1)
+    qq = torch.where(m, q / scale, torch.zeros_like(q))
+    qc = (qq - (qq * mf).sum(-1, keepdim=True) / k) * mf
+    ac = (adv - (adv * mf).sum(-1, keepdim=True) / k) * mf
+    se = ((ac - qc) ** 2).sum()
+    n = mf.sum().clamp(min=1)
+    return se / n, se, (qc ** 2).sum(), n
 
 
 def q_and_values(model, s, a, dueling):
@@ -194,6 +271,14 @@ def main():
                     help="ramp the learning rate up over this many steps (for a fresh optimizer on a grown net)")
     ap.add_argument("--value-weight", type=float, default=0.25, help="weight of the state-value losses (exported value and trunk head)")
     ap.add_argument("--value-scale", type=float, default=100.0)
+    ap.add_argument("--critic", type=float, default=0.0,
+                    help="share of decisions the all-seeing critic grades: each of the top --critic-k options is "
+                         "played out on the real deal by the actor (players still see only their own hands), and "
+                         "the advantages are trained on those margins' differences")
+    ap.add_argument("--critic-k", type=int, default=4)
+    ap.add_argument("--critic-weight", type=float, default=1.0)
+    ap.add_argument("--critic-batch", type=int, default=512)
+    ap.add_argument("--critic-buffer", type=int, default=1_000_000)
     ap.add_argument("--first-weight", type=float, default=0.1,
                     help="weight of the who-goes-out-first loss (a head on the trunk, for learning calls later)")
     ap.add_argument("--dueling", type=int, default=1,
@@ -256,10 +341,10 @@ def main():
     else:
         arch = dict(hidden=args.hidden, depth=args.depth, head=args.head, value_net=args.value_net, dueling=args.dueling)
     dims = resume["dims"] if resume is not None else None
-    model = opt = buf = first_head = None
+    model = opt = buf = first_head = cbuf = None
 
     def build(dims_):
-        nonlocal model, opt, buf, first_head
+        nonlocal model, opt, buf, first_head, cbuf
         model = TichuNet(dims_["state_dim"], dims_["action_dim"], arch["hidden"], arch["depth"], arch["head"],
                          dims_["token_dim"], 0, arch["value_net"]).to(dev)
         if resume is not None:
@@ -277,6 +362,7 @@ def main():
             # start the head and the optimizer afresh.
             say("learner.pt has no first-out head: starting it (and the optimizer) fresh")
         buf = Buffer(args.buffer, dims_["state_dim"], dims_["action_dim"], dev)
+        cbuf = CriticBuffer(args.critic_buffer, dims_["state_dim"], args.critic_k, dims_["action_dim"], dev)
 
     st = resume["state"] if resume is not None else dict(chunk=0, steps=0, budget=0.0, records=0, example=None)
     if dims is not None:
@@ -315,7 +401,7 @@ def main():
                    os.path.join(d, "latest.first.pt"))
 
     train_time = [0.0]
-    last_loss = [float("nan"), float("nan"), float("nan")]
+    last_loss = [float("nan"), float("nan"), float("nan"), float("nan")]
 
     def train_steps(n):
         t0 = time.time()
@@ -327,6 +413,11 @@ def main():
             vl = F.mse_loss(tv, y) + (F.mse_loss(v, y) if model.value_net is not None else 0)
             fl = F.cross_entropy(first_head(h), f)
             loss = ql + args.value_weight * vl + args.first_weight * fl
+            cl = torch.zeros((), device=dev)
+            if cbuf.size >= args.critic_batch:
+                cs_, ca_, cq_ = cbuf.sample(args.critic_batch, gen)
+                cl = critic_loss(option_advantages(model, cs_, ca_), cq_, args.value_scale)[0]
+                loss = loss + args.critic_weight * cl
             if args.warmup:
                 for g in opt.param_groups:
                     g["lr"] = args.lr * min(1.0, (st["steps"] + 1) / args.warmup)
@@ -335,7 +426,7 @@ def main():
             opt.step()
             st["steps"] += 1
             if st["steps"] % 50 == 0:
-                last_loss[:] = [ql.item(), vl.item(), fl.item()]
+                last_loss[:] = [ql.item(), vl.item(), fl.item(), cl.item()]
         train_time[0] += time.time() - t0
 
     def train_while(proc):
@@ -351,6 +442,9 @@ def main():
         cmd = [args.tichu, "selfplay", "--bot", actor, "--played-only", "--explore", str(args.explore),
                "--rounds", str(args.chunk_rounds), "--seed", str(1_000_000 * (args.seed + 1) + k),
                "--out", chunk_path(k) + ".part"]
+        if args.critic > 0:
+            # The critic's players are the actor itself (view-only bots).
+            cmd += ["--critic", str(args.critic), "--critic-k", str(args.critic_k), "--rollout", actor]
         if args.threads:
             cmd += ["--threads", str(args.threads)]
         out = open(os.path.join(d, "selfplay.txt"), "a", encoding="utf-8")
@@ -388,8 +482,9 @@ def main():
             chosen.append(f)
             loaded += (os.path.getsize(f) - HEADER.size) // (REC.size + dims["state_dim"] + dims["action_dim"])
         for f in reversed(chosen):
-            s, a, y, fo, _ = read_played(f)
+            s, a, y, fo, _, cr = read_played(f, args.critic_k)
             buf.add(s, a, y / args.value_scale, fo)
+            cbuf.add(*cr)
         say(f"buffer refilled from {len(chosen)} chunk files: {buf.size} records")
 
     for f in glob.glob(os.path.join(d, "*.part")):
@@ -416,7 +511,7 @@ def main():
         if rc != 0:
             raise SystemExit(f"selfplay for chunk {k} failed ({rc}); see {os.path.join(d, 'selfplay.txt')}")
         os.replace(chunk_path(k) + ".part", chunk_path(k))
-        s, a, y, fo, dims_k = read_played(chunk_path(k))
+        s, a, y, fo, dims_k, cr = read_played(chunk_path(k), args.critic_k)
         if dims is None:
             dims = dims_k
             build(dims)
@@ -444,22 +539,44 @@ def main():
             q_r2 = 1 - F.mse_loss(q_, yy).item() / var
             v_r2 = 1 - F.mse_loss(v_, yy).item() / var
             adv_sd = (q_ - v_).std().item() * args.value_scale
+            # The advantages against the critic's labels, on records it hasn't seen.
+            c_r2, c_agree = float("nan"), float("nan")
+            if len(cr[0]):
+                cn = min(len(cr[0]), 50_000)
+                cs_, ca_, cq_ = (torch.from_numpy(x[:cn]).to(dev) for x in cr)
+                tot = np.zeros(3)
+                agree = []
+                for i in range(0, cn, 4096):
+                    adv_ = option_advantages(model, cs_[i:i + 4096], ca_[i:i + 4096])
+                    _, se, sst, _ = critic_loss(adv_, cq_[i:i + 4096], args.value_scale)
+                    tot += [se.item(), sst.item(), 0]
+                    qb = cq_[i:i + 4096]
+                    m = ~torch.isnan(qb)
+                    best_q = torch.where(m, qb, torch.full_like(qb, -1e9)).max(-1).values
+                    pick = torch.where(m, adv_, torch.full_like(adv_, -1e9)).argmax(-1)
+                    # Ties count: the net's pick is one of the critic's best.
+                    agree.append((qb.gather(1, pick[:, None]).squeeze(1) == best_q).float())
+                c_r2 = 1 - tot[0] / max(tot[1], 1e-9)
+                c_agree = torch.cat(agree).mean().item()
         model.train()
         i0 = len(s) // 2
         st["example"] = dict(state=s[i0].tolist(), action=a[i0].tolist())
         buf.add(s, a, y, fo)
+        cbuf.add(*cr)
         st["records"] += len(s)
         st["budget"] += args.replay * len(s) / args.batch
         st["chunk"] = k + 1
         rounds_s = args.chunk_rounds / sp_secs
         say(f"chunk {k}: {len(s)} records ({rounds_s:.1f} rounds/s, actor {os.path.basename(actor)}); "
             f"fresh-data R² Q {q_r2:.3f}, value {v_r2:.3f}, sd(Q − V) {adv_sd:.1f} pts; "
-            f"margin sd {np.sqrt(var) * args.value_scale:.0f} pts; first out: log loss {f_ll:.3f} vs {f_base:.3f} "
+            f"margin sd {np.sqrt(var) * args.value_scale:.0f} pts; critic: {len(cr[0])} records, advantage R² "
+            f"{c_r2:.3f}, picks a critic-best option {c_agree:.0%}; first out: log loss {f_ll:.3f} vs {f_base:.3f} "
             f"base rate, P(me) Brier {f_brier:.3f} (I'm first {f_rate:.0%}); steps {st['steps']} "
-            f"(loss Q {last_loss[0]:.3f}, V {last_loss[1]:.3f}, first {last_loss[2]:.3f}; "
-            f"{train_time[0]:.0f}s training); buffer {buf.size}")
+            f"(loss Q {last_loss[0]:.3f}, V {last_loss[1]:.3f}, first {last_loss[2]:.3f}, critic {last_loss[3]:.3f}; "
+            f"{train_time[0]:.0f}s training); buffer {buf.size}, critic buffer {cbuf.size}")
         jot(event="chunk", chunk=k, records=len(s), rounds_per_s=rounds_s, q_r2=q_r2, v_r2=v_r2, adv_sd=adv_sd,
             first_ll=f_ll, first_base_ll=f_base, first_brier=f_brier, first_rate=f_rate,
+            critic_records=len(cr[0]), critic_r2=c_r2, critic_agree=c_agree, loss_critic=last_loss[3],
             steps=st["steps"], loss_q=last_loss[0], loss_v=last_loss[1], loss_first=last_loss[2], train_secs=train_time[0],
             buffer=buf.size, elapsed=time.time() - run_t0)
         train_time[0] = 0.0
