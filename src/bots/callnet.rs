@@ -164,6 +164,13 @@ impl CallNetBot {
     }
 }
 
+/// Never call over the partner's call, as the v2 rules and people don't: at
+/// most one of us can go out first. The models rarely saw this case in their
+/// labels and sometimes called anyway.
+fn partner_called(view: &PlayerView) -> bool {
+    view.players[view.partner()].tichu != TichuCall::None
+}
+
 impl Bot for CallNetBot {
     fn name(&self) -> String {
         format!("callnet:{}", self.inner.name())
@@ -172,13 +179,13 @@ impl Bot for CallNetBot {
         if !self.grand {
             return self.inner.grand_tichu(view);
         }
-        self.net.gain(view, true) > self.threshold
+        !partner_called(view) && self.net.gain(view, true) > self.threshold
     }
     fn small_tichu(&mut self, view: &PlayerView) -> bool {
         if !self.small {
             return self.inner.small_tichu(view);
         }
-        self.net.gain(view, false) > self.threshold
+        !partner_called(view) && self.net.gain(view, false) > self.threshold
     }
     fn pass_cards(&mut self, view: &PlayerView) -> PassInfo {
         self.inner.pass_cards(view)
@@ -252,8 +259,13 @@ mod tests {
             let mut state = GameState::new(Settings::default());
             state.start_round(shuffled_deck(&mut StdRng::seed_from_u64(seed)));
             let r = play_dealt_round(&mut state, &mut bots, None).unwrap();
-            // Threshold -1000: everyone calls Grand.
-            assert!(r.tichu_calls.iter().all(|c| *c == TichuCall::Grand));
+            // Threshold -1000: everyone would call, but never over the
+            // partner, so one Grand per team and no Small calls.
+            for team in 0..2 {
+                let calls = [r.tichu_calls[team], r.tichu_calls[team + 2]];
+                assert_eq!(calls.iter().filter(|c| **c == TichuCall::Grand).count(), 1, "{:?}", r.tichu_calls);
+                assert!(calls.contains(&TichuCall::None), "{:?}", r.tichu_calls);
+            }
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&bad);
