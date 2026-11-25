@@ -22,6 +22,7 @@ usage:
       --threads T     worker threads (default: all cores)
       --no-duplicate  play each deal once instead of once per seating
       --clockwise     clockwise play direction
+      --progress FILE append a JSON line per finished deal or game to FILE
       --log DIR       write game logs (deal-NNNN.json, both seatings) for
                       the first --log-deals deals (default 20) to DIR
   tichu replay <LOG.json>... [--out FILE] [--json]
@@ -38,12 +39,16 @@ usage:
       --rollout NAME  rollout policy for --q (default heuristic; e.g. net:models/q10.tnet)
       --explore P     play a random option with probability P (the label is still recorded)
       --exact-endgame with --q: label two-player endgames with the solver's exact values
+      --pass-fill     with --q: give the other seats of each guessed deal their pass knowledge
       --infer K       with --q: weight guessed deals by the others' plays (K candidates each)
       --q-max M       with --q: keep sampling (up to M) until the best option is clearly ahead
       --anchor K      with --q and a net rollout: search only the net's top K options and
                       keep its choice unless another is clearly ahead
       --played-only   record only the option played (one-option records, no history
                       tokens): Deep Monte Carlo data for train/dmc.py
+      --critic P      with --played-only: on this share of decisions, play the round out
+                      from the real deal after each of the top --critic-k options (4),
+                      with --rollout in all seats, and record those margins as Q
       --seed S, --threads T
   tichu calllabel --out FILE [options]    Tichu / Grand Tichu call records for train/calls.py
       --bot NAME      bot in all four seats and the rollouts (default h2)
@@ -94,7 +99,7 @@ impl Args {
         while i < raw.len() {
             let s = &raw[i];
             if let Some(f) = s.strip_prefix("--") {
-                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only" | "exact-endgame" | "played-only");
+                let takes_value = !matches!(f, "no-duplicate" | "clockwise" | "json" | "body-only" | "exact-endgame" | "played-only" | "pass-fill");
                 let v = if takes_value { i += 1; raw.get(i).cloned() } else { None };
                 if takes_value && v.is_none() {
                     eprintln!("--{f} needs a value");
@@ -148,6 +153,9 @@ fn main() {
             if let Some((_, Some(dir))) = args.flags.iter().find(|(k, _)| k == "log") {
                 cfg.log_dir = Some(dir.into());
                 cfg.log_deals = args.num("log-deals").unwrap_or(20);
+            }
+            if let Some((_, Some(p))) = args.flags.iter().find(|(k, _)| k == "progress") {
+                cfg.progress = Some(p.into());
             }
             let start = std::time::Instant::now();
             let report = arena::run(&a, &*factory(&a), &b, &*factory(&b), &cfg);
@@ -222,6 +230,9 @@ fn main() {
                 q_max: args.num("q-max").unwrap_or(0),
                 anchor: args.num("anchor").unwrap_or(0),
                 played_only: args.has("played-only"),
+                critic: args.num("critic").unwrap_or(0.0),
+                critic_k: args.num("critic-k").unwrap_or(4),
+                pass_fill: args.has("pass-fill"),
             };
             let file = std::fs::File::create(&out).unwrap_or_else(|e| {
                 eprintln!("{out}: {e}");

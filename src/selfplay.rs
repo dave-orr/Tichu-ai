@@ -14,7 +14,11 @@
 //!
 //! With `played_only` (`--played-only`) each record holds just the option
 //! that was played, as a one-option record with label 0, and blocks carry
-//! no history tokens: the compact data `train/dmc.py` learns from.
+//! no history tokens: the compact data `train/dmc.py` learns from. With
+//! `critic` > 0 some decisions also get a critic record (in a second block
+//! for the seat): up to `critic_k` options, the played one first (label 0),
+//! each with Q = my team's margin when the round is played out from the real
+//! state after that option.
 //!
 //! File layout (little endian): a 24-byte header — `b"TCHR"`, format
 //! version, `FEATURE_VERSION`, `STATE_DIM`, `ACTION_DIM`, `TOKEN_DIM` (u32
@@ -46,7 +50,7 @@ use crate::bots;
 use crate::deck::shuffled_deck;
 use crate::endgame;
 use crate::infer;
-use crate::engine::{Action, GameState};
+use crate::engine::{Action, GameState, Pending};
 use crate::features::*;
 use crate::scoring::RoundResult;
 use crate::sim::{play_dealt_round, play_from};
@@ -91,6 +95,18 @@ pub struct SelfplayConfig {
     /// tokens: the data for Deep Monte Carlo training (`train/dmc.py`),
     /// which regresses the played option's value onto the round's margin.
     pub played_only: bool,
+    /// With `played_only`: on this share of decisions, a critic that sees
+    /// the real deal plays the round out once for each of up to `critic_k`
+    /// options (the one played and the net's next best), with `rollout` in
+    /// all four seats. The rollout players still see only their own hands;
+    /// only the critic knows the deal. Every option is played out from the
+    /// same state with the same deterministic bots, so the deal's luck cancels
+    /// out of the differences. Written as extra blocks of records with Q (see
+    /// the module docs).
+    pub critic: f64,
+    pub critic_k: usize,
+    /// With `q_samples`: `Teacher::fill`.
+    pub pass_fill: bool,
 }
 
 /// The policy net of a `net:PATH` / `net@T:PATH` bot name.
@@ -145,10 +161,11 @@ pub fn pimc_q(
     samples: usize,
     infer: usize,
     max_samples: usize,
+    fill: bool,
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<f32> {
-    let rows = pimc_rows(view, plays, cands, samples, infer, max_samples, rollout, rng);
+    let rows = pimc_rows(view, plays, cands, samples, infer, max_samples, fill, rollout, rng);
     let m = rows.len().max(1) as f64;
     (0..cands.len()).map(|k| (rows.iter().map(|r| r[k]).sum::<f64>() / m) as f32).collect()
 }
@@ -163,13 +180,18 @@ fn pimc_rows(
     samples: usize,
     infer: usize,
     max_samples: usize,
+    fill: bool,
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<Vec<f64>> {
+    let mut fill_rng = StdRng::seed_from_u64(if fill { rng.gen() } else { 0 });
     let team = view.my_team();
     let n = cands.len();
-    let run = |guess: [Vec<Card>; 4], rollout: &mut [Box<dyn Bot>; 4]| -> Vec<f64> {
-        let base = GameState::from_view_with_history(view, guess);
+    let mut run = |guess: [Vec<Card>; 4], rollout: &mut [Box<dyn Bot>; 4]| -> Vec<f64> {
+        let mut base = GameState::from_view_with_history(view, guess);
+        if fill {
+            crate::passfill::guess_passes(&mut base, view, &mut fill_rng);
+        }
         cands
             .options
             .iter()
@@ -307,6 +329,10 @@ pub struct Teacher {
     /// keep its choice unless another is clearly ahead (`clearly_ahead`).
     pub anchor: Option<Arc<Net>>,
     pub anchor_k: usize,
+    /// Give the other seats of each guessed deal their pass knowledge
+    /// (`passfill::guess_passes`); without it they play as if they had
+    /// forgotten what they passed and received.
+    pub fill: bool,
 }
 
 impl Teacher {
@@ -328,7 +354,7 @@ impl Teacher {
             }
         }
         let Some(net) = &self.anchor else {
-            let q = pimc_q(view, plays, cands, self.q_samples, self.infer, self.q_max, rollout, rng);
+            let q = pimc_q(view, plays, cands, self.q_samples, self.infer, self.q_max, self.fill, rollout, rng);
             return (argmax(&q), q);
         };
         let logits = net.option_logits(view, cands);
@@ -340,7 +366,7 @@ impl Teacher {
             features: order.iter().flat_map(|&k| cands.features[k * ACTION_DIM..(k + 1) * ACTION_DIM].iter().copied()).collect(),
             group_of: vec![],
         };
-        let rows = pimc_rows(view, plays, &sub, self.q_samples, self.infer, self.q_max, rollout, rng);
+        let rows = pimc_rows(view, plays, &sub, self.q_samples, self.infer, self.q_max, self.fill, rollout, rng);
         let m = rows.len().max(1) as f64;
         let mean: Vec<f64> = (0..sub.len()).map(|k| rows.iter().map(|r| r[k]).sum::<f64>() / m).collect();
         let best = (0..sub.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
@@ -557,6 +583,53 @@ struct Recorder {
     played_only: bool,
     recs: Vec<Rec>,
     out: Rc<RefCell<Vec<Block>>>,
+    critic: f64,
+    critic_k: usize,
+    /// Ranks the options for the critic (the playing net, else the rollout net).
+    critic_net: Option<Arc<Net>>,
+    /// The real state at this seat's turn (`Bot::peek`), for the critic only.
+    real: Option<GameState>,
+    critic_recs: Vec<Rec>,
+}
+
+impl Recorder {
+    /// The critic's record for this decision: the played option `act` and
+    /// the net's next best, each played out from the real state.
+    fn critique(&mut self, view: &PlayerView, plays: &[Combo], cands: &Candidates, act: usize, state: &[u8]) -> Option<Rec> {
+        let real = self.real.as_ref().filter(|g| g.pending() == Pending::Turn(view.seat))?;
+        let mut order: Vec<usize> = (0..cands.len()).filter(|&k| k != act).collect();
+        if let Some(net) = &self.critic_net {
+            let logits = net.option_logits(view, cands);
+            order.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+        }
+        order.insert(0, act);
+        order.truncate(self.critic_k.max(2));
+        let team = view.my_team();
+        let q: Vec<f32> = order
+            .iter()
+            .map(|&k| {
+                let mut g = real.clone();
+                let action = match cands.options[k] {
+                    Some(i) => Action::Play { seat: view.seat, cards: plays[i].cards.clone(), phoenix_as: plays[i].phoenix_as },
+                    None => Action::PassTurn { seat: view.seat },
+                };
+                g.apply(&action).expect("candidate rejected by engine");
+                match play_from(&mut g, &mut self.rollout, None, true) {
+                    Ok(r) => (r.total(team) - r.total(1 - team)) as f32,
+                    Err(_) => f32::NAN,
+                }
+            })
+            .collect();
+        if q.iter().any(|x| x.is_nan()) {
+            return None;
+        }
+        let sub = Candidates {
+            options: order.iter().map(|&k| cands.options[k]).collect(),
+            features: order.iter().flat_map(|&k| cands.features[k * ACTION_DIM..(k + 1) * ACTION_DIM].iter().copied()).collect(),
+            group_of: vec![],
+        };
+        Some(Rec { state: state.to_vec(), cands: sub, label: 0, q: Some(q), prefix: 0 })
+    }
 }
 
 impl Bot for Recorder {
@@ -608,6 +681,11 @@ impl Bot for Recorder {
                 features: cands.features[act * ACTION_DIM..(act + 1) * ACTION_DIM].to_vec(),
                 group_of: vec![],
             };
+            if self.critic > 0.0 && self.rng.gen_bool(self.critic.min(1.0)) {
+                if let Some(r) = self.critique(view, plays, &cands, act, &state) {
+                    self.critic_recs.push(r);
+                }
+            }
             self.recs.push(Rec { state, cands: played, label: 0, q: None, prefix: 0 });
             return choice;
         }
@@ -616,8 +694,18 @@ impl Bot for Recorder {
         choice
     }
 
+    fn cheats(&self) -> bool {
+        // Not to play: only the critic's labels use the real state.
+        self.critic > 0.0
+    }
+
+    fn peek(&mut self, state: &GameState) {
+        self.real = matches!(state.pending(), Pending::Turn(_)).then(|| state.clone());
+    }
+
     fn round_over(&mut self, view: &PlayerView, result: &RoundResult) {
         self.inner.round_over(view, result);
+        self.real = None;
         if self.recs.is_empty() {
             return;
         }
@@ -627,6 +715,7 @@ impl Bot for Recorder {
         let n_tokens = if self.played_only { 0 } else { encode_history(view, &mut tokens) };
         assert!(self.recs.iter().all(|r| r.prefix <= n_tokens), "history isn't a prefix of the round's");
         let recs = std::mem::take(&mut self.recs);
+        let critic_recs = std::mem::take(&mut self.critic_recs);
         let first = result.out_order[0];
         let out_flags = if first == view.seat {
             FLAG_OUT_FIRST
@@ -636,6 +725,10 @@ impl Bot for Recorder {
             0
         };
         self.out.borrow_mut().push(Block { seat: view.seat as u8, tokens, n_tokens, recs, margin, out_flags });
+        if !critic_recs.is_empty() {
+            let b = Block { seat: view.seat as u8, tokens: vec![], n_tokens: 0, recs: critic_recs, margin, out_flags };
+            self.out.borrow_mut().push(b);
+        }
     }
 }
 
@@ -644,7 +737,7 @@ impl Bot for Recorder {
 /// exactly as `selfplay --q N --rollout ROLLOUT` labels it, and leaves every
 /// other decision to h2 (`selfplay --bot h2`). Flags: `e` = `--exact-endgame`,
 /// `iK` = `--infer K`, `aM` = `--q-max M` (adaptive samples), `pK` = `--anchor K` (needs a
-/// `net:` rollout).
+/// `net:` rollout), `f` = `--pass-fill`.
 pub struct LabelerBot {
     base: crate::bots::H2Bot,
     rng: StdRng,
@@ -658,11 +751,12 @@ impl LabelerBot {
         let (head, rollout_name) = name.split_once(':')?;
         let (head, flags) = head.split_once('/').unwrap_or((head, ""));
         let q_samples: usize = head.strip_prefix("label")?.parse().ok().filter(|&n| n > 0)?;
-        let (mut exact_endgame, mut infer, mut q_max, mut anchor_k) = (false, 0, 0, 0);
+        let (mut exact_endgame, mut infer, mut q_max, mut anchor_k, mut fill) = (false, 0, 0, 0, false);
         let mut chars = flags.chars().peekable();
         while let Some(f) = chars.next() {
             match f {
                 'e' => exact_endgame = true,
+                'f' => fill = true,
                 'i' | 'a' | 'p' => {
                     let mut k = String::new();
                     while let Some(d) = chars.peek().filter(|c| c.is_ascii_digit()) {
@@ -692,7 +786,7 @@ impl LabelerBot {
         Some(Box::new(LabelerBot {
             base: crate::bots::H2Bot::new(),
             rng: StdRng::seed_from_u64(seed ^ 0xABCD),
-            teacher: Teacher { q_samples, exact_endgame, infer, q_max, anchor, anchor_k },
+            teacher: Teacher { q_samples, exact_endgame, infer, q_max, anchor, anchor_k, fill },
             rollout,
             name: name.to_string(),
         }))
@@ -788,12 +882,18 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                                 q_max: cfg.q_max,
                                 anchor: (cfg.anchor > 0).then(|| anchor_net(&cfg.rollout).expect("--anchor needs a net rollout")),
                                 anchor_k: cfg.anchor,
+                                fill: cfg.pass_fill,
                             },
                             rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
                             played_only: cfg.played_only,
                             recs: vec![],
                             out: out.clone(),
+                            critic: if cfg.played_only { cfg.critic } else { 0.0 },
+                            critic_k: cfg.critic_k,
+                            critic_net: (cfg.critic > 0.0).then(|| anchor_net(&cfg.bot).or_else(|| anchor_net(&cfg.rollout))).flatten(),
+                            real: None,
+                            critic_recs: vec![],
                         })
                     });
                     let mut rng = StdRng::seed_from_u64(seed);

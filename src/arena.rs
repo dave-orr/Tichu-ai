@@ -41,6 +41,9 @@ pub struct ArenaConfig {
     /// Round mode only.
     pub log_dir: Option<std::path::PathBuf>,
     pub log_deals: usize,
+    /// Append one JSON line per finished deal or game (`i`, `diff`, `a_win`,
+    /// `rounds`) to this file as it completes, for watching long runs.
+    pub progress: Option<std::path::PathBuf>,
 }
 
 impl Default for ArenaConfig {
@@ -54,6 +57,7 @@ impl Default for ArenaConfig {
             settings: Settings::default(),
             log_dir: None,
             log_deals: 0,
+            progress: None,
         }
     }
 }
@@ -119,6 +123,8 @@ pub struct Report {
     pub samples: Vec<f64>,
     pub games: usize,
     pub a_game_wins: f64,
+    /// A's game wins per sample (0, 0.5 or 1 with duplicate), game mode.
+    pub win_samples: Vec<f64>,
     pub a: SideStats,
     pub b: SideStats,
     pub errors: Vec<String>,
@@ -154,11 +160,17 @@ impl Report {
             1.96 * self.stderr()
         );
         if self.games > 0 {
+            let w = &self.win_samples;
+            let n = w.len() as f64;
+            let m = w.iter().sum::<f64>() / n;
+            let se = (w.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n - 1.0).max(1.0) / n).sqrt();
             s += &format!(
-                "  game win rate for {}: {:.1}%  ({} games)\n",
+                "  game win rate for {}: {:.1}% ± {:.1}  ({} {})\n",
                 self.a_name,
-                100.0 * self.a_game_wins / self.games as f64,
-                self.games
+                100.0 * m,
+                196.0 * se,
+                self.games,
+                if w.iter().any(|&x| x == 0.5) { "duplicate pairs" } else { "games" }
             );
         }
         for (name, st) in [(&self.a_name, &self.a), (&self.b_name, &self.b)] {
@@ -276,11 +288,30 @@ fn run_one(i: usize, cfg: &ArenaConfig, a: &BotFactory, b: &BotFactory, names: [
 pub fn run(a_name: &str, a: &BotFactory, b_name: &str, b: &BotFactory, cfg: &ArenaConfig) -> Report {
     let threads = cfg.threads.max(1).min(cfg.count.max(1));
     let mut samples: Vec<(usize, Sample)> = Vec::with_capacity(cfg.count);
+    let progress = cfg.progress.as_ref().map(|p| {
+        std::sync::Mutex::new(
+            std::fs::OpenOptions::new().create(true).append(true).open(p).unwrap_or_else(|e| panic!("{}: {e}", p.display())),
+        )
+    });
+    let progress = &progress;
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
                 scope.spawn(move || {
-                    (t..cfg.count).step_by(threads).map(|i| (i, run_one(i, cfg, a, b, [a_name, b_name]))).collect::<Vec<_>>()
+                    (t..cfg.count)
+                        .step_by(threads)
+                        .map(|i| {
+                            let s = run_one(i, cfg, a, b, [a_name, b_name]);
+                            if let Some(f) = progress {
+                                use std::io::Write;
+                                let line = serde_json::json!({
+                                    "i": i, "diff": s.diff, "a_win": s.a_win, "rounds": s.a.rounds, "error": s.error,
+                                });
+                                let _ = writeln!(f.lock().unwrap(), "{line}");
+                            }
+                            (i, s)
+                        })
+                        .collect::<Vec<_>>()
                 })
             })
             .collect();
@@ -307,6 +338,7 @@ pub fn run(a_name: &str, a: &BotFactory, b_name: &str, b: &BotFactory, cfg: &Are
         if cfg.mode == Mode::Games {
             report.games += 1;
             report.a_game_wins += s.a_win;
+            report.win_samples.push(s.a_win);
         }
     }
     report

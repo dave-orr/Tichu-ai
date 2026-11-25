@@ -7,7 +7,7 @@ One `tichu live` process serves every open seat on the server, each on its
 own thread.
 
 ```sh
-BOT_TOKEN=... tichu live --bot search:runs/dmc1.tnet --server http://localhost:3000
+BOT_TOKEN=... tichu live --bot best --server http://localhost:3000
 ```
 
 ## How it works
@@ -52,10 +52,14 @@ Once (on the host):
    `echo "BOT_TOKEN=$(openssl rand -hex 24)" >> ~/tichu/server/.env`.
 2. Install Rust (`curl https://sh.rustup.rs -sSf | sh`), clone this repo next
    to `~/tichu`, and `cargo build --release`.
-3. Copy the model files the bot spec names from the desktop into the clone:
-   `runs/dmc1.tnet` for the default `search:runs/dmc1.tnet` (about 0.1 s a
-   play on one core), plus the call models `runs/calls3/m3.tcall` and
-   `runs/calls1/m1.tcall` for `best:runs/dmc1.tnet` once `best` is merged.
+3. Copy the model files the bot spec names from the desktop into the clone,
+   at the same paths. The default `best` (search on the v4 gen3 net plus the
+   learned Grand and Small calls; about 0.12 s a play on one core) needs
+   `runs/v4/gen3.tnet`, `runs/calls3/m3.tcall` and `runs/calls1/m1.tcall`
+   (about 3.3 MB together). `best:PATH` swaps the net, e.g.
+   `best:runs/dmc1/snap00190.tnet` for dmc1. (As nets alone gen3 is +4.4 ± 2.7
+   a deal vs the v4 start net, and dmc1 +0.3 ± 3.0; under search dmc1 and the
+   start net tie.)
 4. `pm2 start scripts/live.config.js && pm2 save`. The config reads
    `BOT_TOKEN` and `PORT` from `../tichu/server/.env`, so the secret lives in
    one place; edit `BOT` in it to change the bot.

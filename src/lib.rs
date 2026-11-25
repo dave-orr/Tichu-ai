@@ -27,6 +27,7 @@ pub mod humanlog;
 pub mod infer;
 pub mod live;
 pub mod llm;
+pub mod passfill;
 pub mod replay;
 pub mod scoring;
 pub mod selfplay;

@@ -127,6 +127,43 @@ points:
 Rough speed on 4 cores: ~4,000 heuristic-vs-heuristic rounds/s;
 `pimc20` vs `heuristic` is about 2 deals/s (it wins by +62 ± 8 per deal over 400 deals).
 
+## The strongest bot: `best`
+
+`best` puts the strongest pieces together: card play by `search:` over the
+v4 gen3 net (`runs/v4/gen3.tnet`), learned Grand Tichu calls
+(`runs/calls3/m3.tcall`) and learned Small Tichu calls
+(`runs/calls1/m1.tcall`); passing, bombs out of turn, the wish and the
+Dragon gift are h2's. `best:NET` swaps in another net. The model files live
+in the desktop's `runs/` (not in git); paths are relative to the working
+directory.
+
+Full games to 1000, duplicate, Nov 2026 (`tichu arena best B --games N`):
+
+| B | game pairs | best wins | margin per game |
+|---|---|---|---|
+| `search:runs/v4/gen3.tnet` (same play, v2 calls) | 1000 | **58.0% ± 1.8** | +0 ± 27 |
+| `net:runs/v4/gen3.tnet` (no search, v2 calls) | 1235 | **66.4% ± 1.6** | +159 ± 24 |
+| `h2` | 273 | 93.8% ± 2.0 | +756 ± 37 |
+
+Search alone: `search:gen3` beats `net:gen3` by +13.5 ± 4.3 per deal
+(1000 deals). Against the same card play the learned calls win 58% of games
+with no point margin at all: they call far more (about 4.6 Grands and 2
+Tichus per game against 1.4 and 1 for v2, success 56% and 52%), trading
+points for game wins. An Oct 2026 comparison with human
+calls found the model weaker than humans in close games, so expect less
+against people than against v2.
+
+Decision time (`cargo run --release --example decision_time -- best h2 40`,
+one thread, with the desktop otherwise busy): plays average 0.12–0.16 s,
+p90 0.25–0.27 s, p99 0.3–0.6 s, worst seen 4.2 s; calls and passes under
+0.15 s; forced plays, bombs, wishes and Dragon gifts instant. About 1.2 s of
+thinking per seat per round. What putting it on the live server would take
+is in [docs/SERVER_BOT.md](docs/SERVER_BOT.md).
+
+`arena --progress FILE` appends one JSON line per finished deal or game, so
+long matches can be watched (and combined across seeds); game mode now
+prints a 95% CI on the win rate, from the duplicate pairs.
+
 ## Watching a game
 
 `tichu replay LOG.json [more logs] --out replay.html` builds one

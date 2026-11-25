@@ -213,7 +213,13 @@ impl GameState {
             p.has_played_first_card = pub_.has_played_first_card;
             p.out_order = pub_.out_order;
             p.grand_decided = true;
+            // As many piles as the seat has won (views show the count), the
+            // first one carrying all the points.
             p.tricks_won = vec![placeholder_pile(pub_.captured_points)];
+            p.tricks_won.resize(pub_.trick_count.max(1), vec![]);
+            if pub_.trick_count == 0 && pub_.captured_points == 0 {
+                p.tricks_won.clear();
+            }
         }
         s.out_count = view.players.iter().filter(|p| p.is_out()).count() as u8;
         s.current_trick = view.current_trick.clone();
