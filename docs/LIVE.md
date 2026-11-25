@@ -21,6 +21,12 @@ sees exactly the `PlayerView` (log included) it would see in `tichu arena`,
 and every move is checked by the engine before it is sent. `tests/live.rs`
 checks the shadow against real engine games, action by action.
 
+Grand Tichu is called by everyone at once on the server, so the bridge makes
+its bots take turns: a bot decides only once every person at the table has,
+and after any bot in a lower seat, so it sees every call made before it (as
+in `tichu arena`, which asks the seats in order). It never calls Grand over
+its partner's call.
+
 The server lets anyone bomb at any instant. Like the simulator, the bridge
 offers its bot a bomb after every play by another seat and during each trick
 countdown (sent at once; the countdown is 3 s). Small Tichu is offered

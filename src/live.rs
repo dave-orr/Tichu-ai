@@ -49,6 +49,9 @@ pub struct ServerPlayer {
     pub grand_tichu_decided: bool,
     pub passed_cards: bool,
     pub card_count: usize,
+    /// A bot's seat (ours or anyone's).
+    #[serde(default)]
+    pub is_ai: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -583,7 +586,16 @@ pub fn decide(bot: &mut dyn Bot, shadow: &Shadow, s: &ServerState, done: &dyn Fn
             if pl.grand_tichu_decided || done(&format!("{r}:grand")) {
                 return None;
             }
-            let call = bot.grand_tichu(&view);
+            // Everyone at the table calls at once on the server, so take
+            // turns: wait for every person, then for the bots in lower
+            // seats. Each bot then sees every call made before it.
+            let waiting = (0..4).any(|p| p != me && !s.players[p].grand_tichu_decided && (!s.players[p].is_ai || p < me));
+            if waiting {
+                return None;
+            }
+            // Never call Grand over the partner's call.
+            let partner = (me + 2) % 4;
+            let call = s.players[partner].tichu_call == TichuCall::None && bot.grand_tichu(&view);
             d(format!("{r}:grand"), json!({"type": "call-grand-tichu", "call": call}), false)
         }
         "passing" => {
