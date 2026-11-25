@@ -29,7 +29,12 @@ before each of its turns while allowed. Other moves wait `--delay-ms`
 the wait, it thinks again.
 
 It needs the server from dave-orr/tichu#148 or later: the bot token, the
-`roundActions` log, 409 for refused moves.
+`roundActions` log, 409 for refused moves. A seat can move before the first
+deal (the organizer swaps seats, or random partners reshuffles the table as
+the game starts): the bridge follows `mySeat` and starts its shadow afresh.
+With dave-orr/tichu#154 or later it addresses the server by the `player` id
+the join returns, which follows it to the new seat; older servers only know
+seats, and a moved bot there loses its stream.
 
 ## Options
 
