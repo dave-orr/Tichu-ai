@@ -6,7 +6,10 @@
 // plays it to the end. Run it alongside a server and `tichu live`; see
 // scripts/live-e2e.sh, which starts all three.
 //
-//   node scripts/live-e2e.mjs [--server URL] [--target N] [--clockwise] [--timeout-s S]
+//   node scripts/live-e2e.mjs [--server URL] [--target N] [--clockwise] [--random-partners] [--timeout-s S]
+//
+// --random-partners has the server reshuffle the seats as the game starts, so
+// the bots end up in other seats than the ones they claimed.
 //
 // Needs the tichu repo's node_modules (socket.io-client): TICHU_REPO or ../tichu.
 
@@ -18,6 +21,7 @@ const opt = (k, d) => { const i = args.indexOf(`--${k}`); return i >= 0 ? args[i
 const server = opt('server', 'http://localhost:3000');
 const target = Number(opt('target', '1000'));
 const clockwise = args.includes('--clockwise');
+const randomPartners = args.includes('--random-partners');
 const timeoutS = Number(opt('timeout-s', '900'));
 
 const repo = process.env.TICHU_REPO || path.resolve(import.meta.dirname, '../../tichu');
@@ -46,7 +50,7 @@ function fail(msg) {
 setTimeout(() => fail(`no game end within ${timeoutS}s`), timeoutS * 1000);
 
 sock.on('connect', () => {
-  sock.emit('create-room', { playerName: 'Host', settings: { targetScore: target, clockwise } });
+  sock.emit('create-room', { playerName: 'Host', randomPartners, settings: { targetScore: target, clockwise } });
 });
 sock.on('room-created', ({ roomCode }) => {
   room = roomCode;

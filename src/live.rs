@@ -718,11 +718,16 @@ impl Api {
         }
     }
 
-    /// Open the seat's event stream. Err(true) = the room or seat is gone.
-    fn stream(&self, room: &str, seat: Seat) -> Result<Box<dyn std::io::Read + Send>, bool> {
+    /// Open the player's event stream, by its player id where the server
+    /// gave one, else by seat. Err(true) = the room or seat is gone.
+    fn stream(&self, room: &str, player: Option<&str>, seat: Seat) -> Result<Box<dyn std::io::Read + Send>, bool> {
+        let who = match player {
+            Some(p) => format!("player={p}"),
+            None => format!("seat={seat}"),
+        };
         let resp = self
             .agent
-            .get(&format!("{}/rooms/{room}/stream?seat={seat}", self.base))
+            .get(&format!("{}/rooms/{room}/stream?{who}", self.base))
             .set("Authorization", &self.auth)
             .call();
         match resp {
@@ -739,13 +744,16 @@ enum Event {
     Gone,
 }
 
-/// Read the seat's SSE stream on its own thread, reconnecting as needed.
-fn spawn_stream(api: Arc<Api>, room: String, seat: Seat, tag: String) -> Receiver<Event> {
+/// Read the player's SSE stream on its own thread, reconnecting as needed.
+/// The server can move the player to another seat in the waiting room (seat
+/// swaps, random partners); `player` names it wherever it sits, and without
+/// one (older servers) `seat` is where it sits now.
+fn spawn_stream(api: Arc<Api>, room: String, player: Option<String>, seat: Arc<AtomicUsize>, tag: String) -> Receiver<Event> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut failures = 0;
         loop {
-            let reader = match api.stream(&room, seat) {
+            let reader = match api.stream(&room, player.as_deref(), seat.load(Ordering::SeqCst)) {
                 Ok(r) => r,
                 Err(true) => {
                     let _ = tx.send(Event::Gone);
@@ -802,9 +810,11 @@ pub struct SeatReport {
 }
 
 /// Play one seat until its game ends or the room goes away.
-fn play_seat(api: Arc<Api>, cfg: &LiveConfig, room: String, seat: Seat, seed: u64) -> SeatReport {
-    let tag = format!("[{room}:{seat}]");
-    let rx = spawn_stream(api.clone(), room.clone(), seat, tag.clone());
+fn play_seat(api: Arc<Api>, cfg: &LiveConfig, room: String, player: Option<String>, mut seat: Seat, seed: u64) -> SeatReport {
+    let mut tag = format!("[{room}:{seat}]");
+    let seat_now = Arc::new(AtomicUsize::new(seat));
+    let rx = spawn_stream(api.clone(), room.clone(), player.clone(), seat_now.clone(), tag.clone());
+    let player = player.as_deref();
     let mut bot = crate::bots::by_name(&cfg.bot, seed).expect("unknown bot");
     let mut shadow = Shadow::new(seat, seed);
     let mut done: std::collections::HashMap<String, usize> = Default::default();
@@ -837,6 +847,18 @@ fn play_seat(api: Arc<Api>, cfg: &LiveConfig, room: String, seat: Seat, seed: u6
         }
         let Some(s) = latest.as_deref().cloned() else { continue };
         let s = &s;
+        if s.my_seat != seat {
+            // Moved: the organizer swapped seats, or random partners
+            // reshuffled the table as the game started. Nothing of the
+            // round can have happened yet, so start following afresh.
+            eprintln!("{tag}: moved to seat {}", s.my_seat);
+            seat = s.my_seat;
+            seat_now.store(seat, Ordering::SeqCst);
+            tag = format!("[{room}:{seat}]");
+            shadow = Shadow::new(seat, seed);
+            done.clear();
+            last_warning.clear();
+        }
         match shadow.sync(s) {
             Ok(w) if !w.is_empty() => {
                 let msg = w.join("; ");
@@ -880,7 +902,7 @@ fn play_seat(api: Arc<Api>, cfg: &LiveConfig, room: String, seat: Seat, seed: u6
         }
         let game_end = s.phase == "gameEnd";
         let key = dec.key.clone();
-        let ok = send(&api, &room, seat, &tag, dec, &mut shadow, &mut done, &mut report);
+        let ok = send(&api, &room, player, seat, &tag, dec, &mut shadow, &mut done, &mut report);
         if game_end && ok {
             report.finished = true;
             break;
@@ -889,7 +911,7 @@ fn play_seat(api: Arc<Api>, cfg: &LiveConfig, room: String, seat: Seat, seed: u6
             // Refused moves change nothing, so no new state will come to
             // prompt a retry: look again shortly, and after the last try fall
             // back to the simplest moves.
-            if done.get(&key).copied().unwrap_or(0) >= TRIES && rescue(&api, &room, seat, &tag, s) && game_end {
+            if done.get(&key).copied().unwrap_or(0) >= TRIES && rescue(&api, &room, player, seat, &tag, s) && game_end {
                 report.finished = true;
                 break;
             }
@@ -911,7 +933,16 @@ fn absorb(e: Event, latest: &mut Option<Box<ServerState>>) -> bool {
     }
 }
 
-/// Post a decision. Returns whether the server took it.
+/// An action request: for `player` when the server gave an id (it follows
+/// the player across seat moves), and the seat for older servers.
+fn action_body(player: Option<&str>, seat: Seat, action: Value) -> Value {
+    let mut v = json!({"seat": seat, "action": action});
+    if let Some(p) = player {
+        v["player"] = json!(p);
+    }
+    v
+}
+
 /// Tries at a decision point before falling back to `rescue`.
 const TRIES: usize = 2;
 /// Marks a decision point the server took.
@@ -921,6 +952,7 @@ const TAKEN: usize = usize::MAX / 2;
 fn send(
     api: &Api,
     room: &str,
+    player: Option<&str>,
     seat: Seat,
     tag: &str,
     dec: Decision,
@@ -929,7 +961,7 @@ fn send(
     report: &mut SeatReport,
 ) -> bool {
     let tries = done.entry(dec.key.clone()).or_insert(0);
-    match api.post(&format!("/rooms/{room}/action"), json!({"seat": seat, "action": dec.action})) {
+    match api.post(&format!("/rooms/{room}/action"), action_body(player, seat, dec.action.clone())) {
         Ok(_) => {
             *tries = TAKEN;
             if let Some(p) = dec.pass {
@@ -948,7 +980,7 @@ fn send(
 
 /// The bot's move keeps being refused (a bridge bug): get the game moving
 /// with the simplest moves the server might take.
-fn rescue(api: &Api, room: &str, seat: Seat, tag: &str, s: &ServerState) -> bool {
+fn rescue(api: &Api, room: &str, player: Option<&str>, seat: Seat, tag: &str, s: &ServerState) -> bool {
     let me = seat;
     let hand = &s.my_hand;
     let mut tries: Vec<Value> = vec![];
@@ -975,7 +1007,7 @@ fn rescue(api: &Api, room: &str, seat: Seat, tag: &str, s: &ServerState) -> bool
         _ => {}
     }
     for a in tries {
-        if api.post(&format!("/rooms/{room}/action"), json!({"seat": seat, "action": a})).is_ok() {
+        if api.post(&format!("/rooms/{room}/action"), action_body(player, seat, a.clone())).is_ok() {
             eprintln!("{tag}: rescued with {a}");
             return true;
         }
@@ -1015,13 +1047,14 @@ pub fn run(cfg: LiveConfig) -> Vec<SeatReport> {
                     };
                     announced_idle = false;
                     let (room, seat) = (room.to_string(), seat as Seat);
+                    let player = v["player"].as_str().map(String::from);
                     eprintln!("[{room}:{seat}] joined as {} ({})", cfg.name, cfg.bot);
                     active.fetch_add(1, Ordering::SeqCst);
                     started.fetch_add(1, Ordering::SeqCst);
                     let (api, cfg2, active, rep_tx) = (api.clone(), cfg.clone(), active.clone(), rep_tx.clone());
                     let seed = rng.gen();
                     std::thread::spawn(move || {
-                        let r = play_seat(api, &cfg2, room.clone(), seat, seed);
+                        let r = play_seat(api, &cfg2, room.clone(), player, seat, seed);
                         eprintln!("[{room}:{seat}] done: {r:?}");
                         active.fetch_sub(1, Ordering::SeqCst);
                         let _ = rep_tx.send(r);
