@@ -11,6 +11,7 @@
 //! - `trace`: JSON round traces (used to diff against the TS engine)
 //! - `llm`: language-model players and a resumable match runner
 //! - `replay`: game logs and the visual replay viewer
+//! - `live`: play on the real server through its AI player API
 
 pub mod arena;
 pub mod bot;
@@ -24,6 +25,7 @@ pub mod features;
 pub mod hand;
 pub mod humanlog;
 pub mod infer;
+pub mod live;
 pub mod llm;
 pub mod replay;
 pub mod scoring;

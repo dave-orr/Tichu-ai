@@ -53,6 +53,16 @@ usage:
       --scores FILE   start each round from a game score drawn from FILE (lines
                       'team0 team1'; train/calls.py --write-states makes one)
       --seed S, --threads T
+  tichu live --bot NAME [options]         play on a real server (dave-orr/tichu) through its AI
+                                          API: claim open AI seats and play them, until stopped.
+                                          Needs the server's token in the BOT_TOKEN env variable.
+      --server URL    the server (default http://localhost:3000)
+      --name NAME     the name shown at the table (default Tichu AI; max 20 chars)
+      --room CODE     join this room only, then exit (default: any room with an open AI seat)
+      --delay-ms MS   pause before each move, so people can follow (default 800; bombs: none)
+      --games N       exit after N seat-games (default: run forever)
+      --max-seats N   play at most N seats at once (default 8)
+      --poll-secs S   how often to look for open seats (default 3)
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
 
@@ -271,6 +281,41 @@ fn main() {
                     eprintln!("{out}: {e}");
                     exit(1)
                 }
+            }
+        }
+        "live" => {
+            let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());
+            let Some(bot) = flag("bot") else {
+                eprintln!("live needs --bot NAME");
+                exit(2);
+            };
+            let _ = factory(&bot); // exits on an unknown name
+            let Ok(token) = std::env::var("BOT_TOKEN") else {
+                eprintln!("set BOT_TOKEN to the server's bot token (BOT_TOKEN in its server/.env)");
+                exit(2);
+            };
+            let name = flag("name").unwrap_or_else(|| "Tichu AI".into());
+            if name.is_empty() || name.chars().count() > 20 {
+                eprintln!("--name must be 1 to 20 characters");
+                exit(2);
+            }
+            let cfg = tichu_engine::live::LiveConfig {
+                server: flag("server").unwrap_or_else(|| "http://localhost:3000".into()),
+                token,
+                bot,
+                name,
+                room: flag("room"),
+                delay: std::time::Duration::from_millis(args.num("delay-ms").unwrap_or(800)),
+                poll: std::time::Duration::from_secs(args.num("poll-secs").unwrap_or(3)),
+                games: args.num("games").unwrap_or(0),
+                max_seats: args.num("max-seats").unwrap_or(8),
+                seed,
+            };
+            let reports = tichu_engine::live::run(cfg);
+            let bad = reports.iter().filter(|r| r.rejected > 0 || r.divergences > 0).count();
+            eprintln!("{} seat-games, {} finished, {bad} with rejected moves or divergences", reports.len(), reports.iter().filter(|r| r.finished).count());
+            if bad > 0 {
+                exit(1);
             }
         }
         "trace" => {
