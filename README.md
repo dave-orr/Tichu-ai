@@ -48,6 +48,7 @@ heuristic vs random  (2000 deals)
 | `src/humanlog.rs` | real games: rebuilds an `npm run export-rounds` round with a play log through the engine (used by `examples/endgame_audit.rs` and `examples/human_disagree.rs`; findings in [docs/ENDGAME_AUDIT.md](docs/ENDGAME_AUDIT.md)) |
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
 | `src/replay.rs`, `viewer/` | game logs and the visual replay viewer (see below) |
+| `src/live.rs`, `tichu live` | plays on the real server (tichu.squidbox.com) through its AI API: claims open AI seats and replays each round through the engine so the bot gets its usual `PlayerView`; see [docs/LIVE.md](docs/LIVE.md) |
 | `src/llm/`, `examples/llm_match.rs` | Claude as a player (via `claude -p` on a subscription) and a resumable Claude-vs-bot match; see [docs/LLM_MATCH.md](docs/LLM_MATCH.md) |
 
 ## Writing a bot
