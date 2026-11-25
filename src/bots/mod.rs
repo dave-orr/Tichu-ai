@@ -34,10 +34,22 @@ pub const NAMES: &[(&str, &str)] = &[
     ("pass2[~F]:BOT", "BOT with v2 passing (F = only these rules: o opponents, m Mah Jong vs Grand, p partner; e.g. pass2~o:h2): low singletons odd left / even right, Mah Jong before a Grand, partner gets my best card unless a gift would make me a Tichu hand"),
     ("net:PATH", "learned policy (a .tnet model from train/) plays its top choice; h2 for calls, passes, bombs out of turn"),
     ("labelN[/FLAGS]:BOT", "the selfplay --q labeler as a player: best of N guessed deals with BOT rollouts, h2 for the rest; flags e = --exact-endgame, iK = --infer K (label10/ei4:net:m.tnet)"),
+    ("best[:NET]", "the strongest assembled player: learned Grand calls (runs/calls3/m3.tcall) and Small calls (runs/calls1/m1.tcall) on top of search:NET; NET defaults to runs/v4/gen3.tnet. Paths are relative to the working directory"),
     ("search:PATH", "the strongest bundled player: net:PATH plus search at every play (label24/ep3:net:PATH: 24 guessed deals over the net's top 3 moves, exact two-player endgames, keeps the net's move unless another is clearly ahead); about 0.1 s per play"),
     ("net@T:PATH", "net:PATH sampling its play from softmax(logits / T) instead of the top choice (net@0.5:m.tnet)"),
     ("vpimcN:PATH", "pimcN whose rollouts stop at my next turn and are scored by the model's value head"),
 ];
+
+/// Card-play net and call models behind `best` (the desktop's run directories,
+/// not in git). Swap the net with `best:PATH`.
+pub const BEST_NET: &str = "runs/v4/gen3.tnet";
+pub const BEST_GRAND: &str = "runs/calls3/m3.tcall";
+pub const BEST_SMALL: &str = "runs/calls1/m1.tcall";
+
+/// The full bot name `best[:NET]` stands for.
+pub fn best_spec(net: Option<&str>) -> String {
+    format!("callnet~g:{BEST_GRAND}:callnet~s:{BEST_SMALL}:search:{}", net.unwrap_or(BEST_NET))
+}
 
 /// Construct a bundled bot by name.
 pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
@@ -45,6 +57,8 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
         "random" => Some(Box::new(RandomBot::new(seed))),
         "heuristic" => Some(Box::new(HeuristicBot::new())),
         "h2" => Some(Box::new(H2Bot::new())),
+        "best" => by_name(&best_spec(None), seed),
+        _ if name.starts_with("best:") => by_name(&best_spec(Some(&name[5..])), seed),
         _ if name.starts_with("h2~") => Some(Box::new(H2Bot::with_params(h2::Params::parse(&name[3..])?))),
         _ if name.starts_with("nocalls:") => Some(Box::new(CallsBot::new(CallPolicy::Never, by_name(&name[8..], seed)?))),
         _ if name.starts_with("pass2") => {

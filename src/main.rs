@@ -22,6 +22,7 @@ usage:
       --threads T     worker threads (default: all cores)
       --no-duplicate  play each deal once instead of once per seating
       --clockwise     clockwise play direction
+      --progress FILE append a JSON line per finished deal or game to FILE
       --log DIR       write game logs (deal-NNNN.json, both seatings) for
                       the first --log-deals deals (default 20) to DIR
   tichu replay <LOG.json>... [--out FILE] [--json]
@@ -148,6 +149,9 @@ fn main() {
             if let Some((_, Some(dir))) = args.flags.iter().find(|(k, _)| k == "log") {
                 cfg.log_dir = Some(dir.into());
                 cfg.log_deals = args.num("log-deals").unwrap_or(20);
+            }
+            if let Some((_, Some(p))) = args.flags.iter().find(|(k, _)| k == "progress") {
+                cfg.progress = Some(p.into());
             }
             let start = std::time::Instant::now();
             let report = arena::run(&a, &*factory(&a), &b, &*factory(&b), &cfg);
