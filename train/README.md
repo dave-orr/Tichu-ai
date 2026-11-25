@@ -372,6 +372,11 @@ search-trained net: it reaches it without search, but doesn't pass it.
   trained on either labelling, or on the full playouts, gain nothing
   (+0.1 ± 0.9, −1.2 ± 1.4, −0.8 ± 1.0).
 
+Play-time search on dmc1 (`label24/ep3:net:runs/dmc1/snap00190.tnet`, 1000
+deals each, seed 902): +17.7 ± 4.3 vs dmc1 itself, +70.6 ± 6.4 vs h2, and
+−3.5 ± 5.7 vs the same search on the v4 start net. Search adds the same
+amount to either net, and the two stay level.
+
 Taken together: at this representation the policy has what single-deal
 supervision can teach it, whatever the label. What it lacks is what search
 adds by averaging many deals for the hand in front of it.
