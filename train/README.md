@@ -331,6 +331,51 @@ from chunk 95 on stayed between −6.9 and +3.6 vs the start net. Final net,
 at this net size and settings DMC plateaus at the level of the best
 search-trained net: it reaches it without search, but doesn't pass it.
 
+### Bigger nets, the all-seeing critic, and where the noise is (Nov 2026)
+
+- **Wide net** (`train/widen.py` grows a net without changing its play;
+  `dmc-big`, 1024 wide, 2.28M parameters against 409k): worse. By chunk 25 it
+  was −5.8 ± 5.6 vs dmc1, and fresh-data R² of Q fell from 0.53 to 0.46.
+- **Critic on the real deal** (`selfplay --critic P`, `dmc.py --critic P`:
+  play the round out once from the real state after each of the net's top 4
+  options, players still seeing only their own hands; train the centred
+  advantages on those margins). `dmc-critic`, the same wide net: −6.6 ± 6.1
+  vs dmc1 at chunk 90, and the advantages' fit to fresh critic labels stayed
+  at R² 0.07 with 64% agreement from the first chunk to the last.
+- `train/critic_probe.py` (critic labels alone, 380k records): a fresh
+  256-wide net reaches R² 0.040 / 63.4% in a minute, which took dmc1 3.8M
+  rounds of outcomes; dmc1 itself moves from 0.061 to 0.066 and no further.
+- `examples/critic_ceiling.rs` + `train/critic_ceiling.py` (27,768
+  decisions; shares of the real-deal verdict's variance): the net 6.9%; the
+  mean of M uniform guessed deals 0.8 / 1.6 / 2.7 / 3.5% for M = 1 / 2 / 4 /
+  6 and 7.9% as M → ∞; guesses weighted by the play so far (`infer`, 16
+  candidates each) 4.1% at M = 6 and 8.9% in the limit; net and guesses
+  together 9.0% (uniform) and 9.9% (weighted). The net holds about 40% of
+  what unlimited search over guessed deals knows.
+- **Rebuilt states forget.** The real hands put through
+  `GameState::from_view_with_history` played out like the real deal in only
+  37% of decisions (R² 0.23 against the real verdict): the other seats lost
+  their trick counts (fixed in `from_view`) and what they passed and
+  received. With both restored (`passfill::restore_passes`) it is 100%.
+  Guessing the unknown passes (`passfill::guess_passes`, `--pass-fill`,
+  label flag `f`) is no better than leaving them out: 44% identical, and
+  `label24/ep3f` vs `label24/ep3` on dmc1 is −1.1 ± 4.4 over 1200 deals. One
+  playout is a chaotic function of the position: any difference in what the
+  players know changes it.
+- **Truncated all-seeing critic** (`examples/oracle_data.rs`,
+  `train/oracle_probe.py`; 40k rounds). A value net that sees all four
+  views predicts the final margin with R² 0.51, against 0.44 from the
+  mover's own view on the same 437k positions, and gains about 0.015 per
+  doubling of data. Choosing by its value right after the move loses to the
+  net's own choice (−4.1 ± 1.6 points per decision on full playouts); by its
+  value 12 decisions later it gains (+4.4 ± 1.8), but dmc1's move scores
+  trained on either labelling, or on the full playouts, gain nothing
+  (+0.1 ± 0.9, −1.2 ± 1.4, −0.8 ± 1.0).
+
+Taken together: at this representation the policy has what single-deal
+supervision can teach it, whatever the label. What it lacks is what search
+adds by averaging many deals for the hand in front of it.
+
 ## Running the loop
 
 ```sh

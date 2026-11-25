@@ -6,9 +6,14 @@
 //! - the real deal (what `selfplay --critic` labels with);
 //! - the real hands put through `GameState::from_view_with_history`, as a
 //!   check that rebuilt states play out like real ones;
-//! - M uniform guesses of the hidden cards (`view.sample_hands`);
+//! - the same with the other seats' pass knowledge put back: the real
+//!   passes (`rebuilt_true`, which should play out exactly like the real
+//!   deal) or guessed ones (`rebuilt_fill`, `passfill::guess_passes`);
+//! - M uniform guesses of the hidden cards (`view.sample_hands`), as they
+//!   are (`uniform`) and with guessed passes (`uniform_fill`);
 //! - M guesses weighted by how well they explain the play so far
-//!   (`infer::sample_hands_weighted`, `--infer-k` candidates per guess).
+//!   (`infer::sample_hands_weighted`, `--infer-k` candidates per guess),
+//!   with guessed passes (`weighted_fill`).
 //!
 //! Writes one JSON line per decision (the net's logits and every margin);
 //! `train/critic_ceiling.py` turns them into the numbers.
@@ -28,6 +33,7 @@ use tichu_engine::deck::shuffled_deck;
 use tichu_engine::engine::{Action, GameState, Pending};
 use tichu_engine::features::Candidates;
 use tichu_engine::infer::{self, InferConfig};
+use tichu_engine::passfill;
 use tichu_engine::sim::{play_dealt_round, play_from};
 use tichu_engine::types::*;
 use tichu_engine::view::PlayerView;
@@ -112,17 +118,37 @@ impl Bot for Probe {
         let rebuilt = GameState::from_view_with_history(view, hands);
         let uniform: Vec<[Vec<Card>; 4]> = (0..cfg.m).map(|_| view.sample_hands(&mut self.rng)).collect();
         let weighted = infer::sample_hands_weighted(view, &mut self.rng, cfg.m, &InferConfig { k: cfg.infer_k, ..Default::default() });
-        let many = |gs: &[[Vec<Card>; 4]]| -> Option<Vec<Vec<f32>>> {
-            gs.iter().map(|g| margins(&cfg, &GameState::from_view_with_history(view, g.clone()), view, plays, &opts)).collect()
+        let mut frng = StdRng::seed_from_u64(self.rng.gen());
+        let mut many = |gs: &[[Vec<Card>; 4]], fill: bool| -> Option<Vec<Vec<f32>>> {
+            gs.iter()
+                .map(|g| {
+                    let mut st = GameState::from_view_with_history(view, g.clone());
+                    if fill {
+                        passfill::guess_passes(&mut st, view, &mut frng);
+                    }
+                    margins(&cfg, &st, view, plays, &opts)
+                })
+                .collect()
         };
-        let (Some(qr), Some(qb), Some(qu), Some(qw)) =
-            (margins(&cfg, &real, view, plays, &opts), margins(&cfg, &rebuilt, view, plays, &opts), many(&uniform), many(&weighted))
-        else {
+        let mut rebuilt_true = rebuilt.clone();
+        passfill::restore_passes(&mut rebuilt_true, view, [0, 1, 2, 3].map(|s| real.players[s].pass.unwrap()));
+        let mut rebuilt_fill = rebuilt.clone();
+        passfill::guess_passes(&mut rebuilt_fill, view, &mut self.rng);
+        let (Some(qr), Some(qb), Some(qt), Some(qf), Some(qu), Some(quf), Some(qwf)) = (
+            margins(&cfg, &real, view, plays, &opts),
+            margins(&cfg, &rebuilt, view, plays, &opts),
+            margins(&cfg, &rebuilt_true, view, plays, &opts),
+            margins(&cfg, &rebuilt_fill, view, plays, &opts),
+            many(&uniform, false),
+            many(&uniform, true),
+            many(&weighted, true),
+        ) else {
             return choice;
         };
         let line = serde_json::json!({
             "cards_left": view.hand.len(), "plays_so_far": view.log.len(), "logits": lg,
-            "real": qr, "rebuilt": qb, "uniform": qu, "weighted": qw,
+            "real": qr, "rebuilt": qb, "rebuilt_true": qt, "rebuilt_fill": qf,
+            "uniform": qu, "uniform_fill": quf, "weighted_fill": qwf,
         });
         self.out.borrow_mut().push(line.to_string());
         choice

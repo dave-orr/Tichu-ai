@@ -38,21 +38,23 @@ def main():
     rows = [json.loads(l) for l in open(path)]
     n = len(rows)
     M = len(rows[0]["uniform"])
-    same = np.mean([r["real"] == r["rebuilt"] for r in rows])
+    singles = [k for k in rows[0] if k.startswith("rebuilt")]
+    sources = [k for k in rows[0] if isinstance(rows[0][k], list) and isinstance(rows[0][k][0], list)]
     # Per-decision sufficient statistics (sums over options).
-    names = ["rr", "aa", "ar", "bb", "br"]
+    names = ["rr", "aa", "ar"] + [f"{k}:{x}" for k in singles for x in ("bb", "br")]
     stat = {k: np.zeros(n) for k in names}
     per = {}
-    for src in ("uniform", "weighted"):
+    for src in sources:
         per[src] = dict(uu=np.zeros(n), uv=np.zeros(n), ur=np.zeros((n, M)), ua=np.zeros((n, M)),
                         mm=np.zeros((n, M)), mr=np.zeros((n, M)), ma=np.zeros((n, M)))
     for i, row in enumerate(rows):
         r = centre(np.array(row["real"]))
         a = centre(np.array(row["logits"]) * 100.0)
         stat["rr"][i], stat["aa"][i], stat["ar"][i] = r @ r, a @ a, a @ r
-        b = centre(np.array(row["rebuilt"]))
-        stat["bb"][i], stat["br"][i] = b @ b, b @ r
-        for src in ("uniform", "weighted"):
+        for k in singles:
+            b = centre(np.array(row[k]))
+            stat[k + ":bb"][i], stat[k + ":br"][i] = b @ b, b @ r
+        for src in sources:
             u = centre(np.array(row[src]))  # [M, K]
             p = per[src]
             g = u @ u.T
@@ -65,9 +67,10 @@ def main():
     def numbers(idx):
         S = lambda x: x[idx].sum(0)  # noqa: E731
         rr, aa, ar = S(stat["rr"]), S(stat["aa"]), S(stat["ar"])
-        out = {"net vs real": ar ** 2 / (aa * rr),
-               "real hands, rebuilt state, vs real": S(stat["br"]) ** 2 / (S(stat["bb"]) * rr)}
-        for src in ("uniform", "weighted"):
+        out = {"net vs real": ar ** 2 / (aa * rr)}
+        for k in singles:
+            out[f"real hands, {k}, vs real"] = S(stat[k + ":br"]) ** 2 / max(S(stat[k + ":bb"]) * rr, 1e-9)
+        for src in sources:
             p = per[src]
             uu, uv, ur, ua = S(p["uu"]), S(p["uv"]), S(p["ur"]).mean(), S(p["ua"]).mean()
             out[f"{src}: reliability"] = uv / uu
@@ -90,7 +93,9 @@ def main():
     full = numbers(np.arange(n))
     rng = np.random.default_rng(0)
     boots = [numbers(rng.integers(0, n, n)) for _ in range(300)]
-    print(f"{n} decisions, {M} guesses each; rebuilt real state plays out identically in {same:.1%}")
+    print(f"{n} decisions, {M} guesses each")
+    for k in singles:
+        print(f"  real hands, {k}: plays out identically in {np.mean([r['real'] == r[k] for r in rows]):.1%}")
     print(f"sd of a real-deal verdict difference: {np.sqrt(stat['rr'].sum() / sum(len(r['real']) for r in rows)):.0f} pts")
     for k, v in full.items():
         lo, hi = np.percentile([b[k] for b in boots], [2.5, 97.5])

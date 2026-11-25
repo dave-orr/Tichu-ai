@@ -287,6 +287,7 @@ fn selfplay_records_parse_and_are_reproducible() {
         played_only: false,
         critic: 0.0,
         critic_k: 4,
+        pass_fill: false,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -348,6 +349,7 @@ fn selfplay_played_only_records_hold_the_played_option() {
         played_only: false,
         critic: 0.0,
         critic_k: 4,
+        pass_fill: false,
     };
     let (full_buf, _) = selfplay_file(&cfg);
     let (buf, n) = selfplay_file(&SelfplayConfig { played_only: true, ..cfg.clone() });
@@ -395,6 +397,7 @@ fn selfplay_critic_records_play_out_the_top_options() {
         played_only: true,
         critic: 0.5,
         critic_k: 3,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -455,6 +458,7 @@ fn selfplay_q_labels_are_written() {
         played_only: false,
         critic: 0.0,
         critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -486,6 +490,7 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         played_only: false,
         critic: 0.0,
         critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -514,6 +519,7 @@ fn selfplay_adaptive_samples_run_and_are_deterministic() {
         played_only: false,
         critic: 0.0,
         critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -548,6 +554,7 @@ fn selfplay_anchored_labels_search_only_the_nets_top_options() {
         played_only: false,
         critic: 0.0,
         critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);

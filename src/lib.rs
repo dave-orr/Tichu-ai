@@ -23,6 +23,7 @@ pub mod hand;
 pub mod humanlog;
 pub mod infer;
 pub mod llm;
+pub mod passfill;
 pub mod replay;
 pub mod scoring;
 pub mod selfplay;

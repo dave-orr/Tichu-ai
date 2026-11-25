@@ -105,6 +105,8 @@ pub struct SelfplayConfig {
     /// the module docs).
     pub critic: f64,
     pub critic_k: usize,
+    /// With `q_samples`: `Teacher::fill`.
+    pub pass_fill: bool,
 }
 
 /// The policy net of a `net:PATH` / `net@T:PATH` bot name.
@@ -159,10 +161,11 @@ pub fn pimc_q(
     samples: usize,
     infer: usize,
     max_samples: usize,
+    fill: bool,
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<f32> {
-    let rows = pimc_rows(view, plays, cands, samples, infer, max_samples, rollout, rng);
+    let rows = pimc_rows(view, plays, cands, samples, infer, max_samples, fill, rollout, rng);
     let m = rows.len().max(1) as f64;
     (0..cands.len()).map(|k| (rows.iter().map(|r| r[k]).sum::<f64>() / m) as f32).collect()
 }
@@ -177,13 +180,18 @@ fn pimc_rows(
     samples: usize,
     infer: usize,
     max_samples: usize,
+    fill: bool,
     rollout: &mut [Box<dyn Bot>; 4],
     rng: &mut StdRng,
 ) -> Vec<Vec<f64>> {
+    let mut fill_rng = StdRng::seed_from_u64(if fill { rng.gen() } else { 0 });
     let team = view.my_team();
     let n = cands.len();
-    let run = |guess: [Vec<Card>; 4], rollout: &mut [Box<dyn Bot>; 4]| -> Vec<f64> {
-        let base = GameState::from_view_with_history(view, guess);
+    let mut run = |guess: [Vec<Card>; 4], rollout: &mut [Box<dyn Bot>; 4]| -> Vec<f64> {
+        let mut base = GameState::from_view_with_history(view, guess);
+        if fill {
+            crate::passfill::guess_passes(&mut base, view, &mut fill_rng);
+        }
         cands
             .options
             .iter()
@@ -321,6 +329,10 @@ pub struct Teacher {
     /// keep its choice unless another is clearly ahead (`clearly_ahead`).
     pub anchor: Option<Arc<Net>>,
     pub anchor_k: usize,
+    /// Give the other seats of each guessed deal their pass knowledge
+    /// (`passfill::guess_passes`); without it they play as if they had
+    /// forgotten what they passed and received.
+    pub fill: bool,
 }
 
 impl Teacher {
@@ -340,7 +352,7 @@ impl Teacher {
             }
         }
         let Some(net) = &self.anchor else {
-            let q = pimc_q(view, plays, cands, self.q_samples, self.infer, self.q_max, rollout, rng);
+            let q = pimc_q(view, plays, cands, self.q_samples, self.infer, self.q_max, self.fill, rollout, rng);
             return (argmax(&q), q);
         };
         let logits = net.option_logits(view, cands);
@@ -352,7 +364,7 @@ impl Teacher {
             features: order.iter().flat_map(|&k| cands.features[k * ACTION_DIM..(k + 1) * ACTION_DIM].iter().copied()).collect(),
             group_of: vec![],
         };
-        let rows = pimc_rows(view, plays, &sub, self.q_samples, self.infer, self.q_max, rollout, rng);
+        let rows = pimc_rows(view, plays, &sub, self.q_samples, self.infer, self.q_max, self.fill, rollout, rng);
         let m = rows.len().max(1) as f64;
         let mean: Vec<f64> = (0..sub.len()).map(|k| rows.iter().map(|r| r[k]).sum::<f64>() / m).collect();
         let best = (0..sub.len()).max_by(|&a, &b| mean[a].total_cmp(&mean[b])).unwrap();
@@ -576,7 +588,7 @@ impl Bot for Recorder {
 /// exactly as `selfplay --q N --rollout ROLLOUT` labels it, and leaves every
 /// other decision to h2 (`selfplay --bot h2`). Flags: `e` = `--exact-endgame`,
 /// `iK` = `--infer K`, `aM` = `--q-max M` (adaptive samples), `pK` = `--anchor K` (needs a
-/// `net:` rollout).
+/// `net:` rollout), `f` = `--pass-fill`.
 pub struct LabelerBot {
     base: crate::bots::H2Bot,
     rng: StdRng,
@@ -590,11 +602,12 @@ impl LabelerBot {
         let (head, rollout_name) = name.split_once(':')?;
         let (head, flags) = head.split_once('/').unwrap_or((head, ""));
         let q_samples: usize = head.strip_prefix("label")?.parse().ok().filter(|&n| n > 0)?;
-        let (mut exact_endgame, mut infer, mut q_max, mut anchor_k) = (false, 0, 0, 0);
+        let (mut exact_endgame, mut infer, mut q_max, mut anchor_k, mut fill) = (false, 0, 0, 0, false);
         let mut chars = flags.chars().peekable();
         while let Some(f) = chars.next() {
             match f {
                 'e' => exact_endgame = true,
+                'f' => fill = true,
                 'i' | 'a' | 'p' => {
                     let mut k = String::new();
                     while let Some(d) = chars.peek().filter(|c| c.is_ascii_digit()) {
@@ -624,7 +637,7 @@ impl LabelerBot {
         Some(Box::new(LabelerBot {
             base: crate::bots::H2Bot::new(),
             rng: StdRng::seed_from_u64(seed ^ 0xABCD),
-            teacher: Teacher { q_samples, exact_endgame, infer, q_max, anchor, anchor_k },
+            teacher: Teacher { q_samples, exact_endgame, infer, q_max, anchor, anchor_k, fill },
             rollout,
             name: name.to_string(),
         }))
@@ -720,6 +733,7 @@ pub fn run(cfg: &SelfplayConfig, w: &mut impl Write) -> std::io::Result<usize> {
                                 q_max: cfg.q_max,
                                 anchor: (cfg.anchor > 0).then(|| anchor_net(&cfg.rollout).expect("--anchor needs a net rollout")),
                                 anchor_k: cfg.anchor,
+                                fill: cfg.pass_fill,
                             },
                             rollout: [0, 1, 2, 3].map(|k| bots::by_name(&cfg.rollout, sd * 4 + k).expect("unknown bot")),
                             explore: cfg.explore,
