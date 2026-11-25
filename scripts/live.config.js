@@ -9,8 +9,9 @@ const fs = require('fs');
 const path = require('path');
 
 const repo = path.join(__dirname, '..');
-// The bot spec; model paths are relative to the repo (pm2's cwd below).
-const BOT = process.env.BOT || 'search:runs/dmc1.tnet';
+// The bot spec (default: `best`, the strongest assembled bot; see
+// src/bots/mod.rs). Model paths are relative to the repo (pm2's cwd below).
+const BOT = process.env.BOT || 'best';
 
 function readEnv(file) {
   const out = {};

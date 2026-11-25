@@ -1,7 +1,9 @@
 # Putting the bot on tichu.squidbox.com
 
 What it would take to let people play against `best` on the live server.
-Nothing here has been done; this is the plan and its costs.
+This was the plan; it is now built: `tichu live` (docs/LIVE.md) and
+dave-orr/tichu#148/#149 (bot token, the round's action log, 409 on refused
+moves). Games with AI seats aren't Elo-rated.
 
 ## The bot
 
