@@ -285,6 +285,9 @@ fn selfplay_records_parse_and_are_reproducible() {
         q_max: 0,
         anchor: 0,
         played_only: false,
+        critic: 0.0,
+        critic_k: 4,
+        pass_fill: false,
     };
     let (one, n) = selfplay_file(&cfg);
     let recs = parse_records(&one);
@@ -344,6 +347,9 @@ fn selfplay_played_only_records_hold_the_played_option() {
         q_max: 0,
         anchor: 0,
         played_only: false,
+        critic: 0.0,
+        critic_k: 4,
+        pass_fill: false,
     };
     let (full_buf, _) = selfplay_file(&cfg);
     let (buf, n) = selfplay_file(&SelfplayConfig { played_only: true, ..cfg.clone() });
@@ -372,6 +378,50 @@ fn selfplay_played_only_records_hold_the_played_option() {
     // With exploration, still one option per record.
     let (buf, _) = selfplay_file(&SelfplayConfig { played_only: true, explore: 0.3, ..cfg });
     assert!(parse_records(&buf).iter().all(|r| r.n == 1 && r.label == 0));
+}
+
+#[test]
+fn selfplay_critic_records_play_out_the_top_options() {
+    let cfg = SelfplayConfig {
+        bot: "h2".into(),
+        rounds: 6,
+        seed: 9,
+        threads: 1,
+        q_samples: 0,
+        rollout: "h2".into(),
+        explore: 0.1,
+        exact_endgame: false,
+        infer: 0,
+        q_max: 0,
+        anchor: 0,
+        played_only: true,
+        critic: 0.5,
+        critic_k: 3,
+        pass_fill: false,
+    };
+    let (buf, n) = selfplay_file(&cfg);
+    let recs = parse_records(&buf);
+    assert_eq!(recs.len(), n);
+    let (critic, played): (Vec<&Rec>, Vec<&Rec>) = recs.iter().partition(|r| r.q.is_some());
+    assert!(critic.len() > 10, "{} critic records", critic.len());
+    let s = 11 + STATE_DIM;
+    for c in &critic {
+        assert!((2..=3).contains(&c.n) && c.label == 0);
+        assert!(c.q.as_ref().unwrap().iter().all(|x| x.is_finite() && x.fract() == 0.0 && x.abs() <= 800.0));
+        // Its first option is the one played at that decision.
+        let same = played.iter().any(|p| {
+            p.round == c.round && p.seat == c.seat && p.bytes[11..s] == c.bytes[11..s] && p.bytes[s..s + ACTION_DIM] == c.bytes[s..s + ACTION_DIM]
+        });
+        assert!(same, "critic record without its played record");
+    }
+    // Deterministic, whatever the thread count.
+    let (four, _) = selfplay_file(&SelfplayConfig { threads: 4, ..cfg.clone() });
+    let key = |recs: Vec<Rec>| {
+        let mut v: Vec<(u32, u8, Vec<u8>)> = recs.into_iter().map(|r| (r.round, r.seat, r.bytes)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(key(recs), key(parse_records(&four)));
 }
 
 /// Number of blocks in a record file.
@@ -406,6 +456,9 @@ fn selfplay_q_labels_are_written() {
         q_max: 0,
         anchor: 0,
         played_only: false,
+        critic: 0.0,
+        critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -435,6 +488,9 @@ fn selfplay_exact_endgame_and_infer_options_run() {
         q_max: 0,
         anchor: 0,
         played_only: false,
+        critic: 0.0,
+        critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -461,6 +517,9 @@ fn selfplay_adaptive_samples_run_and_are_deterministic() {
         q_max: 8,
         anchor: 0,
         played_only: false,
+        critic: 0.0,
+        critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
@@ -493,6 +552,9 @@ fn selfplay_anchored_labels_search_only_the_nets_top_options() {
         q_max: 0,
         anchor: 2,
         played_only: false,
+        critic: 0.0,
+        critic_k: 4,
+        pass_fill: false,
     };
     let (buf, n) = selfplay_file(&cfg);
     let recs = parse_records(&buf);
