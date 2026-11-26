@@ -96,3 +96,27 @@ fn trace_emits_one_json_round_per_line() {
         assert!(v.is_object());
     }
 }
+
+#[test]
+fn analyze_reads_a_round_log_on_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let (log, _) = common::server_round_log_json("h2", 2, false, true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tichu"))
+        .args(["analyze", "--bot", "h2", "--threads", "2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(log.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["bot"], "h2");
+    assert_eq!(v["passes"].as_array().unwrap().len(), 4);
+    assert!(!v["decisions"].as_array().unwrap().is_empty());
+    // Garbage in: a clear error, exit 1.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_tichu")).args(["analyze", "--bot", "h2"]).stdin(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(b"{}").unwrap();
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(1));
+}

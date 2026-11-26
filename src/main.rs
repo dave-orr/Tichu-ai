@@ -68,6 +68,11 @@ usage:
       --games N       exit after N seat-games (default: run forever)
       --max-seats N   play at most N seats at once (default 8)
       --poll-secs S   how often to look for open seats (default 3)
+  tichu analyze --bot NAME [--threads T]  read one server round log (JSON, with `actions`) on
+                                          stdin and print, as JSON, what the bot would have done
+                                          at each decision: passes, plays, the wish, the Dragon
+                                          gift (dave-orr/tichu's hand review; src/analyze.rs)
+      --threads T     worker threads (default 2)
   tichu trace [--rounds N] [--seed S] [--bot NAME]
                                           JSONL round traces for tools/ts-diff";
 
@@ -138,6 +143,26 @@ fn main() {
 
     match cmd.as_str() {
         "bots" => list_bots(),
+        "analyze" => {
+            let bot = args.flags.iter().find(|(k, _)| k == "bot").and_then(|(_, v)| v.clone()).unwrap_or_else(|| "best".into());
+            let _ = factory(&bot); // exits on an unknown name
+            let mut text = String::new();
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+                eprintln!("stdin: {e}");
+                exit(1);
+            }
+            let log: tichu_engine::humanlog::RoundLog = serde_json::from_str(&text).unwrap_or_else(|e| {
+                eprintln!("bad round log: {e}");
+                exit(1)
+            });
+            match tichu_engine::analyze::analyze(&log, &bot, args.num("threads").unwrap_or(2)) {
+                Ok(a) => println!("{}", serde_json::to_string(&a).unwrap()),
+                Err(e) => {
+                    eprintln!("{e}");
+                    exit(1);
+                }
+            }
+        }
         "arena" => {
             let [a, b] = two_bots(&args);
             let mut cfg = ArenaConfig { seed, settings, duplicate: !args.has("no-duplicate"), ..Default::default() };

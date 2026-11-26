@@ -12,7 +12,9 @@
 //! - `llm`: language-model players and a resumable match runner
 //! - `replay`: game logs and the visual replay viewer
 //! - `live`: play on the real server through its AI player API
+//! - `analyze`: a bot's choice at every decision of a logged real round
 
+pub mod analyze;
 pub mod arena;
 pub mod bot;
 pub mod bots;

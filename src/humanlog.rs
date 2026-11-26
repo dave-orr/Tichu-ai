@@ -262,8 +262,8 @@ fn check_result(r: &RoundLog, g: &GameState) -> Result<(), String> {
     Ok(())
 }
 
-/// Deal the logged hands and apply Grand calls and passes: the state as play begins.
-fn deal<'a>(r: &'a RoundLog, settings: Settings) -> Result<(GameState, Vec<&'a LogPlayer>), String> {
+/// Deal the logged hands and apply the Grand calls.
+fn deal_to_pass<'a>(r: &'a RoundLog, settings: Settings) -> Result<(GameState, Vec<&'a LogPlayer>), String> {
     let mut ps: Vec<&LogPlayer> = r.players.iter().collect();
     ps.sort_by_key(|p| p.seat);
     if ps.len() != 4 || ps.iter().enumerate().any(|(i, p)| p.seat != i || p.initial_hand.len() != 14) {
@@ -280,6 +280,20 @@ fn deal<'a>(r: &'a RoundLog, settings: Settings) -> Result<(GameState, Vec<&'a L
     for s in 0..4 {
         apply(&mut g, Action::GrandTichu { seat: s, call: ps[s].tichu_call == TichuCall::Grand }, &mut steps)?;
     }
+    Ok((g, ps))
+}
+
+/// The logged hands dealt and the Grand calls made: the state as the pass
+/// begins (every seat still to choose its pass), in the log's direction.
+pub fn pass_state(r: &RoundLog) -> Result<GameState, String> {
+    let settings = Settings { clockwise: r.clockwise.unwrap_or(false), ..Settings::default() };
+    deal_to_pass(r, settings).map(|(g, _)| g)
+}
+
+/// Deal the logged hands and apply Grand calls and passes: the state as play begins.
+fn deal<'a>(r: &'a RoundLog, settings: Settings) -> Result<(GameState, Vec<&'a LogPlayer>), String> {
+    let (mut g, ps) = deal_to_pass(r, settings)?;
+    let mut steps = vec![];
     for s in 0..4 {
         let p = ps[s];
         let (Some(left), Some(partner), Some(right)) = (p.passed_left, p.passed_partner, p.passed_right) else {
