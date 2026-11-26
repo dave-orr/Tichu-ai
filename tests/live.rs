@@ -57,6 +57,7 @@ fn server_state(g: &GameState, seat: Seat) -> ServerState {
                 grand_tichu_decided: p.grand_decided,
                 passed_cards: p.pass.is_some(),
                 card_count: p.hand.len(),
+                is_ai: true,
             })
             .collect(),
         teams: vec![ServerTeam { score: g.scores[0] }, ServerTeam { score: g.scores[1] }],
@@ -138,4 +139,56 @@ fn shadow_follows_random_bots() {
 #[test]
 fn shadow_follows_h2_clockwise() {
     follow_rounds("h2", 60, true);
+}
+
+/// Bots take turns at the Grand call: after every person, then in seat
+/// order, and never over the partner's call.
+#[test]
+fn grand_calls_wait_their_turn() {
+    use tichu_engine::live::decide;
+    let mut rng = StdRng::seed_from_u64(7);
+    let mut g = GameState::new(Settings::default());
+    g.start_round(shuffled_deck(&mut rng));
+    let me = 1;
+    /// Calls Grand whenever asked.
+    struct Eager;
+    impl Bot for Eager {
+        fn name(&self) -> String {
+            "eager".into()
+        }
+        fn grand_tichu(&mut self, _: &tichu_engine::view::PlayerView) -> bool {
+            true
+        }
+        fn pass_cards(&mut self, _: &tichu_engine::view::PlayerView) -> PassInfo {
+            unreachable!()
+        }
+        fn play(&mut self, _: &tichu_engine::view::PlayerView, _: &[Combo], _: bool) -> Option<usize> {
+            unreachable!()
+        }
+        fn dragon_recipient(&mut self, _: &tichu_engine::view::PlayerView) -> Seat {
+            unreachable!()
+        }
+    }
+    let mut bot = Eager;
+    let not_done = |_: &str| false;
+    let mut ask = |g: &GameState, humans: &[Seat]| {
+        let mut s = server_state(g, me);
+        for &h in humans {
+            s.players[h].is_ai = false;
+        }
+        let mut sh = Shadow::new(me, 3);
+        sh.sync(&s).unwrap();
+        decide(&mut bot, &sh, &s, &not_done).map(|d| d.action)
+    };
+    // Seat 0 undecided, person or bot (a lower seat): wait.
+    assert!(ask(&g, &[0]).is_none());
+    assert!(ask(&g, &[]).is_none());
+    g.apply(&Action::GrandTichu { seat: 0, call: false }).unwrap();
+    // A person in seat 2 still deciding: wait.
+    assert!(ask(&g, &[2]).is_none());
+    // Only bots in higher seats left: my turn.
+    assert_eq!(ask(&g, &[]).unwrap()["call"], true);
+    // My partner (seat 3, a person) called Grand: never call over it.
+    g.apply(&Action::GrandTichu { seat: 3, call: true }).unwrap();
+    assert_eq!(ask(&g, &[3]).unwrap()["call"], false);
 }
