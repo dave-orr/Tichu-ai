@@ -457,6 +457,63 @@ noisy (R² 0.02–0.05), so more labelling should still help, and labels should
 be redone when card play improves (they measure a call's worth given how
 these bots play).
 
+## One net for every decision (in progress)
+
+Everything above learns one kind of decision at a time. `tichu e2edata` and
+`train/e2e.py` are the first two pieces of a setup where one net makes all
+of them: Grand, Small Tichu, the three pass cards, plays, out-of-turn bombs,
+the wish and the Dragon gift.
+
+```sh
+B=callnet~g:runs/calls3/m3.tcall:callnet~s:runs/calls1/m1.tcall:net:runs/v4/gen3.tnet
+tichu e2edata --bot $B --games 250 --seed 1 --out runs/e2e/part001.bin.gz
+tichu e2edata --bot $B --games 500 --seed 1001 --out runs/e2e/val.bin.gz
+python train/e2e.py runs/e2e/part*.bin.gz --val runs/e2e/val.bin.gz --out runs/e2e/a.pt
+```
+
+- **Records** (`src/e2e.rs`). Full games with one bot in every seat. Every
+  decision with a real choice becomes a record: the seat's state features
+  (the 704 of `encode_state`, the kind of decision, and for calls the 32
+  call features), the option taken (136 bytes, each kind in its own slots:
+  the 48 play features for plays and bombs, a call bit, a pass card with the
+  hand it leaves, a wish, a Dragon recipient), how many history tokens the
+  seat had seen, and where every card it couldn't see really was (a target,
+  never an input). The block header holds the round's result, the card
+  points, who went out first and the game score before the round. Passing is
+  three records: partner card, then left, then right.
+- **Branches**: the real-deal critic for every kind of decision. With the
+  chance `--branch` gives each kind (default grand 0.25, small 0.12, pass
+  0.25, play 0.04, bomb 0.2, wish 0.5, dragon 0.5) the generator copies the
+  real state, takes another option and plays the round out with fresh
+  copies of the bot (players still see only their own views). The decision
+  and its alternatives share a group number. A play's alternatives are the
+  bot's net's next choices; a pass changes one card (low cards likelier for
+  opponents); "not now" for a Small Tichu or a bomb holds only until the
+  seat's view changes. A quarter of the decisions inside a branch are
+  recorded as well (`--inner-keep`). The defaults cost about 8 playouts per
+  round of the game and give about 140 records, 23 KB gzipped.
+- **Trainer.** A shared residual body over the state (plus, with `--seq`, a
+  GRU over the history tokens), then for one option: Q = V + advantage in
+  units of 100 points, regressed on the round's margin, and who goes out
+  first; for the position: V, who goes out first, and for each unseen card
+  which seat holds it. Files are read and trained on one at a time, once.
+- **Held-out report**, by kind of decision: R² of V and Q against the
+  margin; hidden cards placed right against guessing by card counts; and on
+  the branches, how often the net's best-scored option was a best one and
+  the points per decision gained by taking the net's choice among the tried
+  options over the bot's own (an unbiased estimate, since the net never
+  saw those rounds). A branch gain has a standard deviation near 190 points,
+  so ±2 needs about 35k branches of that kind.
+
+Not built yet: the Rust bot that plays from this net, the win-chance
+target, the warm start from the current models, and the self-play loop.
+
+`cargo build --release --features mimalloc` swaps in the mimalloc allocator.
+`examples/decision_census.rs` counts the decisions of each kind per round
+(the current bot without search: 37 plays with a choice, 8.6 Small Tichu
+offers, 4 Grand decisions, 4 passes, 3.2 bomb offers, 0.9 wishes and 0.9
+Dragon gifts).
+
 ## Running the loop
 
 ```sh

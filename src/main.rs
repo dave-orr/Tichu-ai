@@ -10,6 +10,12 @@ use tichu_engine::deck::shuffled_deck;
 use tichu_engine::engine::{Action, GameState};
 use tichu_engine::sim::play_dealt_round;
 use tichu_engine::trace::trace_round;
+
+/// `--features mimalloc`: self-play allocates a lot from every thread, and
+/// the system allocator can hold many threads back (Windows especially).
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use tichu_engine::types::*;
 
 const USAGE: &str = "\
