@@ -127,10 +127,14 @@ def main():
             line = f"    {kind:7}"
             if "n" in r:
                 line += f" R² V {r['v_r2']:.3f} Q {r['q_r2']:.3f}"
+            if "teacher_r2" in r:
+                line += f" (the bot's net {r['teacher_r2']:.3f})"
             if "cards_right" in r:
                 line += f"; cards right {r['cards_right']:.1%} (counting {r['cards_right_counting']:.1%})"
             if "groups" in r:
                 line += f"; {r['groups']} branches: best option {r['agree']:.1%}, gain {r['gain']:+.1f} ± {r['gain_ci']:.1f}, R² {r['branch_r2']:.3f}"
+            if "same_as_bot" in r:
+                line += f", policy head picks the bot's play {r['same_as_bot']:.1%}"
             say(line)
     say("done")
 

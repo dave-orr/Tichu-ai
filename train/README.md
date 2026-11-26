@@ -478,7 +478,9 @@ python train/e2e.py runs/e2e/part*.bin.gz --val runs/e2e/val.bin.gz --out runs/e
   the 48 play features for plays and bombs, a call bit, a pass card with the
   hand it leaves, a wish, a Dragon recipient), how many history tokens the
   seat had seen, and where every card it couldn't see really was (a target,
-  never an input). The block header holds the round's result, the card
+  never an input), and what the bot's own net said: its value of the position
+  and, for a play, its policy's log-probability of the option (targets for
+  a warm start; the trainer's `--teacher-weight`). The block header holds the round's result, the card
   points, who went out first and the game score before the round. Passing is
   three records: partner card, then left, then right.
 - **Branches**: the real-deal critic for every kind of decision. With the

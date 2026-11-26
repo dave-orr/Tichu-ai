@@ -35,6 +35,10 @@
 //!         at 255) | u8 pass step | u16 group (0 = none; unique within the
 //!         game's round) | u16 history tokens seen
 //!         E_STATE_DIM bytes | CAND_DIM bytes | HIDDEN_DIM bytes
+//!         i16 the bot's net's value of the position, in tenths of a
+//!         point (flag 2; plays, bombs, wishes and Dragon gifts)
+//!         i16 its policy's log-probability of this option, in
+//!         thousandths (flag 4; plays)
 //! ```
 //!
 //! Candidate features (`CAND_DIM` bytes; each kind has its own slots, the
@@ -56,7 +60,7 @@ use rand::{Rng, SeedableRng};
 
 use crate::bot::Bot;
 use crate::bots::h2::{self, Counts};
-use crate::bots::net::Net;
+use crate::bots::net::{Net, SeqCache};
 use crate::calllabel::{encode_call_extra, CALL_EXTRA_DIM};
 use crate::deck::shuffled_deck;
 use crate::engine::{Action, GameState};
@@ -66,13 +70,13 @@ use crate::sim::{bomb_round, play_dealt_round, play_from, resume_from};
 use crate::types::*;
 use crate::view::PlayerView;
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// The decision's kind (one-hot, 8) and the call features.
 pub const CTX_DIM: usize = 8 + CALL_EXTRA_DIM;
 pub const E_STATE_DIM: usize = STATE_DIM + CTX_DIM;
 pub const CAND_DIM: usize = 136;
 pub const HIDDEN_DIM: usize = 56;
-pub const RECORD_SIZE: usize = 8 + E_STATE_DIM + CAND_DIM + HIDDEN_DIM;
+pub const RECORD_SIZE: usize = 8 + E_STATE_DIM + CAND_DIM + HIDDEN_DIM + 4;
 
 const CALL_AT: usize = 48;
 const PASS_AT: usize = 50;
@@ -301,6 +305,8 @@ struct Rec {
     state: Vec<u8>,
     cand: Vec<u8>,
     hidden: Vec<u8>,
+    teacher_v: i16,
+    teacher_lp: i16,
 }
 
 /// What a round's playouts share.
@@ -346,6 +352,7 @@ struct Recorder {
     hold: Option<usize>,
     scores_before: [i32; 2],
     seed: u64,
+    seq: SeqCache,
 }
 
 impl Recorder {
@@ -361,14 +368,36 @@ impl Recorder {
             Some(g) => hidden_targets(view, g),
             None => vec![0; HIDDEN_DIM],
         };
-        Rec { kind, flags: 0, n_options, step: step as u8, group: 0, prefix: self.walk.n_tokens(), state, cand, hidden }
+        Rec { kind, flags: 0, n_options, step: step as u8, group: 0, prefix: self.walk.n_tokens(), state, cand, hidden, teacher_v: 0, teacher_lp: 0 }
     }
 
     /// Keep a decision's record: always in the game itself, a share of them
     /// inside a branch.
-    fn keep(&mut self, rec: Rec) {
+    fn keep(&mut self, mut rec: Rec, option: Option<(&Candidates, usize)>) {
         if self.main() || rec.group != 0 || self.rng.gen_bool(self.common.cfg.inner_keep) {
+            self.teach(&mut rec, option);
             self.recs.push(rec);
+        }
+    }
+
+    /// What the bot's own net says here, for a learner to start from: its
+    /// value of the position and, for a play, its policy's log-probability
+    /// of option `k`. Call it while `self.walk` is at the record's view.
+    fn teach(&mut self, rec: &mut Rec, option: Option<(&Candidates, usize)>) {
+        let Some(net) = self.common.anchor.clone() else { return };
+        if !matches!(rec.kind, Kind::Play | Kind::Bomb | Kind::Wish | Kind::Dragon) || rec.flags & 6 != 0 {
+            return;
+        }
+        let state = &rec.state[..STATE_DIM];
+        let h = net.trunk(state, &net.encode_seq_cached(self.walk.tokens(), &mut self.seq));
+        rec.teacher_v = (net.value(state, &h) * 10.0).round().clamp(-32000.0, 32000.0) as i16;
+        rec.flags |= 2;
+        if let (Kind::Play, Some((cands, k))) = (rec.kind, option) {
+            let logits = net.logits(&h, &cands.features);
+            let top = logits.iter().copied().fold(f32::MIN, f32::max);
+            let lse = top + logits.iter().map(|l| (l - top).exp()).sum::<f32>().ln();
+            rec.teacher_lp = ((logits[k] - lse) * 1000.0).round().clamp(-32000.0, 0.0) as i16;
+            rec.flags |= 4;
         }
     }
 
@@ -386,6 +415,7 @@ impl Recorder {
     /// (`None`: with the offer turned down for now), recording `root` as
     /// this seat's first decision of the playout.
     fn branch(&mut self, view: &PlayerView, mut root: Rec, action: Option<Action>, after: After) {
+        self.teach(&mut root, None);
         let Some(mut g) = self.real.clone() else { return };
         let seat = view.seat;
         let hold = action.is_none().then_some(view.log.len());
@@ -415,6 +445,7 @@ impl Recorder {
                 hold: if s == seat { hold } else { None },
                 scores_before: self.scores_before,
                 seed: base,
+                seq: SeqCache::default(),
             })
         });
         let done = match after {
@@ -447,7 +478,7 @@ impl Bot for Recorder {
             alt.group = rec.group;
             self.branch(view, alt, Some(Action::GrandTichu { seat: view.seat, call: !call }), After::Full);
         }
-        self.keep(rec);
+        self.keep(rec, None);
         call
     }
 
@@ -464,7 +495,7 @@ impl Bot for Recorder {
             let action = (!call).then_some(Action::SmallTichu { seat: view.seat });
             self.branch(view, alt, action, After::Resume);
         }
-        self.keep(rec);
+        self.keep(rec, None);
         call
     }
 
@@ -506,7 +537,7 @@ impl Bot for Recorder {
             }
         }
         for rec in recs {
-            self.keep(rec);
+            self.keep(rec, None);
         }
         pass
     }
@@ -538,6 +569,7 @@ impl Bot for Recorder {
             for k in order {
                 let mut alt = self.rec(view, Kind::Play, cands.len(), 0, feat(k));
                 alt.group = rec.group;
+                self.teach(&mut alt, Some((&cands, k)));
                 match cands.options[k] {
                     Some(i) => {
                         let action = Action::Play { seat: view.seat, cards: plays[i].cards.clone(), phoenix_as: plays[i].phoenix_as };
@@ -547,7 +579,7 @@ impl Bot for Recorder {
                 }
             }
         }
-        self.keep(rec);
+        self.keep(rec, Some((&cands, opt)));
         choice
     }
 
@@ -571,7 +603,7 @@ impl Bot for Recorder {
                 None => self.branch(view, alt, None, After::Resume),
             }
         }
-        self.keep(rec);
+        self.keep(rec, None);
         choice
     }
 
@@ -586,7 +618,7 @@ impl Bot for Recorder {
             alt.group = rec.group;
             self.branch(view, alt, Some(Action::Wish { seat: view.seat, rank: wish_of(k) }), After::Resume);
         }
-        self.keep(rec);
+        self.keep(rec, None);
         rank
     }
 
@@ -601,7 +633,7 @@ impl Bot for Recorder {
             alt.group = rec.group;
             self.branch(view, alt, Some(Action::GiveDragon { seat: view.seat, to: other }), After::Resume);
         }
-        self.keep(rec);
+        self.keep(rec, None);
         to
     }
 
@@ -656,6 +688,8 @@ impl Bot for Recorder {
             b.extend_from_slice(&r.state);
             b.extend_from_slice(&r.cand);
             b.extend_from_slice(&r.hidden);
+            b.extend_from_slice(&r.teacher_v.to_le_bytes());
+            b.extend_from_slice(&r.teacher_lp.to_le_bytes());
         }
         sh.records += recs.len();
     }
@@ -710,6 +744,7 @@ pub fn run(cfg: &E2eConfig, w: impl Write) -> std::io::Result<E2eStats> {
                             hold: None,
                             scores_before: [0, 0],
                             seed: sd,
+                            seq: SeqCache::default(),
                         })
                     });
                     let mut rng = StdRng::seed_from_u64(seed);
@@ -807,7 +842,7 @@ mod tests {
             for _ in 0..nr {
                 let r = &raw[pos..pos + RECORD_SIZE];
                 assert!(u16_at(r, 6) <= nt);
-                out.push((r[0], r[1], u16_at(r, 4), playout, (game, round), r[8 + E_STATE_DIM..8 + E_STATE_DIM + CAND_DIM].to_vec(), r[RECORD_SIZE - HIDDEN_DIM..].to_vec()));
+                out.push((r[0], r[1], u16_at(r, 4), playout, (game, round), r[8 + E_STATE_DIM..8 + E_STATE_DIM + CAND_DIM].to_vec(), r[RECORD_SIZE - 4 - HIDDEN_DIM..RECORD_SIZE - 4].to_vec()));
                 pos += RECORD_SIZE;
             }
         }

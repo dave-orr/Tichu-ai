@@ -49,9 +49,11 @@ import torch.nn.functional as F
 
 HEADER = struct.Struct("<4s6I")
 BLOCK = struct.Struct("<IHHBB6hHH")
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 KINDS = ["grand", "small", "pass", "play", "bomb", "wish", "dragon"]
 SCALE = 100.0
+# Teacher log-probabilities below this are all "never".
+LP_FLOOR = -8.0
 
 
 class Data:
@@ -70,7 +72,7 @@ class Data:
             if dims is not None and d != dims:
                 raise ValueError(f"{path}: layout {d}, expected {dims}")
             dims = d
-            R = 8 + S + C + H
+            R = 8 + S + C + H + 4
             data = np.frombuffer(buf, dtype=np.uint8)
             pos = HEADER.size
             while pos < len(buf):
@@ -87,7 +89,7 @@ class Data:
                 raise ValueError(f"{path}: truncated")
         self.dims = dims
         S, C, H, D = dims["state_dim"], dims["cand_dim"], dims["hidden_dim"], dims["token_dim"]
-        rows = np.concatenate(recs) if recs else np.zeros((0, 8 + S + C + H), np.uint8)
+        rows = np.concatenate(recs) if recs else np.zeros((0, 8 + S + C + H + 4), np.uint8)
         B = np.array(blocks, dtype=np.int64).reshape(-1, 15)
         of = np.repeat(np.arange(len(B)), B[:, 14])
         self.kind = rows[:, 0].astype(np.int64)
@@ -98,7 +100,12 @@ class Data:
         self.prefix = rows[:, 6].astype(np.int64) | (rows[:, 7].astype(np.int64) << 8)
         self.state = rows[:, 8:8 + S]
         self.cand = rows[:, 8 + S:8 + S + C]
-        self.hidden = rows[:, 8 + S + C:]
+        self.hidden = rows[:, 8 + S + C:8 + S + C + H]
+        # What the data's bot's own net said: its value of the position
+        # (points) and its policy's log-probability of this option.
+        teacher = np.ascontiguousarray(rows[:, 8 + S + C + H:]).view("<i2").astype(np.float32)
+        self.has_tv, self.has_tlp = (rows[:, 1] & 2).astype(bool), (rows[:, 1] & 4).astype(bool)
+        self.teacher_v, self.teacher_lp = teacher[:, 0] / 10.0, teacher[:, 1] / 1000.0
         self.tokens = np.concatenate(toks).reshape(-1, D) if toks else np.zeros((0, D), np.uint8)
         fi, game, rnd, playout, seat, first = (B[of, k] for k in range(6))
         self.game, self.playout, self.first = game, playout, first
@@ -128,8 +135,9 @@ class E2ENet(nn.Module):
         self.first = nn.Linear(width, 4)
         self.belief = nn.Linear(width, H * 3)
         self.q1 = nn.Linear(width + C, head)
-        # advantage, then first-out logits for the option
-        self.q2 = nn.Linear(head, 1 + 4)
+        # advantage, first-out logits for the option, and the teacher
+        # policy's log-probability of it
+        self.q2 = nn.Linear(head, 1 + 4 + 1)
         self.H = H
 
     def body(self, s, toks, lens):
@@ -148,11 +156,12 @@ class E2ENet(nn.Module):
 
     def forward(self, s, c, toks, lens):
         """-> V [B], Q [B], first-out logits for the position [B, 4] and the
-        option [B, 4], hidden-card logits [B, H, 3]."""
+        option [B, 4], hidden-card logits [B, H, 3], the option's policy
+        log-probability [B]."""
         h = self.body(s, toks, lens)
         v = self.value(h).squeeze(-1)
         o = self.q2(F.relu(self.q1(torch.cat([h, c], -1))))
-        return v, v + o[:, 0], self.first(h), o[:, 1:], self.belief(h).view(len(s), self.H, 3)
+        return v, v + o[:, 0], self.first(h), o[:, 1:5], self.belief(h).view(len(s), self.H, 3), o[:, 5]
 
 
 class Batcher:
@@ -166,6 +175,8 @@ class Batcher:
         self.forced, self.kind = T(data.forced), T(data.kind)
         self.prefix, self.tok_off = T(data.prefix), T(data.tok_off)
         self.tokens = T(data.tokens) if seq else None
+        self.has_tv, self.has_tlp = T(data.has_tv), T(data.has_tlp)
+        self.teacher_v, self.teacher_lp = T(data.teacher_v) / SCALE, T(data.teacher_lp).clamp(min=LP_FLOOR)
 
     def get(self, idx):
         s = self.state[idx].float() / 255.0
@@ -183,7 +194,7 @@ class Batcher:
 
 def losses(model, b, idx, args):
     s, c, toks, lens = b.get(idx)
-    v, q, f_s, f_c, bel = model(s, c, toks, lens)
+    v, q, f_s, f_c, bel, lp = model(s, c, toks, lens)
     y, first, own = b.margin[idx], b.first[idx], ~b.forced[idx]
     ql = F.mse_loss(q, y)
     # V and the position's first-out are about the bot's own choice.
@@ -194,7 +205,12 @@ def losses(model, b, idx, args):
     hid = b.hidden[idx].long()
     m = hid > 0
     bl = F.cross_entropy(bel[m], hid[m] - 1) if m.any() else ql * 0
-    return ql + args.value_weight * vl + args.first_weight * fl + args.belief_weight * bl, (ql, vl, fl, bl)
+    # The teacher: its value where it gave one, its policy on plays.
+    wv, wp = b.has_tv[idx].float(), b.has_tlp[idx].float()
+    tl = ((v - b.teacher_v[idx]) ** 2 * wv).sum() / wv.sum().clamp(min=1)
+    pl = (F.smooth_l1_loss(lp, b.teacher_lp[idx], reduction="none") * wp).sum() / wp.sum().clamp(min=1)
+    total = ql + args.value_weight * vl + args.first_weight * fl + args.belief_weight * bl + args.teacher_weight * (tl + 0.5 * pl)
+    return total, (ql, vl, fl, bl, tl, pl)
 
 
 @torch.no_grad()
@@ -202,11 +218,12 @@ def evaluate(model, data, dev, args):
     """The held-out report (see the module docs), as a dict."""
     model.eval()
     b = Batcher(data, dev, model.seq)
-    V, Q, hit, n_hid, ll = [], [], [], [], []
+    V, Q, P, hit, n_hid, ll = [], [], [], [], [], []
     for i in range(0, len(data), 4096):
         idx = torch.arange(i, min(i + 4096, len(data)), device=dev)
         s, c, toks, lens = b.get(idx)
-        v, q, _, _, bel = model(s, c, toks, lens)
+        v, q, _, _, bel, plp = model(s, c, toks, lens)
+        P.append(plp.cpu())
         V.append(v.cpu())
         Q.append(q.cpu())
         hid = b.hidden[idx].long()
@@ -216,7 +233,7 @@ def evaluate(model, data, dev, args):
         ll.append((-(lp.gather(2, (hid - 1).clamp(min=0).unsqueeze(-1)).squeeze(-1)) * m).sum(1).cpu())
         n_hid.append(m.sum(1).cpu())
     model.train()
-    V, Q = torch.cat(V).numpy() * SCALE, torch.cat(Q).numpy() * SCALE
+    V, Q, P = torch.cat(V).numpy() * SCALE, torch.cat(Q).numpy() * SCALE, torch.cat(P).numpy()
     hit, ll, n_hid = torch.cat(hit).numpy(), torch.cat(ll).numpy(), torch.cat(n_hid).numpy()
     out = {}
     # Guessing from how many cards each seat holds: the best single guess
@@ -237,6 +254,11 @@ def evaluate(model, data, dev, args):
         if cards > 0:
             r.update(cards_right=hit[sel].sum() / cards, cards_right_counting=counts[sel].max(1).sum() / cards,
                      cards_ll=ll[sel].sum() / cards, cards_ll_counting=base_ll[sel].sum() / cards)
+        tv = sel & data.has_tv
+        if tv.sum() >= 50:
+            yt = data.margin[tv]
+            r.update(teacher_r2=1 - ((data.teacher_v[tv] - yt) ** 2).mean() / yt.var(),
+                     v_like_teacher=1 - ((V[tv] - data.teacher_v[tv]) ** 2).mean() / data.teacher_v[tv].var())
         out[name] = r
     # Branch groups: a decision and the other options tried on the same deal.
     g = data.group
@@ -252,7 +274,10 @@ def evaluate(model, data, dev, args):
             continue
         y, q = data.margin[m], Q[m]
         pick = m[int(np.argmax(q))]
-        st = stats.setdefault(int(data.kind[mine[0]]), dict(gain=[], hind=[], agree=[], sse=0.0, sst=0.0))
+        st = stats.setdefault(int(data.kind[mine[0]]), dict(gain=[], hind=[], agree=[], same=[], sse=0.0, sst=0.0))
+        if data.has_tlp[m].all():
+            # The data's bot took its policy's top option: does the policy head too?
+            st["same"].append(float(m[int(np.argmax(P[m]))] == mine[0]))
         st["gain"].append(data.margin[pick] - data.margin[mine[0]])
         st["hind"].append(y.max() - data.margin[mine[0]])
         st["agree"].append(float(data.margin[pick] == y.max()))
@@ -263,6 +288,8 @@ def evaluate(model, data, dev, args):
         out.setdefault(KINDS[k], {}).update(
             groups=len(gain), gain=gain.mean(), gain_ci=1.96 * gain.std() / max(1, len(gain)) ** 0.5,
             hindsight=float(np.mean(st["hind"])), agree=float(np.mean(st["agree"])), branch_r2=1 - st["sse"] / max(st["sst"], 1e-9))
+        if st["same"]:
+            out[KINDS[k]].update(same_as_bot=float(np.mean(st["same"])))
     return {k: {a: (float(x) if not isinstance(x, int) else x) for a, x in v.items()} for k, v in out.items()}
 
 
@@ -272,12 +299,16 @@ def show(report):
         line = f"  {name:7}"
         if "n" in r:
             line += f" {r['n']:8d} decisions: R² V {r['v_r2']:.3f} Q {r['q_r2']:.3f}"
+        if "teacher_r2" in r:
+            line += f" (the bot's net: {r['teacher_r2']:.3f}; V matches it {r['v_like_teacher']:.3f})"
         if "cards_right" in r:
             line += (f"; cards right {r['cards_right']:.1%} (counting {r['cards_right_counting']:.1%}), "
                      f"log loss {r['cards_ll']:.3f} ({r['cards_ll_counting']:.3f})")
         if "groups" in r:
             line += (f"; {r['groups']} branches: picks a best option {r['agree']:.0%}, gain {r['gain']:+.1f} ± {r['gain_ci']:.1f} "
                      f"(hindsight {r['hindsight']:+.1f}), R² {r['branch_r2']:.3f}")
+        if "same_as_bot" in r:
+            line += f", policy head picks the bot's play {r['same_as_bot']:.0%}"
         lines.append(line)
     return "\n".join(lines)
 
@@ -299,6 +330,8 @@ def main():
     ap.add_argument("--value-weight", type=float, default=0.5)
     ap.add_argument("--first-weight", type=float, default=0.1)
     ap.add_argument("--belief-weight", type=float, default=0.5)
+    ap.add_argument("--teacher-weight", type=float, default=1.0,
+                    help="weight of matching the data's bot's own net (its value, and its policy on plays); 0 = results only")
     ap.add_argument("--eval-every", type=int, default=1, help="files between held-out reports")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--threads", type=int, default=0)
@@ -324,7 +357,7 @@ def main():
             raise SystemExit(f"{path}: layout {data.dims}, expected {val.dims}")
         b = Batcher(data, dev, model.seq)
         perm = torch.randperm(len(data), device=dev, generator=gen)
-        tot = np.zeros(4)
+        tot = np.zeros(6)
         nb = 0
         for i in range(0, len(perm) - args.batch + 1, args.batch):
             for g in opt.param_groups:
@@ -339,9 +372,10 @@ def main():
         seen += len(data)
         del b
         line = dict(file=os.path.basename(path), records=seen, steps=steps, mins=(time.time() - t0) / 60,
-                    train=dict(zip(["q", "v", "first", "cards"], (tot / max(nb, 1)).tolist())))
+                    train=dict(zip(["q", "v", "first", "cards", "teacher_v", "teacher_policy"], (tot / max(nb, 1)).tolist())))
         msg = (f"{fi + 1}/{len(files)} {line['file']}: {seen} records, {steps} steps, {line['mins']:.1f} min; "
-               f"train loss Q {line['train']['q']:.3f} V {line['train']['v']:.3f} first {line['train']['first']:.3f} cards {line['train']['cards']:.3f}")
+               f"train loss Q {line['train']['q']:.3f} V {line['train']['v']:.3f} first {line['train']['first']:.3f} cards {line['train']['cards']:.3f} "
+               f"teacher V {line['train']['teacher_v']:.3f} policy {line['train']['teacher_policy']:.3f}")
         if (fi + 1) % args.eval_every == 0 or fi + 1 == len(files):
             line["val"] = evaluate(model, val, dev, args)
             msg += "\n" + show(line["val"])
