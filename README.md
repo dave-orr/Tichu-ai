@@ -49,6 +49,7 @@ heuristic vs random  (2000 deals)
 | `src/trace.rs`, `tools/ts-diff/` | JSON round traces and the TS replayer |
 | `src/replay.rs`, `viewer/` | game logs and the visual replay viewer (see below) |
 | `src/live.rs`, `tichu live` | plays on the real server (tichu.squidbox.com) through its AI API: claims open AI seats and replays each round through the engine so the bot gets its usual `PlayerView`; see [docs/LIVE.md](docs/LIVE.md) |
+| `src/analyze.rs`, `tichu analyze` | a bot's second opinion on a real hand: reads one server round log on stdin and prints what the bot would have done at each decision (passes, on-turn plays, the wish, the Dragon gift), from each seat's own view. dave-orr/tichu's hand review runs it for its AI suggestions; see [docs/LIVE.md](docs/LIVE.md#hand-review-suggestions) |
 | `src/llm/`, `examples/llm_match.rs` | Claude as a player (via `claude -p` on a subscription) and a resumable Claude-vs-bot match; see [docs/LLM_MATCH.md](docs/LLM_MATCH.md) |
 
 ## Writing a bot

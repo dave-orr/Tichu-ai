@@ -100,6 +100,36 @@ node scripts/live-e2e.mjs --server http://localhost:3999 --target 500
 At the end, `tichu live --games N` prints how many seat-games had refused
 moves or divergences (it exits non-zero if any did).
 
+## Hand review suggestions
+
+The server's hand review (dave-orr/tichu) can show what the AI would have
+done at each turn of the hand just played. For that the server runs this
+checkout's binary itself, once per hand someone asks about:
+
+```sh
+tichu analyze --bot best --threads 2 < round-log.json
+```
+
+It reads the hand as a server round log (`RoundLog`, with `actions`),
+rebuilds it through the engine (`humanlog::replay`) and asks a fresh bot at
+every decision, from the decider's own `PlayerView` (its hand and the play so
+far, never the other hands): each seat's pass, every on-turn play or pass
+that had a choice, the Mah Jong wish and the Dragon gift. Grand and Small
+Tichu calls and out-of-turn bombs aren't asked. Each decision's bot is seeded
+by its place in the hand, so the answer is the same every time. Output:
+
+```json
+{"bot":"best","passes":[{"seat":0,"left":…,"partner":…,"right":…}],
+ "decisions":[{"action":3,"seat":1,"suggestion":{"type":"play","cards":[…]}},
+              {"action":4,"seat":2,"suggestion":{"type":"pass"}}]}
+```
+
+`action` indexes the log's `actions`. Suggestion types: `play` (`cards`,
+`phoenixAs`), `pass`, `wish` (`rank` or null), `dragon` (`to`). The server
+looks for the checkout next to its own (where `scripts/deploy.sh` builds it)
+and runs the binary from it, so `best`'s model files are found the same way
+as for `tichu live`; nothing else to set up.
+
 ## Known limits
 
 - A bot joins only while the room is waiting, so it can't take over a
