@@ -505,6 +505,13 @@ python train/e2e.py runs/e2e/part*.bin.gz --val runs/e2e/val.bin.gz --out runs/e
   saw those rounds). A branch gain has a standard deviation near 190 points,
   so ±2 needs about 35k branches of that kind.
 
+`train/e2e_stage1.py --dir runs/e2e-s1` is the first experiment: it makes a
+held-out file and 50 training files (resumable, one file at a time), trains
+four nets on them in the same order, each file once (dmc1's shape; 512x4
+without and with the GRU; 1024x6 with it), and writes their held-out
+reports side by side in `log.txt`. The question is whether size and a
+memory of the round buy anything on equal data.
+
 Not built yet: the Rust bot that plays from this net, the win-chance
 target, the warm start from the current models, and the self-play loop.
 
