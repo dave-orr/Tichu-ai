@@ -357,6 +357,15 @@ calls; full games are 600 duplicate pairs, about ±3%):
 | m2 | + calls2: 40k rounds at game scores, m1 in all seats | | 52.8% |
 | m3 | calls3: 40k rounds, game scores, m2 in all seats, Grand one at a time | | 54.2% |
 | m3 Grand + m1 Small | (stacked) | | 56.1% (600), 56.1% ± 1.8 on 1500 fresh games |
+| m4 Small (call / wait / pass-to-wait) + m3 Grand | calls4: 40k rounds, Small offers labelled against waiting | | 48.8% against the row above |
+| m4 Grand + m1 Small | calls3 + calls4 | | 50.5% against m3 Grand + m1 Small |
+
+Small Tichu labels from format 3 compare calling now with waiting (the
+bot's own policy at later offers, so playing a card first loses the
+option) and, on my turn, with passing to keep the option. That is the
+honest comparison, but its signal is much smaller than "call now against
+never": with 40k rounds the Small head stays at v2's offline value and
+never chooses to pass, and it lost to m1 in full games.
 
 The learned calls are far more aggressive than v2 (Tichu success 40–60%
 against v2's 65%, Grand ~54% against 63%), especially when behind, and they
