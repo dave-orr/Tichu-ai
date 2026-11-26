@@ -32,6 +32,15 @@ usage:
                                           llm_match games/); --json prints the
                                           replay data instead
   tichu play <A> <B> [--seed S]           narrate one round (A = seats 0/2)
+  tichu e2edata --out FILE [options]      records of every kind of decision, in full games, with
+                                          real-deal branches (gzip; see train/README.md)
+      --bot NAME      bot in all four seats (default h2)
+      --games N       full games to play (default 100)
+      --branch SPEC   chance of trying another option on the real deal, by kind of
+                      decision: grand=P,small=P,pass=P,play=P,bomb=P,wish=P,dragon=P
+                      (all=P sets every kind)
+      --play-alts N   alternatives per branching play (default 2); --pass-alts N (default 1)
+      --inner-keep P  share of the decisions inside a branch that are recorded (default 0.25)
   tichu selfplay --out FILE [options]     export training records (see train/README.md)
       --bot NAME      bot in all four seats, and the label unless --q (default heuristic)
       --rounds N      rounds to play (default 10000)
@@ -251,6 +260,48 @@ fn main() {
                     exit(1)
                 }
             }
+        }
+        "e2edata" => {
+            let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());
+            let Some(out) = flag("out") else {
+                eprintln!("e2edata needs --out FILE");
+                exit(2);
+            };
+            let bot = flag("bot").unwrap_or_else(|| "h2".into());
+            let _ = factory(&bot);
+            let mut cfg = tichu_engine::e2e::E2eConfig {
+                bot,
+                games: args.num("games").unwrap_or(100),
+                seed,
+                threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
+                ..Default::default()
+            };
+            cfg.play_alts = args.num("play-alts").unwrap_or(cfg.play_alts);
+            cfg.pass_alts = args.num("pass-alts").unwrap_or(cfg.pass_alts);
+            cfg.inner_keep = args.num("inner-keep").unwrap_or(cfg.inner_keep);
+            if let Some(spec) = flag("branch") {
+                if tichu_engine::e2e::parse_branch(&spec, &mut cfg.branch).is_none() {
+                    eprintln!("--branch: expected KIND=P,... with kinds {} or all", tichu_engine::e2e::KIND_NAMES.join(", "));
+                    exit(2);
+                }
+            }
+            let file = std::fs::File::create(&out).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                exit(1)
+            });
+            let start = std::time::Instant::now();
+            let stats = tichu_engine::e2e::run(&cfg, file).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                exit(1)
+            });
+            println!(
+                "wrote {} records from {} games ({} rounds, {} playouts) to {out} ({:.1}s)",
+                stats.records,
+                stats.games,
+                stats.rounds,
+                stats.playouts,
+                start.elapsed().as_secs_f64()
+            );
         }
         "calllabel" => {
             let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());

@@ -8,6 +8,7 @@
 //! - `endgame`: exact solver for two-player endgames
 //! - `features`, `selfplay`: inputs for learned bots and training-data export
 //! - `calllabel`: counterfactual call/no-call records for learned calls
+//! - `e2e`: records of every kind of decision, with real-deal branches, for one net that makes them all
 //! - `trace`: JSON round traces (used to diff against the TS engine)
 //! - `llm`: language-model players and a resumable match runner
 //! - `replay`: game logs and the visual replay viewer
@@ -19,6 +20,7 @@ pub mod bots;
 pub mod calllabel;
 pub mod combinations;
 pub mod deck;
+pub mod e2e;
 pub mod endgame;
 pub mod engine;
 pub mod features;

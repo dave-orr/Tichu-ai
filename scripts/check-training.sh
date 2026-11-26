@@ -55,6 +55,14 @@ if "$PY" -c "import torch" 2>/dev/null; then
   "$PY" train/dmc.py --dir "$dir/dmc-critic" --chunk-rounds 12 --hidden 32 --head 16 --buffer 2000 --eval-every 0 --threads 2 --device cpu --chunks 2 --critic 0.3 --critic-k 3 >/dev/null
   grep -q "chunk 1: .*critic: [1-9][0-9]* records" "$dir/dmc-critic/log.txt"
   echo "dmc.py runs, resumes, and its models load and play in Rust (with and without the critic)"
+  # One net for every kind of decision: e2edata -> train/e2e.py and its held-out report.
+  ./target/release/tichu e2edata --out "$dir/e2e.bin.gz" --games 3 --seed 4 --threads 2 --branch all=0.5 2>/dev/null >/dev/null
+  ./target/release/tichu e2edata --out "$dir/e2e-val.bin.gz" --games 2 --seed 5 --threads 2 --branch all=0.5 2>/dev/null >/dev/null
+  for seq in 8 0; do
+    "$PY" train/e2e.py "$dir/e2e.bin.gz" --val "$dir/e2e-val.bin.gz" --out "$dir/e2e.pt" --width 32 --depth 2 --head 16 --seq $seq --batch 64 --device cpu > "$dir/e2e.txt"
+    grep -q "play .*cards right .*branches: picks a best option" "$dir/e2e.txt"
+  done
+  echo "e2edata records train in train/e2e.py (with and without a GRU)"
 else
   echo "PyTorch not installed: skipped the train.py -> .tnet check"
 fi

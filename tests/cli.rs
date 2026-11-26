@@ -87,6 +87,18 @@ fn selfplay_writes_a_record_file() {
 }
 
 #[test]
+fn e2edata_writes_a_gzip_record_file() {
+    let path = std::env::temp_dir().join(format!("tichu-cli-e2e-{}.bin.gz", std::process::id()));
+    let out = ok(&["e2edata", "--out", path.to_str().unwrap(), "--games", "1", "--threads", "1", "--branch", "all=0.2"]);
+    assert!(out.contains("records from 1 games"), "{out}");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..2], &[0x1f, 0x8b]);
+    let bad = tichu(&["e2edata", "--out", path.to_str().unwrap(), "--branch", "plays=1"]);
+    assert_eq!(bad.status.code(), Some(2));
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn trace_emits_one_json_round_per_line() {
     let out = ok(&["trace", "--rounds", "3", "--seed", "5", "--bot", "heuristic"]);
     let lines: Vec<&str> = out.lines().collect();

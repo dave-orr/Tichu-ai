@@ -91,7 +91,7 @@ fn offer_bombs(
 }
 
 /// After a play/bomb by `by`: let the others bomb, repeatedly, until nobody does.
-fn bomb_round(
+pub fn bomb_round(
     state: &mut GameState,
     bots: &mut [Box<dyn Bot>; 4],
     by: Seat,
@@ -146,10 +146,27 @@ pub fn play_dealt_round(
 pub fn play_from(
     state: &mut GameState,
     bots: &mut [Box<dyn Bot>; 4],
-    mut obs: Option<Observer>,
+    obs: Option<Observer>,
     ask_small_tichu: bool,
 ) -> Result<RoundResult, SimError> {
-    let mut asked_small = !ask_small_tichu;
+    play_loop(state, bots, obs, ask_small_tichu, !ask_small_tichu)
+}
+
+/// Play on from the middle of a round that this simulator was already
+/// playing (a copy of its state, e.g. to try another option at a decision):
+/// seats are offered Small Tichu before their own turns as usual, but the
+/// offer to all four seats when play begins is not repeated.
+pub fn resume_from(state: &mut GameState, bots: &mut [Box<dyn Bot>; 4], obs: Option<Observer>) -> Result<RoundResult, SimError> {
+    play_loop(state, bots, obs, true, true)
+}
+
+fn play_loop(
+    state: &mut GameState,
+    bots: &mut [Box<dyn Bot>; 4],
+    mut obs: Option<Observer>,
+    ask_small_tichu: bool,
+    mut asked_small: bool,
+) -> Result<RoundResult, SimError> {
     for _step in 0..5000 {
         match state.pending() {
             Pending::GrandTichu(seats) => {
