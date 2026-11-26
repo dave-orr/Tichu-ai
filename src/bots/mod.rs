@@ -3,6 +3,7 @@
 
 pub mod calls;
 pub mod callnet;
+pub mod passnet;
 pub mod endgame;
 pub mod h2;
 pub mod heuristic;
@@ -29,6 +30,7 @@ pub const NAMES: &[(&str, &str)] = &[
     ("oracleN[@x]", "CHEATS (diagnostic): pimc that searches the real hands (oracle1, oracle20@0.1)"),
     ("eg:BOT", "BOT, but two-player endgames are solved exactly (e.g. eg:heuristic, eg:pimc20)"),
     ("calls:P:BOT", "BOT with call policy P: none, v1 (old heuristic rules), T = v2 Tichu threshold T + v2 Grand, sT = v2 Tichu only, TbN = each bomb counts N winners (default 1; 0b2 = bombs count double), g = v2 Grand only (calls:1:pimc20)"),
+    ("passnet[@T]:PATH:BOT", "BOT with its partner card chosen by a learned pass model (.tpass from train/passes.py): keeps BOT's pass unless another card is predicted to gain more than T points (default 0)"),
     ("callnet[@T][~F]:PATH:BOT", "BOT with Grand/Small Tichu calls from a learned call model (.tcall from train/calls.py): call when the predicted game-win gain is above T points (default 0); F = g (model Grand only) or s (model Small only)"),
     ("nocalls:BOT", "same as calls:none:BOT"),
     ("pass2[~F]:BOT", "BOT with v2 passing (F = only these rules: o opponents, m Mah Jong vs Grand, p partner; e.g. pass2~o:h2): low singletons odd left / even right, Mah Jong before a Grand, partner gets my best card unless a gift would make me a Tichu hand"),
@@ -71,6 +73,7 @@ pub fn by_name(name: &str, seed: u64) -> Option<Box<dyn Bot>> {
             Some(Box::new(passing::PassBot::new(cfg, by_name(inner, seed)?)))
         }
         _ if name.starts_with("callnet") => Some(Box::new(callnet::CallNetBot::by_name(name, seed)?)),
+        _ if name.starts_with("passnet") => Some(Box::new(passnet::PassNetBot::by_name(name, seed)?)),
         _ if name.starts_with("calls:") => {
             let (policy, inner) = name[6..].split_once(':')?;
             Some(Box::new(CallsBot::new(CallPolicy::parse(policy)?, by_name(inner, seed)?)))

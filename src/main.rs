@@ -58,6 +58,11 @@ usage:
       --scores FILE   start each round from a game score drawn from FILE (lines
                       'team0 team1'; train/calls.py --write-states makes one)
       --seed S, --threads T
+  tichu passlabel --out FILE [options]    pass records for train/passes.py: every partner card of
+                                          each seat's pass, played out on the real deal
+      --bot NAME      bot in all four seats and the playouts (default h2)
+      --rounds N      rounds to label (default 1000; four pass decisions each)
+      --seed S, --threads T
   tichu live --bot NAME [options]         play on a real server (dave-orr/tichu) through its AI
                                           API: claim open AI seats and play them, until stopped.
                                           Needs the server's token in the BOT_TOKEN env variable.
@@ -246,6 +251,33 @@ fn main() {
                         println!("{s}");
                     }
                 }
+                Err(e) => {
+                    eprintln!("{out}: {e}");
+                    exit(1)
+                }
+            }
+        }
+        "passlabel" => {
+            let flag = |k: &str| args.flags.iter().find(|(f, _)| f == k).and_then(|(_, v)| v.clone());
+            let Some(out) = flag("out") else {
+                eprintln!("passlabel needs --out FILE");
+                exit(2);
+            };
+            let bot = flag("bot").unwrap_or_else(|| "h2".into());
+            let _ = factory(&bot);
+            let cfg = tichu_engine::passlabel::PassLabelConfig {
+                bot,
+                rounds: args.num("rounds").unwrap_or(1000),
+                seed,
+                threads: args.num("threads").unwrap_or_else(|| ArenaConfig::default().threads),
+            };
+            let file = std::fs::File::create(&out).unwrap_or_else(|e| {
+                eprintln!("{out}: {e}");
+                exit(1)
+            });
+            let start = std::time::Instant::now();
+            match tichu_engine::passlabel::run(&cfg, &mut std::io::BufWriter::new(file)) {
+                Ok(n) => println!("wrote {n} pass decisions to {out} ({:.1}s)", start.elapsed().as_secs_f64()),
                 Err(e) => {
                     eprintln!("{out}: {e}");
                     exit(1)

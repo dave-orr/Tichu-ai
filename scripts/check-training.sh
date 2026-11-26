@@ -55,6 +55,12 @@ if "$PY" -c "import torch" 2>/dev/null; then
   "$PY" train/dmc.py --dir "$dir/dmc-critic" --chunk-rounds 12 --hidden 32 --head 16 --buffer 2000 --eval-every 0 --threads 2 --device cpu --chunks 2 --critic 0.3 --critic-k 3 >/dev/null
   grep -q "chunk 1: .*critic: [1-9][0-9]* records" "$dir/dmc-critic/log.txt"
   echo "dmc.py runs, resumes, and its models load and play in Rust (with and without the critic)"
+  # Learned passer: labels, the trainer, and the Rust bot on its model.
+  ./target/release/tichu passlabel --out "$dir/pass.bin" --bot heuristic --rounds 12 --seed 4 --threads 2 2>/dev/null
+  "$PY" train/passes.py "$dir/pass.bin" --out "$dir/p.tpass" --hidden 16 --epochs 2 --batch 8 >"$dir/pass.txt"
+  grep -q "held-out R" "$dir/pass.txt"
+  ./target/release/tichu arena "passnet:$dir/p.tpass:heuristic" heuristic --rounds 6 --threads 2 | grep -q "margin per deal"
+  echo "passlabel records train a pass model that the passnet bot loads"
 else
   echo "PyTorch not installed: skipped the train.py -> .tnet check"
 fi

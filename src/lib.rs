@@ -17,6 +17,7 @@ pub mod arena;
 pub mod bot;
 pub mod bots;
 pub mod calllabel;
+pub mod passlabel;
 pub mod combinations;
 pub mod deck;
 pub mod endgame;
