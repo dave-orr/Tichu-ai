@@ -56,6 +56,8 @@ SCALE = 100.0
 LP_FLOOR = -8.0
 # Most options of one decision used in a step.
 GROUP_MAX = 24
+# Longest history the attention encoder takes (a round has under 200 tokens).
+MAX_TOKENS = 256
 
 
 class Data:
@@ -125,12 +127,22 @@ class Data:
 
 
 class E2ENet(nn.Module):
-    def __init__(self, dims, width=512, depth=4, head=256, seq=128):
+    def __init__(self, dims, width=512, depth=4, head=256, seq=128, seq_kind="gru", seq_layers=2):
         super().__init__()
         S, C, D, H = dims["state_dim"], dims["cand_dim"], dims["token_dim"], dims["hidden_dim"]
-        self.arch = dict(width=width, depth=depth, head=head, seq=seq)
+        self.arch = dict(width=width, depth=depth, head=head, seq=seq, seq_kind=seq_kind, seq_layers=seq_layers)
         self.seq = seq
-        self.gru = nn.GRU(D, seq, batch_first=True) if seq else None
+        self.gru = nn.GRU(D, seq, batch_first=True) if seq and seq_kind == "gru" else None
+        # Or attention over the tokens: every token can be looked up
+        # directly (who led the first trick), where a GRU has to carry it.
+        self.attn = None
+        if seq and seq_kind == "attn":
+            self.tok_in = nn.Linear(D, seq)
+            self.pos = nn.Embedding(MAX_TOKENS + 1, seq)
+            self.cls = nn.Parameter(torch.zeros(seq))
+            layer = nn.TransformerEncoderLayer(seq, 4, seq * 2, dropout=0.0, batch_first=True, norm_first=True)
+            self.attn = nn.TransformerEncoder(layer, seq_layers, enable_nested_tensor=False)
+            self.attn_norm = nn.LayerNorm(seq)
         self.inp = nn.Linear(S + seq, width)
         self.blocks = nn.ModuleList(nn.Linear(width, width) for _ in range(depth - 1))
         self.value = nn.Sequential(nn.Linear(width, head // 2), nn.ReLU(), nn.Linear(head // 2, 1))
@@ -150,6 +162,17 @@ class E2ENet(nn.Module):
                 out, _ = self.gru(toks)
                 e = out[torch.arange(len(lens), device=s.device), (lens - 1).clamp(min=0)]
                 e = e * (lens > 0).unsqueeze(-1).to(e.dtype)
+            s = torch.cat([s, e], -1)
+        elif self.attn is not None:
+            B, L = len(s), min(toks.shape[1], MAX_TOKENS)
+            # Position 0 is a summary slot; the tokens follow, newest last.
+            x = self.cls.expand(B, 1, -1)
+            if L:
+                t = self.tok_in(toks[:, :L]) + self.pos(torch.arange(1, L + 1, device=s.device))[None]
+                x = torch.cat([x, t], 1)
+            x = x + self.pos(torch.zeros(1, dtype=torch.long, device=s.device))[None]
+            pad = torch.arange(L + 1, device=s.device)[None] > lens.clamp(max=L)[:, None]
+            e = self.attn_norm(self.attn(x, src_key_padding_mask=pad)[:, 0])
             s = torch.cat([s, e], -1)
         h = F.relu(self.inp(s))
         for l in self.blocks:
@@ -224,7 +247,14 @@ def losses(model, b, idx, args):
     fl = F.cross_entropy(f_c, first) + (F.cross_entropy(f_s, first, reduction="none") * w).sum() / n_own
     hid = b.hidden[idx].long()
     m = hid > 0
-    bl = F.cross_entropy(bel[m], hid[m] - 1) if m.any() else ql * 0
+    if m.any() and args.key_card_weight != 1.0:
+        # The cards a player tracks (specials, aces, kings) are a fifth of
+        # the deck: unweighted, the low cards drown them out.
+        card = torch.arange(hid.shape[1], device=hid.device)
+        w = torch.where((card >= 52) | (card % 13 >= 11), args.key_card_weight, 1.0).expand_as(m)[m]
+        bl = (F.cross_entropy(bel[m], hid[m] - 1, reduction="none") * w).sum() / w.sum()
+    else:
+        bl = F.cross_entropy(bel[m], hid[m] - 1) if m.any() else ql * 0
     # The teacher: its value where it gave one, its policy on plays.
     wv, wp = b.has_tv[idx].float(), b.has_tlp[idx].float()
     tl = ((v - b.teacher_v[idx]) ** 2 * wv).sum() / wv.sum().clamp(min=1)
@@ -359,7 +389,9 @@ def main():
     ap.add_argument("--width", type=int, default=512)
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--head", type=int, default=256)
-    ap.add_argument("--seq", type=int, default=128, help="GRU units over the history tokens (0 = no history)")
+    ap.add_argument("--seq", type=int, default=128, help="width of the encoder over the history tokens (0 = no history)")
+    ap.add_argument("--seq-kind", choices=["gru", "attn"], default="gru", help="a GRU, or attention layers, over the tokens")
+    ap.add_argument("--seq-layers", type=int, default=2, help="attention layers")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch", type=int, default=1024)
     ap.add_argument("--lr", type=float, default=3e-4)
@@ -368,6 +400,8 @@ def main():
     ap.add_argument("--value-weight", type=float, default=0.5)
     ap.add_argument("--first-weight", type=float, default=0.1)
     ap.add_argument("--belief-weight", type=float, default=0.5)
+    ap.add_argument("--key-card-weight", type=float, default=1.0,
+                    help="weight of the specials, aces and kings in the hidden-card loss (the other cards are 1)")
     ap.add_argument("--group-weight", type=float, default=0.0,
                     help="weight of the same-deal loss on branch groups (differences between options tried on one deal)")
     ap.add_argument("--group-batch", type=int, default=256, help="decisions per step for it")
@@ -384,7 +418,7 @@ def main():
     torch.manual_seed(args.seed)
     dev = torch.device(args.device)
     val = Data([args.val])
-    model = E2ENet(val.dims, args.width, args.depth, args.head, args.seq).to(dev)
+    model = E2ENet(val.dims, args.width, args.depth, args.head, args.seq, args.seq_kind, args.seq_layers).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"{n_par} parameters, {model.arch}; held out: {len(val)} records from {val.rounds} rounds; on {dev}", flush=True)
