@@ -127,10 +127,10 @@ class Data:
 
 
 class E2ENet(nn.Module):
-    def __init__(self, dims, width=512, depth=4, head=256, seq=128, seq_kind="gru", seq_layers=2):
+    def __init__(self, dims, width=512, depth=4, head=256, seq=128, seq_kind="gru", seq_layers=2, oracle=False):
         super().__init__()
         S, C, D, H = dims["state_dim"], dims["cand_dim"], dims["token_dim"], dims["hidden_dim"]
-        self.arch = dict(width=width, depth=depth, head=head, seq=seq, seq_kind=seq_kind, seq_layers=seq_layers)
+        self.arch = dict(width=width, depth=depth, head=head, seq=seq, seq_kind=seq_kind, seq_layers=seq_layers, oracle=oracle)
         self.seq = seq
         self.gru = nn.GRU(D, seq, batch_first=True) if seq and seq_kind == "gru" else None
         # Or attention over the tokens: every token can be looked up
@@ -148,13 +148,18 @@ class E2ENet(nn.Module):
         self.value = nn.Sequential(nn.Linear(width, head // 2), nn.ReLU(), nn.Linear(head // 2, 1))
         self.first = nn.Linear(width, 4)
         self.belief = nn.Linear(width, H * 3)
+        # Which of the other three seats holds a bomb.
+        self.bombs = nn.Linear(width, 3)
+        # Training only: where the hidden cards really are, as an input
+        # that a growing share of the examples go without (--oracle).
+        self.oracle = nn.Linear(H * 3, width, bias=False) if oracle else None
         self.q1 = nn.Linear(width + C, head)
         # advantage, first-out logits for the option, and the teacher
         # policy's log-probability of it
         self.q2 = nn.Linear(head, 1 + 4 + 1)
         self.H = H
 
-    def body(self, s, toks, lens):
+    def body(self, s, toks, lens, ora=None):
         if self.gru is not None:
             if toks.shape[1] == 0:
                 e = s.new_zeros(len(s), self.seq)
@@ -174,19 +179,23 @@ class E2ENet(nn.Module):
             pad = torch.arange(L + 1, device=s.device)[None] > lens.clamp(max=L)[:, None]
             e = self.attn_norm(self.attn(x, src_key_padding_mask=pad)[:, 0])
             s = torch.cat([s, e], -1)
-        h = F.relu(self.inp(s))
+        h = self.inp(s)
+        if ora is not None and self.oracle is not None:
+            h = h + self.oracle(ora)
+        h = F.relu(h)
         for l in self.blocks:
             h = h + F.relu(l(h))
         return h
 
-    def forward(self, s, c, toks, lens):
+    def forward(self, s, c, toks, lens, ora=None):
         """-> V [B], Q [B], first-out logits for the position [B, 4] and the
         option [B, 4], hidden-card logits [B, H, 3], the option's policy
-        log-probability [B]."""
-        h = self.body(s, toks, lens)
+        log-probability [B], bomb-holder logits [B, 3]. `ora` [B, H * 3]:
+        the hidden cards' holders, one-hot, or zeros (None) without them."""
+        h = self.body(s, toks, lens, ora)
         v = self.value(h).squeeze(-1)
         o = self.q2(F.relu(self.q1(torch.cat([h, c], -1))))
-        return v, v + o[:, 0], self.first(h), o[:, 1:5], self.belief(h).view(len(s), self.H, 3), o[:, 5]
+        return v, v + o[:, 0], self.first(h), o[:, 1:5], self.belief(h).view(len(s), self.H, 3), o[:, 5], self.bombs(h)
 
 
 class Batcher:
@@ -235,9 +244,32 @@ class Batcher:
         return s, c, toks, lens
 
 
-def losses(model, b, idx, args):
+def bomb_holders(hid):
+    """[B, 3]: does each other seat hold a bomb among the cards I can't see
+    (four of a rank, or five in a row of a suit)? From the hidden-card
+    target [B, 56]."""
+    g = hid[:, :52].view(-1, 4, 13)
+    out = []
+    for seat in (1, 2, 3):
+        e = g == seat
+        run = e[:, :, :9]
+        for k in range(1, 5):
+            run = run & e[:, :, k:k + 9]
+        out.append(e.all(1).any(1) | run.flatten(1).any(1))
+    return torch.stack(out, 1).float()
+
+
+def losses(model, b, idx, args, oracle_p=0.0):
     s, c, toks, lens = b.get(idx)
-    v, q, f_s, f_c, bel, lp = model(s, c, toks, lens)
+    hid = b.hidden[idx].long()
+    # Examples that see the hidden cards learn values from them and are not
+    # asked to guess them.
+    blind = torch.ones(len(idx), dtype=torch.bool, device=s.device)
+    ora = None
+    if model.oracle is not None:
+        blind = torch.rand(len(idx), device=s.device) >= oracle_p
+        ora = (F.one_hot(hid, 4)[:, :, 1:].flatten(1) * ~blind[:, None]).float()
+    v, q, f_s, f_c, bel, lp, bm = model(s, c, toks, lens, ora)
     y, first, own = b.margin[idx], b.first[idx], ~b.forced[idx]
     ql = F.mse_loss(q, y)
     # V and the position's first-out are about the bot's own choice.
@@ -245,8 +277,7 @@ def losses(model, b, idx, args):
     n_own = w.sum().clamp(min=1)
     vl = ((v - y) ** 2 * w).sum() / n_own
     fl = F.cross_entropy(f_c, first) + (F.cross_entropy(f_s, first, reduction="none") * w).sum() / n_own
-    hid = b.hidden[idx].long()
-    m = hid > 0
+    m = (hid > 0) & blind[:, None]
     if m.any() and args.key_card_weight != 1.0:
         # The cards a player tracks (specials, aces, kings) are a fifth of
         # the deck: unweighted, the low cards drown them out.
@@ -259,8 +290,11 @@ def losses(model, b, idx, args):
     wv, wp = b.has_tv[idx].float(), b.has_tlp[idx].float()
     tl = ((v - b.teacher_v[idx]) ** 2 * wv).sum() / wv.sum().clamp(min=1)
     pl = (F.smooth_l1_loss(lp, b.teacher_lp[idx], reduction="none") * wp).sum() / wp.sum().clamp(min=1)
-    total = ql + args.value_weight * vl + args.first_weight * fl + args.belief_weight * bl + args.teacher_weight * (tl + 0.5 * pl)
-    return total, (ql, vl, fl, bl, tl, pl)
+    rows = m.any(1)
+    bo = F.binary_cross_entropy_with_logits(bm[rows], bomb_holders(hid[rows])) if rows.any() else ql * 0
+    total = (args.q_weight * ql + args.value_weight * vl + args.first_weight * fl + args.belief_weight * bl
+             + args.bomb_weight * bo + args.teacher_weight * (tl + 0.5 * pl))
+    return total, (ql, vl, fl, bl, tl, pl, bo)
 
 
 def group_loss(model, b, rows):
@@ -286,12 +320,14 @@ def evaluate(model, data, dev, args):
     """The held-out report (see the module docs), as a dict."""
     model.eval()
     b = Batcher(data, dev, model.seq)
-    V, Q, P, hit, n_hid, ll = [], [], [], [], [], []
+    V, Q, P, hit, n_hid, ll, BP, BT = [], [], [], [], [], [], [], []
     for i in range(0, len(data), 4096):
         idx = torch.arange(i, min(i + 4096, len(data)), device=dev)
         s, c, toks, lens = b.get(idx)
-        v, q, _, _, bel, plp = model(s, c, toks, lens)
+        v, q, _, _, bel, plp, bm = model(s, c, toks, lens)
         P.append(plp.cpu())
+        BP.append(torch.sigmoid(bm).cpu())
+        BT.append(bomb_holders(b.hidden[idx].long()).cpu())
         V.append(v.cpu())
         Q.append(q.cpu())
         hid = b.hidden[idx].long()
@@ -303,6 +339,7 @@ def evaluate(model, data, dev, args):
     model.train()
     V, Q, P = torch.cat(V).numpy() * SCALE, torch.cat(Q).numpy() * SCALE, torch.cat(P).numpy()
     hit, ll, n_hid = torch.cat(hit).numpy(), torch.cat(ll).numpy(), torch.cat(n_hid).numpy()
+    BP, BT = torch.cat(BP).numpy(), torch.cat(BT).numpy() > 0
     out = {}
     # Guessing from how many cards each seat holds: the best single guess
     # is the fullest seat, and the log loss is the entropy of the shares.
@@ -322,6 +359,14 @@ def evaluate(model, data, dev, args):
         if cards > 0:
             r.update(cards_right=hit[sel].sum() / cards, cards_right_counting=counts[sel].max(1).sum() / cards,
                      cards_ll=ll[sel].sum() / cards, cards_ll_counting=base_ll[sel].sum() / cards)
+            # Bombs: of the seats that hold one, the share the net gives 50% or
+            # more, and how often a seat it gives 50% or more holds one.
+            bs = sel & (tot > 0)
+            t, p = BT[bs], BP[bs]
+            r.update(bomb_rate=t.mean(), bomb_found=(p[t] >= 0.5).mean() if t.any() else 0.0,
+                     bomb_right=t[p >= 0.5].mean() if (p >= 0.5).any() else 0.0,
+                     bomb_ll=-(np.log(np.clip(np.where(t, p, 1 - p), 1e-6, 1))).mean(),
+                     bomb_ll_base=-(t.mean() * np.log(max(t.mean(), 1e-6)) + (1 - t.mean()) * np.log(max(1 - t.mean(), 1e-6))))
         tv = sel & data.has_tv
         if tv.sum() >= 50:
             yt = data.margin[tv]
@@ -372,6 +417,9 @@ def show(report):
         if "cards_right" in r:
             line += (f"; cards right {r['cards_right']:.1%} (counting {r['cards_right_counting']:.1%}), "
                      f"log loss {r['cards_ll']:.3f} ({r['cards_ll_counting']:.3f})")
+        if "bomb_rate" in r:
+            line += (f"; bombs (a seat holds one {r['bomb_rate']:.1%}): finds {r['bomb_found']:.0%}, right when it says so "
+                     f"{r['bomb_right']:.0%}, log loss {r['bomb_ll']:.3f} ({r['bomb_ll_base']:.3f})")
         if "groups" in r:
             line += (f"; {r['groups']} branches: picks a best option {r['agree']:.0%}, gain {r['gain']:+.1f} ± {r['gain_ci']:.1f} "
                      f"(hindsight {r['hindsight']:+.1f}), R² {r['branch_r2']:.3f}")
@@ -400,6 +448,11 @@ def main():
     ap.add_argument("--value-weight", type=float, default=0.5)
     ap.add_argument("--first-weight", type=float, default=0.1)
     ap.add_argument("--belief-weight", type=float, default=0.5)
+    ap.add_argument("--q-weight", type=float, default=1.0, help="weight of the option score's fit to the round's result")
+    ap.add_argument("--bomb-weight", type=float, default=1.0, help="weight of the who-holds-a-bomb loss")
+    ap.add_argument("--oracle", type=float, default=0.0,
+                    help="share of the examples that start with the hidden cards as an input (training only)")
+    ap.add_argument("--oracle-until", type=float, default=0.6, help="that share falls to zero by this point of the training")
     ap.add_argument("--key-card-weight", type=float, default=1.0,
                     help="weight of the specials, aces and kings in the hidden-card loss (the other cards are 1)")
     ap.add_argument("--group-weight", type=float, default=0.0,
@@ -418,7 +471,7 @@ def main():
     torch.manual_seed(args.seed)
     dev = torch.device(args.device)
     val = Data([args.val])
-    model = E2ENet(val.dims, args.width, args.depth, args.head, args.seq, args.seq_kind, args.seq_layers).to(dev)
+    model = E2ENet(val.dims, args.width, args.depth, args.head, args.seq, args.seq_kind, args.seq_layers, args.oracle > 0).to(dev)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     n_par = sum(p.numel() for p in model.parameters())
     print(f"{n_par} parameters, {model.arch}; held out: {len(val)} records from {val.rounds} rounds; on {dev}", flush=True)
@@ -432,7 +485,7 @@ def main():
             raise SystemExit(f"{path}: layout {data.dims}, expected {val.dims}")
         b = Batcher(data, dev, model.seq)
         perm = torch.randperm(len(data), device=dev, generator=gen)
-        tot = np.zeros(7)
+        tot = np.zeros(8)
         nb = 0
         n_steps = max(1, len(perm) // args.batch)
         use_groups = args.group_weight > 0 and len(b.groups) > 0
@@ -442,7 +495,9 @@ def main():
         for i in range(0, len(perm) - args.batch + 1, args.batch):
             for g in opt.param_groups:
                 g["lr"] = args.lr * min(1.0, (steps + 1) / max(1, args.warmup))
-            loss, parts = losses(model, b, perm[i:i + args.batch], args)
+            progress = (fi + i / max(1, len(perm))) / len(files)
+            oracle_p = args.oracle * max(0.0, 1 - progress / max(args.oracle_until, 1e-9))
+            loss, parts = losses(model, b, perm[i:i + args.batch], args, oracle_p)
             gl = loss * 0
             if use_groups:
                 rows = gperm[nb * gb:(nb + 1) * gb]
@@ -459,10 +514,11 @@ def main():
         seen += len(data)
         del b
         line = dict(file=os.path.basename(path), records=seen, steps=steps, mins=(time.time() - t0) / 60,
-                    train=dict(zip(["q", "v", "first", "cards", "teacher_v", "teacher_policy", "same_deal"], (tot / max(nb, 1)).tolist())))
+                    train=dict(zip(["q", "v", "first", "cards", "teacher_v", "teacher_policy", "bombs", "same_deal"], (tot / max(nb, 1)).tolist())))
         msg = (f"{fi + 1}/{len(files)} {line['file']}: {seen} records, {steps} steps, {line['mins']:.1f} min; "
                f"train loss Q {line['train']['q']:.3f} V {line['train']['v']:.3f} first {line['train']['first']:.3f} cards {line['train']['cards']:.3f} "
-               f"teacher V {line['train']['teacher_v']:.3f} policy {line['train']['teacher_policy']:.3f} same deal {line['train']['same_deal']:.3f}")
+               f"teacher V {line['train']['teacher_v']:.3f} policy {line['train']['teacher_policy']:.3f} bombs {line['train']['bombs']:.3f} "
+               f"same deal {line['train']['same_deal']:.3f}")
         if (fi + 1) % args.eval_every == 0 or fi + 1 == len(files):
             line["val"] = evaluate(model, val, dev, args)
             msg += "\n" + show(line["val"])

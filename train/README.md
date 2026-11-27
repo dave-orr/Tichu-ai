@@ -514,6 +514,34 @@ without and with the GRU; 1024x6 with it), and writes their held-out
 reports side by side in `log.txt`. The question is whether size and a
 memory of the round buy anything on equal data.
 
+Results so far (each file once; held out: other seeds). On 120k and 480k
+rounds of the default data, a 1024x6 net with the GRU fits option scores
+worse than dmc1's shape (play Q R² 0.415 against 0.459, then 0.426 against
+0.468), and no net's play choices beat the bot's own (-1.3 ± 1.5 over 25,281
+branches). The nets also placed the Mah Jong only 77% of the time although
+its holder is whoever led first: the hidden-card loss was too small a part
+of the total. `--seq-kind attn --belief-weight 30 --key-card-weight 8`
+gives Mah Jong 99.4%, Dragon 81%, aces 62% (from 77%, 75%, 52%) on 25k
+rounds with the value fit unchanged.
+
+The next experiment (`runs/e2e-s3`) changes the setup instead of the amount:
+
+    python train/e2e_stage1.py --dir runs/e2e-s3 --parts 80 --val-games 1200 \
+      --gen-extra "--play-alts 64 --branch play=0.1" \
+      --extra "--seq-kind attn --belief-weight 30 --key-card-weight 8 --group-weight 1" \
+      --arms "small:256,2,128,96;wide:1024,6,256,256;wide-oracle:1024,6,256,256:--oracle 0.75"
+
+- `--play-alts 64` plays out *every* legal option of a branching play on
+  the real deal (about 24 playouts per round at `play=0.1`), so the held-out
+  gain is over all options, and `--group-weight` trains the option scores on
+  their same-deal differences.
+- The trainer also predicts which other seats hold a bomb (derived from the
+  hidden-card target; `--bomb-weight`).
+- `--oracle P`: that share of the examples starts with the hidden cards'
+  holders as an input, falling to none by `--oracle-until` of the training;
+  those examples are not asked to guess the cards. The net is always
+  evaluated without them.
+
 Not built yet: the Rust bot that plays from this net, the win-chance
 target, the warm start from the current models, and the self-play loop.
 

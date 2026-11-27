@@ -8,7 +8,8 @@ round use the same data better than a net of dmc1's shape?
 2. Data: a held-out file and --parts training files of `tichu e2edata`
    (the current bot without search in every seat, full games, branches).
 3. Arms: `train/e2e.py` on the same files in the same order, each file once,
-   for every net in --arms (NAME:WIDTH,DEPTH,HEAD,SEQ).
+   for every net in --arms (NAME:WIDTH,DEPTH,HEAD,SEQ, then optionally
+   :MORE ARGUMENTS for that arm's train/e2e.py).
 4. A table of the arms' held-out reports in log.txt.
 
 Stop it any time; re-running skips finished files and finished arms.
@@ -40,6 +41,7 @@ def main():
     ap.add_argument("--speed-games", type=int, default=60)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--extra", default="", help="more arguments for train/e2e.py, in one string")
+    ap.add_argument("--gen-extra", default="", help="more arguments for tichu e2edata, in one string (--play-alts 64 ...)")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -90,7 +92,7 @@ def main():
         path = os.path.join(d, name)
         if not os.path.exists(path):
             out = os.path.join(d, "e2edata.txt")
-            secs = run([exe, "e2edata", "--bot", args.bot, "--games", str(games), "--seed", str(seed), "--out", path + ".tmp"] + threads, out)
+            secs = run([exe, "e2edata", "--bot", args.bot, "--games", str(games), "--seed", str(seed), "--out", path + ".tmp"] + threads + args.gen_extra.split(), out)
             os.replace(path + ".tmp", path)
             m = re.search(r"wrote (\d+) records from \d+ games \((\d+) rounds, (\d+) playouts\)", open(out, encoding="utf-8", errors="replace").read())
             if m:
@@ -104,7 +106,7 @@ def main():
     # 3. Arms.
     rows = []
     for arm in args.arms.split(";"):
-        name, shape = arm.split(":")
+        name, shape, more = (arm.split(":", 2) + [""])[:3]
         width, depth, head, seq = (int(x) for x in shape.split(","))
         out = os.path.join(d, f"{name}.pt")
         done = os.path.join(d, f"{name}.done")
@@ -113,9 +115,9 @@ def main():
                    "--depth", str(depth), "--head", str(head), "--seq", str(seq), "--eval-every", str(max(1, args.parts // 5))]
             if args.device:
                 cmd += ["--device", args.device]
-            secs = run(cmd + args.extra.split(), os.path.join(d, f"{name}.txt"))
+            secs = run(cmd + args.extra.split() + more.split(), os.path.join(d, f"{name}.txt"))
             open(done, "w").write(f"{secs:.0f}\n")
-            say(f"arm {name} ({shape}) trained in {secs / 60:.1f} min")
+            say(f"arm {name} ({shape} {more}) trained in {secs / 60:.1f} min")
         j = json.load(open(os.path.join(d, f"{name}.json"), encoding="utf-8"))
         rows.append((name, j["parameters"], j["log"][-1]["val"]))
 
@@ -131,6 +133,8 @@ def main():
                 line += f" (the bot's net {r['teacher_r2']:.3f})"
             if "cards_right" in r:
                 line += f"; cards right {r['cards_right']:.1%} (counting {r['cards_right_counting']:.1%})"
+            if "bomb_rate" in r:
+                line += f"; bombs: finds {r['bomb_found']:.0%}, right when it says so {r['bomb_right']:.0%}"
             if "groups" in r:
                 line += f"; {r['groups']} branches: best option {r['agree']:.1%}, gain {r['gain']:+.1f} ± {r['gain_ci']:.1f}, R² {r['branch_r2']:.3f}"
             if "same_as_bot" in r:
