@@ -54,6 +54,8 @@ KINDS = ["grand", "small", "pass", "play", "bomb", "wish", "dragon"]
 SCALE = 100.0
 # Teacher log-probabilities below this are all "never".
 LP_FLOOR = -8.0
+# Most options of one decision used in a step.
+GROUP_MAX = 24
 
 
 class Data:
@@ -176,6 +178,24 @@ class Batcher:
         self.prefix, self.tok_off = T(data.prefix), T(data.tok_off)
         self.tokens = T(data.tokens) if seq else None
         self.has_tv, self.has_tlp = T(data.has_tv), T(data.has_tlp)
+        # Branch groups (a decision and the other options tried on the same
+        # deal) as rows of record indices, padded with -1.
+        g = data.group
+        order = np.argsort(g, kind="stable")
+        order = order[g[order] > 0]
+        if len(order):
+            starts = np.flatnonzero(np.r_[True, g[order][1:] != g[order][:-1]])
+            sizes = np.diff(np.r_[starts, len(order)])
+            keep = sizes >= 2
+            width = int(min(sizes.max(), GROUP_MAX))
+            table = np.full((len(starts), width), -1, np.int64)
+            col = np.arange(len(order)) - np.repeat(starts, sizes)
+            row = np.repeat(np.arange(len(starts)), sizes)
+            ok = col < width
+            table[row[ok], col[ok]] = order[ok]
+            self.groups = T(table[keep])
+        else:
+            self.groups = T(np.zeros((0, 2), np.int64))
         self.teacher_v, self.teacher_lp = T(data.teacher_v) / SCALE, T(data.teacher_lp).clamp(min=LP_FLOOR)
 
     def get(self, idx):
@@ -211,6 +231,24 @@ def losses(model, b, idx, args):
     pl = (F.smooth_l1_loss(lp, b.teacher_lp[idx], reduction="none") * wp).sum() / wp.sum().clamp(min=1)
     total = ql + args.value_weight * vl + args.first_weight * fl + args.belief_weight * bl + args.teacher_weight * (tl + 0.5 * pl)
     return total, (ql, vl, fl, bl, tl, pl)
+
+
+def group_loss(model, b, rows):
+    """The luck-free signal: within a decision's tried options (same deal,
+    same position), the differences between the option scores should be the
+    differences between the results."""
+    table = b.groups[rows]
+    m = table >= 0
+    idx = table[m]
+    s, c, toks, lens = b.get(idx)
+    q = model(s, c, toks, lens)[1]
+    Q = torch.zeros(table.shape, device=q.device)
+    Y = torch.zeros(table.shape, device=q.device)
+    Q[m], Y[m] = q, b.margin[idx]
+    n = m.sum(1, keepdim=True).float()
+    dq = (Q - (Q * m).sum(1, keepdim=True) / n) * m
+    dy = (Y - (Y * m).sum(1, keepdim=True) / n) * m
+    return ((dq - dy) ** 2).sum() / m.sum()
 
 
 @torch.no_grad()
@@ -330,6 +368,9 @@ def main():
     ap.add_argument("--value-weight", type=float, default=0.5)
     ap.add_argument("--first-weight", type=float, default=0.1)
     ap.add_argument("--belief-weight", type=float, default=0.5)
+    ap.add_argument("--group-weight", type=float, default=0.0,
+                    help="weight of the same-deal loss on branch groups (differences between options tried on one deal)")
+    ap.add_argument("--group-batch", type=int, default=256, help="decisions per step for it")
     ap.add_argument("--teacher-weight", type=float, default=1.0,
                     help="weight of matching the data's bot's own net (its value, and its policy on plays); 0 = results only")
     ap.add_argument("--eval-every", type=int, default=1, help="files between held-out reports")
@@ -357,12 +398,24 @@ def main():
             raise SystemExit(f"{path}: layout {data.dims}, expected {val.dims}")
         b = Batcher(data, dev, model.seq)
         perm = torch.randperm(len(data), device=dev, generator=gen)
-        tot = np.zeros(6)
+        tot = np.zeros(7)
         nb = 0
+        n_steps = max(1, len(perm) // args.batch)
+        use_groups = args.group_weight > 0 and len(b.groups) > 0
+        gperm = torch.randperm(len(b.groups), device=dev, generator=gen) if use_groups else None
+        # Spread the groups over the file's steps, each used once.
+        gb = max(1, min(args.group_batch, len(b.groups) // n_steps)) if use_groups else 0
         for i in range(0, len(perm) - args.batch + 1, args.batch):
             for g in opt.param_groups:
                 g["lr"] = args.lr * min(1.0, (steps + 1) / max(1, args.warmup))
             loss, parts = losses(model, b, perm[i:i + args.batch], args)
+            gl = loss * 0
+            if use_groups:
+                rows = gperm[nb * gb:(nb + 1) * gb]
+                if len(rows):
+                    gl = group_loss(model, b, rows)
+                    loss = loss + args.group_weight * gl
+            parts = parts + (gl,)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
@@ -372,10 +425,10 @@ def main():
         seen += len(data)
         del b
         line = dict(file=os.path.basename(path), records=seen, steps=steps, mins=(time.time() - t0) / 60,
-                    train=dict(zip(["q", "v", "first", "cards", "teacher_v", "teacher_policy"], (tot / max(nb, 1)).tolist())))
+                    train=dict(zip(["q", "v", "first", "cards", "teacher_v", "teacher_policy", "same_deal"], (tot / max(nb, 1)).tolist())))
         msg = (f"{fi + 1}/{len(files)} {line['file']}: {seen} records, {steps} steps, {line['mins']:.1f} min; "
                f"train loss Q {line['train']['q']:.3f} V {line['train']['v']:.3f} first {line['train']['first']:.3f} cards {line['train']['cards']:.3f} "
-               f"teacher V {line['train']['teacher_v']:.3f} policy {line['train']['teacher_policy']:.3f}")
+               f"teacher V {line['train']['teacher_v']:.3f} policy {line['train']['teacher_policy']:.3f} same deal {line['train']['same_deal']:.3f}")
         if (fi + 1) % args.eval_every == 0 or fi + 1 == len(files):
             line["val"] = evaluate(model, val, dev, args)
             msg += "\n" + show(line["val"])
